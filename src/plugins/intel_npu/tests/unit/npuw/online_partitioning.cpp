@@ -5,16 +5,19 @@
 #include <gtest/gtest.h>
 
 #include <iostream>
+#include <regex>
 
 #include "intel_npu/config/config.hpp"
 #include "intel_npu/config/npuw.hpp"
-#include "model_generator/model_generator.hpp"
+#include "model_builder/model_builder.hpp"
 #include "openvino/op/ops.hpp"
 #include "openvino/op/util/op_types.hpp"
 #include "openvino/openvino.hpp"
 #include "partitioning/online/compiler.hpp"
 #include "partitioning/online/group.hpp"
 #include "partitioning/online/snapshot.hpp"
+
+using namespace ov::test::npuw;
 
 namespace {
 
@@ -107,8 +110,8 @@ class IsRegularParameterCaseParametrized : public ::testing::TestWithParam<std::
 };  // namespace
 
 TEST(OnlinePartitioningTest, Partitioning_IsTheSame_SmallModel) {
-    ModelGenerator mg;
-    auto model = mg.get_model_without_repeated_blocks();
+    ModelBuilder mb;
+    auto model = mb.get_model_without_repeated_blocks();
 
     auto cfg = createConfigWithKeepBlockSize(9);
     auto ens = ov::npuw::online::buildPartitioning(model, cfg);
@@ -120,8 +123,8 @@ TEST(OnlinePartitioningTest, Partitioning_IsTheSame_SmallModel) {
 }
 
 TEST(OnlinePartitioningTest, Partitioning_IsTheSame_RepeatedModel) {
-    ModelGenerator mg;
-    auto model = mg.get_model_with_repeated_blocks();
+    ModelBuilder mb;
+    auto model = mb.get_model_with_repeated_blocks();
 
     auto cfg = createConfigWithKeepBlockSize(9);
     auto ens = ov::npuw::online::buildPartitioning(model, cfg);
@@ -133,8 +136,8 @@ TEST(OnlinePartitioningTest, Partitioning_IsTheSame_RepeatedModel) {
 }
 
 TEST(OnlinePartitioningTest, Partitioning_SingleGroup_SmallModel) {
-    ModelGenerator mg;
-    auto model = mg.get_model_without_repeated_blocks();
+    ModelBuilder mb;
+    auto model = mb.get_model_without_repeated_blocks();
 
     auto snap = std::make_shared<ov::npuw::online::Snapshot>(model);
     snap->singleGroup();
@@ -142,8 +145,8 @@ TEST(OnlinePartitioningTest, Partitioning_SingleGroup_SmallModel) {
 }
 
 TEST(OnlinePartitioningTest, Partitioning_SingleGroup_RepeatedModel) {
-    ModelGenerator mg;
-    auto model = mg.get_model_with_repeated_blocks();
+    ModelBuilder mb;
+    auto model = mb.get_model_with_repeated_blocks();
 
     auto snap = std::make_shared<ov::npuw::online::Snapshot>(model);
     snap->singleGroup();
@@ -151,8 +154,8 @@ TEST(OnlinePartitioningTest, Partitioning_SingleGroup_RepeatedModel) {
 }
 
 TEST(OnlinePartitioningTest, Partitioning_buildGraph_SmallModel) {
-    ModelGenerator mg;
-    auto model = mg.get_model_without_repeated_blocks();
+    ModelBuilder mb;
+    auto model = mb.get_model_without_repeated_blocks();
 
     auto snap = std::make_shared<ov::npuw::online::Snapshot>(model);
     snap->buildGraph();
@@ -165,8 +168,8 @@ TEST(OnlinePartitioningTest, Partitioning_buildGraph_SmallModel) {
 }
 
 TEST(OnlinePartitioningTest, Partitioning_buildGraph_RepeatedModel) {
-    ModelGenerator mg;
-    auto model = mg.get_model_with_repeated_blocks();
+    ModelBuilder mb;
+    auto model = mb.get_model_with_repeated_blocks();
 
     auto snap = std::make_shared<ov::npuw::online::Snapshot>(model);
     snap->buildGraph();
@@ -179,8 +182,8 @@ TEST(OnlinePartitioningTest, Partitioning_buildGraph_RepeatedModel) {
 }
 
 TEST(OnlinePartitioningTest, Partitioning_earlyAvoids_SmallModel) {
-    ModelGenerator mg;
-    auto model = mg.get_model_without_repeated_blocks();
+    ModelBuilder mb;
+    auto model = mb.get_model_without_repeated_blocks();
 
     auto snap = std::make_shared<ov::npuw::online::Snapshot>(model);
     ov::npuw::online::PassContext ctx;
@@ -202,8 +205,8 @@ TEST(OnlinePartitioningTest, Partitioning_earlyAvoids_SmallModel) {
 }
 
 TEST(OnlinePartitioningTest, Partitioning_earlyAvoids_RepeatedModel) {
-    ModelGenerator mg;
-    auto model = mg.get_model_with_repeated_blocks();
+    ModelBuilder mb;
+    auto model = mb.get_model_with_repeated_blocks();
 
     auto snap = std::make_shared<ov::npuw::online::Snapshot>(model);
     ov::npuw::online::PassContext ctx;
@@ -225,8 +228,8 @@ TEST(OnlinePartitioningTest, Partitioning_earlyAvoids_RepeatedModel) {
 }
 
 TEST(OnlinePartitioningTest, Partitioning_collectLHF_SmallModel) {
-    ModelGenerator mg;
-    auto model = mg.get_model_without_repeated_blocks();
+    ModelBuilder mb;
+    auto model = mb.get_model_without_repeated_blocks();
 
     auto snap = std::make_shared<ov::npuw::online::Snapshot>(model);
     snap->buildGraph();
@@ -242,8 +245,8 @@ TEST(OnlinePartitioningTest, Partitioning_collectLHF_SmallModel) {
 }
 
 TEST(OnlinePartitioningTest, Partitioning_collectLHF_RepeatedModel) {
-    ModelGenerator mg;
-    auto model = mg.get_model_with_repeated_blocks();
+    ModelBuilder mb;
+    auto model = mb.get_model_with_repeated_blocks();
 
     auto snap = std::make_shared<ov::npuw::online::Snapshot>(model);
     snap->buildGraph();
@@ -259,8 +262,8 @@ TEST(OnlinePartitioningTest, Partitioning_collectLHF_RepeatedModel) {
 }
 
 TEST(OnlinePartitioningTest, Partitioning_fuseRemnants_SmallModel) {
-    ModelGenerator mg;
-    auto model = mg.get_model_without_repeated_blocks();
+    ModelBuilder mb;
+    auto model = mb.get_model_without_repeated_blocks();
 
     auto snap = std::make_shared<ov::npuw::online::Snapshot>(model);
     snap->buildGraph();
@@ -276,8 +279,8 @@ TEST(OnlinePartitioningTest, Partitioning_fuseRemnants_SmallModel) {
 }
 
 TEST(OnlinePartitioningTest, Partitioning_fuseRemnants_RepeatedModel) {
-    ModelGenerator mg;
-    auto model = mg.get_model_with_repeated_blocks();
+    ModelBuilder mb;
+    auto model = mb.get_model_with_repeated_blocks();
 
     auto snap = std::make_shared<ov::npuw::online::Snapshot>(model);
     snap->buildGraph();
@@ -293,8 +296,8 @@ TEST(OnlinePartitioningTest, Partitioning_fuseRemnants_RepeatedModel) {
 }
 
 TEST(OnlinePartitioningTest, Partitioning_fuseRemnantsExtended_SmallModel) {
-    ModelGenerator mg;
-    auto model = mg.get_model_without_repeated_blocks();
+    ModelBuilder mb;
+    auto model = mb.get_model_without_repeated_blocks();
 
     auto snap = std::make_shared<ov::npuw::online::Snapshot>(model);
     snap->buildGraph();
@@ -310,8 +313,8 @@ TEST(OnlinePartitioningTest, Partitioning_fuseRemnantsExtended_SmallModel) {
 }
 
 TEST(OnlinePartitioningTest, Partitioning_fuseRemnantsExtended_RepeatedModel) {
-    ModelGenerator mg;
-    auto model = mg.get_model_with_repeated_blocks();
+    ModelBuilder mb;
+    auto model = mb.get_model_with_repeated_blocks();
 
     auto snap = std::make_shared<ov::npuw::online::Snapshot>(model);
     snap->buildGraph();
@@ -327,8 +330,8 @@ TEST(OnlinePartitioningTest, Partitioning_fuseRemnantsExtended_RepeatedModel) {
 }
 
 TEST(OnlinePartitioningTest, Partitioning_fuseInputs_SmallModel) {
-    ModelGenerator mg;
-    auto model = mg.get_model_without_repeated_blocks();
+    ModelBuilder mb;
+    auto model = mb.get_model_without_repeated_blocks();
 
     auto snap = std::make_shared<ov::npuw::online::Snapshot>(model);
     snap->buildGraph();
@@ -344,8 +347,8 @@ TEST(OnlinePartitioningTest, Partitioning_fuseInputs_SmallModel) {
 }
 
 TEST(OnlinePartitioningTest, Partitioning_fuseInputs_RepeatedModel) {
-    ModelGenerator mg;
-    auto model = mg.get_model_with_repeated_blocks();
+    ModelBuilder mb;
+    auto model = mb.get_model_with_repeated_blocks();
 
     auto snap = std::make_shared<ov::npuw::online::Snapshot>(model);
     snap->buildGraph();
@@ -361,8 +364,8 @@ TEST(OnlinePartitioningTest, Partitioning_fuseInputs_RepeatedModel) {
 }
 
 TEST(OnlinePartitioningTest, Partitioning_Compiler_Just_SmallModel) {
-    ModelGenerator mg;
-    auto model = mg.get_model_without_repeated_blocks();
+    ModelBuilder mb;
+    auto model = mb.get_model_without_repeated_blocks();
 
     auto snap = std::make_shared<ov::npuw::online::Snapshot>(model);
     snap->buildGraph();
@@ -386,8 +389,8 @@ TEST(OnlinePartitioningTest, Partitioning_Compiler_Just_SmallModel) {
 }
 
 TEST(OnlinePartitioningTest, Partitioning_Compiler_Just_RepeatedModel) {
-    ModelGenerator mg;
-    auto model = mg.get_model_with_repeated_blocks();
+    ModelBuilder mb;
+    auto model = mb.get_model_with_repeated_blocks();
 
     auto snap = std::make_shared<ov::npuw::online::Snapshot>(model);
     snap->buildGraph();
@@ -411,8 +414,8 @@ TEST(OnlinePartitioningTest, Partitioning_Compiler_Just_RepeatedModel) {
 }
 
 TEST(OnlinePartitioningTest, Partitioning_Compiler_RepeatedBlocks_SmallModel) {
-    ModelGenerator mg;
-    auto model = mg.get_model_without_repeated_blocks();
+    ModelBuilder mb;
+    auto model = mb.get_model_without_repeated_blocks();
 
     auto snap = std::make_shared<ov::npuw::online::Snapshot>(model);
     snap->buildGraph();
@@ -436,8 +439,8 @@ TEST(OnlinePartitioningTest, Partitioning_Compiler_RepeatedBlocks_SmallModel) {
 }
 
 TEST(OnlinePartitioningTest, Partitioning_Compiler_RepeatedBlocks_RepeatedModel) {
-    ModelGenerator mg;
-    auto model = mg.get_model_with_repeated_blocks();
+    ModelBuilder mb;
+    auto model = mb.get_model_with_repeated_blocks();
 
     auto snap = std::make_shared<ov::npuw::online::Snapshot>(model);
     snap->buildGraph();
@@ -468,8 +471,8 @@ TEST(OnlinePartitioningTest, Partitioning_Compiler_RepeatedBlocks_RepeatedModel)
 }
 
 TEST(OnlinePartitioningTest, Partitioning_Compiler_Compute_SmallModel) {
-    ModelGenerator mg;
-    auto model = mg.get_model_without_repeated_blocks();
+    ModelBuilder mb;
+    auto model = mb.get_model_without_repeated_blocks();
 
     auto snap = std::make_shared<ov::npuw::online::Snapshot>(model);
 
@@ -499,8 +502,8 @@ TEST(OnlinePartitioningTest, Partitioning_Compiler_Compute_SmallModel) {
 }
 
 TEST(OnlinePartitioningTest, Partitioning_Compiler_Compute_RepeatedModel) {
-    ModelGenerator mg;
-    auto model = mg.get_model_with_repeated_blocks();
+    ModelBuilder mb;
+    auto model = mb.get_model_with_repeated_blocks();
 
     auto snap = std::make_shared<ov::npuw::online::Snapshot>(model);
 
@@ -575,9 +578,9 @@ TEST(OnlinePartitioningTest, Partitioning_Avoids_Pipeline_None) {
 TEST(OnlinePartitioningTest, IsRegularIOCaseWhenNoRB) {
     bool expected_result = false;
 
-    ModelGenerator mg;
-    std::vector<std::shared_ptr<ov::Model>> models = {mg.get_model_with_one_op(),
-                                                      mg.get_model_without_repeated_blocks()};
+    ModelBuilder mb;
+    std::vector<std::shared_ptr<ov::Model>> models = {mb.get_model_with_one_op(),
+                                                      mb.get_model_without_repeated_blocks()};
 
     for (auto model : models) {
         auto cfg = createConfigWithKeepBlockSize(9);
@@ -589,10 +592,10 @@ TEST(OnlinePartitioningTest, IsRegularIOCaseWhenNoRB) {
 }
 
 TEST(OnlinePartitioningTest, IsRegularResultCaseMultipleOutputs) {
-    ModelGenerator mg;
+    ModelBuilder mb;
     std::vector<std::pair<std::shared_ptr<ov::Model>, bool>> model_expected = {
-        {mg.get_model_with_multi_output_repeating_blocks(10, /*irregular_io=*/true), /*irregular_io=*/true},
-        {mg.get_model_with_multi_output_repeating_blocks(10, /*irregular_io=*/false),
+        {mb.get_model_with_multi_output_repeating_blocks(10, /*irregular_io=*/true), /*irregular_io=*/true},
+        {mb.get_model_with_multi_output_repeating_blocks(10, /*irregular_io=*/false),
          /*irregular_io=*/false}};
 
     for (auto [model, expected_result] : model_expected) {
@@ -607,8 +610,8 @@ TEST(OnlinePartitioningTest, IsRegularResultCaseMultipleOutputs) {
 TEST_P(IsRegularResultCaseParametrized, CheckForDifferentResultConfigs) {
     auto [block_indices, expected_result] = GetParam();
 
-    ModelGenerator mg;
-    auto model = mg.get_model_with_repeated_blocks_and_results(10, block_indices);
+    ModelBuilder mb;
+    auto model = mb.get_model_with_repeated_blocks_and_results(10, block_indices);
 
     auto cfg = createConfigWithKeepBlockSize(9);
     auto ens = ov::npuw::online::buildPartitioning(model, cfg);
@@ -633,8 +636,8 @@ INSTANTIATE_TEST_SUITE_P(OnlinePartitioningTest,
 TEST_P(IsRegularParameterCaseParametrized, CheckForDifferentParameterConfigs) {
     auto [block_indices, expected_result] = GetParam();
 
-    ModelGenerator mg;
-    auto model = mg.get_model_with_repeated_blocks_and_parameters(10, block_indices);
+    ModelBuilder mb;
+    auto model = mb.get_model_with_repeated_blocks_and_parameters(10, block_indices);
     auto cfg = createConfigWithKeepBlockSize(4);
     auto ens = ov::npuw::online::buildPartitioning(model, cfg);
 
@@ -654,3 +657,521 @@ INSTANTIATE_TEST_SUITE_P(OnlinePartitioningTest,
                              std::make_tuple(std::vector<std::size_t>{5}, /*irregular_io=*/true),
                              // No blocks have an additional ov::Parameter producers
                              std::make_tuple(std::vector<std::size_t>{}, /*irregular_io=*/false)));
+
+// ============== LLM Model Builder Tests ==============
+
+TEST(LLMModelBuilderTest, BasicLLMModel_HasCorrectStructure) {
+    ModelBuilder mb;
+    LLMConfig config;
+    config.num_layers = 2;
+    config.hidden_size = 64;
+    config.num_heads = 4;
+    config.head_dim = 16;
+    config.vocab_size = 100;
+
+    auto model = mb.build_llm(config);
+
+    ASSERT_NE(model, nullptr);
+
+    auto params = model->get_parameters();
+    bool has_input_ids = false;
+    bool has_attention_mask = false;
+    bool has_position_ids = false;
+
+    for (const auto& param : params) {
+        if (param->get_friendly_name() == "input_ids") has_input_ids = true;
+        if (param->get_friendly_name() == "attention_mask") has_attention_mask = true;
+        if (param->get_friendly_name() == "position_ids") has_position_ids = true;
+    }
+
+    EXPECT_TRUE(has_input_ids) << "Missing input_ids parameter";
+    EXPECT_TRUE(has_attention_mask) << "Missing attention_mask parameter";
+    EXPECT_TRUE(has_position_ids) << "Missing position_ids parameter";
+
+    // KV cache is stateful (ReadValue/Assign with Variables), not parametric
+    auto variables = model->get_variables();
+    size_t kv_var_count = 0;
+    for (const auto& var : variables) {
+        if (var->get_info().variable_id.find("past_key_values") != std::string::npos) {
+            kv_var_count++;
+        }
+    }
+    EXPECT_EQ(kv_var_count, config.num_layers * 2) << "Expected " << config.num_layers * 2 << " KV cache variables";
+
+    // Sinks (Assign nodes) for KV cache state updates
+    auto sinks = model->get_sinks();
+    EXPECT_EQ(sinks.size(), config.num_layers * 2) << "Expected K and V Assign sinks per layer";
+
+    auto results = model->get_results();
+    EXPECT_GE(results.size(), 1) << "Expected at least logits result";
+}
+
+TEST(LLMModelBuilderTest, BasicLLMModel_ContainsDecomposedAttention) {
+    ModelBuilder mb;
+    LLMConfig config;
+    config.num_layers = 1;
+
+    auto model = mb.build_llm(config);
+
+    // Native SDPA v13 op used for attention
+    size_t sdpa_count = 0;
+    for (const auto& op : model->get_ops()) {
+        if (op->get_type_name() == std::string("ScaledDotProductAttention")) {
+            sdpa_count++;
+        }
+    }
+    EXPECT_EQ(sdpa_count, config.num_layers) << "Expected one SDPA per layer";
+}
+
+TEST(LLMModelBuilderTest, BasicLLMModel_HasKVCacheConcat) {
+    ModelBuilder mb;
+    LLMConfig config;
+    config.num_layers = 2;
+
+    auto model = mb.build_llm(config);
+
+    size_t concat_count = 0;
+    for (const auto& op : model->get_ops()) {
+        if (op->get_type_name() == std::string("Concat")) {
+            concat_count++;
+        }
+    }
+    EXPECT_GE(concat_count, config.num_layers * 2) << "Expected K and V concat per layer";
+}
+
+TEST(LLMModelBuilderTest, Partitioning_LLMModel) {
+    ModelBuilder mb;
+    LLMConfig config;
+    config.num_layers = 4;
+
+    auto model = mb.build_llm(config);
+
+    ASSERT_NE(model, nullptr);
+    EXPECT_EQ(model->get_friendly_name(), "llm_test_model");
+
+    size_t sdpa_count = 0;
+    for (const auto& op : model->get_ops()) {
+        if (op->get_type_name() == std::string("ScaledDotProductAttention")) {
+            sdpa_count++;
+        }
+    }
+    EXPECT_EQ(sdpa_count, config.num_layers) << "Expected one SDPA per layer";
+}
+
+TEST(LLMModelBuilderTest, LLMModel_WithoutPositionIds) {
+    ModelBuilder mb;
+    LLMConfig config;
+    config.num_layers = 1;
+    config.use_position_ids = false;
+
+    auto model = mb.build_llm(config);
+    ASSERT_NE(model, nullptr);
+
+    auto params = model->get_parameters();
+    bool has_position_ids = false;
+    for (const auto& param : params) {
+        if (param->get_friendly_name() == "position_ids") has_position_ids = true;
+    }
+    EXPECT_FALSE(has_position_ids) << "Should not have position_ids when disabled";
+
+    // Should still have SDPA (just no RoPE)
+    size_t sdpa_count = 0;
+    for (const auto& op : model->get_ops()) {
+        if (op->get_type_name() == std::string("ScaledDotProductAttention")) {
+            sdpa_count++;
+        }
+    }
+    EXPECT_EQ(sdpa_count, config.num_layers);
+}
+
+TEST(LLMModelBuilderTest, LLMModel_WithRoPE_HasGatherOps) {
+    ModelBuilder mb;
+    LLMConfig config;
+    config.num_layers = 1;
+    config.use_position_ids = true;
+    config.rope_type = RoPEType::HALF_ROTATION;
+
+    auto model = mb.build_llm(config);
+    ASSERT_NE(model, nullptr);
+
+    // RoPE uses Gather to index cos/sin tables by position_ids
+    // 2 Gathers per RoPE (cos + sin), applied to Q and K = 4 Gathers per layer
+    // Plus 1 Gather for the embedding
+    size_t gather_count = 0;
+    for (const auto& op : model->get_ops()) {
+        if (op->get_type_name() == std::string("Gather")) {
+            gather_count++;
+        }
+    }
+    EXPECT_GE(gather_count, 4 * config.num_layers + 1) << "Expected Gather ops for RoPE cos/sin + embedding";
+}
+
+TEST(LLMModelBuilderTest, LLMModel_CompressedWeights_FP16) {
+    ModelBuilder mb;
+    LLMConfig config;
+    config.num_layers = 1;
+    config.weight_format = WeightFormat::FP16;
+    config.use_position_ids = false;
+
+    auto model = mb.build_llm(config);
+    ASSERT_NE(model, nullptr);
+
+    // FP16 weights produce Convert ops
+    size_t convert_count = 0;
+    for (const auto& op : model->get_ops()) {
+        if (op->get_type_name() == std::string("Convert")) {
+            convert_count++;
+        }
+    }
+    EXPECT_GT(convert_count, 0) << "Expected Convert ops for FP16 weight decompression";
+}
+
+TEST(LLMModelBuilderTest, LLMModel_CompressedWeights_INT8) {
+    ModelBuilder mb;
+    LLMConfig config;
+    config.num_layers = 1;
+    config.weight_format = WeightFormat::INT8;
+    config.use_position_ids = false;
+
+    auto model = mb.build_llm(config);
+    ASSERT_NE(model, nullptr);
+
+    // INT8 weights produce Convert + Multiply(scale) ops
+    size_t convert_count = 0;
+    for (const auto& op : model->get_ops()) {
+        if (op->get_type_name() == std::string("Convert")) {
+            convert_count++;
+        }
+    }
+    EXPECT_GT(convert_count, 0) << "Expected Convert ops for INT8 weight decompression";
+}
+
+TEST(LLMModelBuilderTest, LLMModel_ConfigurableLMHead) {
+    ModelBuilder mb;
+    LLMConfig config;
+    config.num_layers = 1;
+    config.weight_format = WeightFormat::FP32;
+    config.lm_head_format = WeightFormat::FP16;
+    config.use_position_ids = false;
+
+    auto model = mb.build_llm(config);
+    ASSERT_NE(model, nullptr);
+
+    // The LM head should have FP16 weights with Convert,
+    // while other layers use FP32.
+    // The attention mask also has a Convert (i64 -> f32), so expect 2 total.
+    size_t convert_count = 0;
+    for (const auto& op : model->get_ops()) {
+        if (op->get_type_name() == std::string("Convert")) {
+            convert_count++;
+        }
+    }
+    EXPECT_EQ(convert_count, 2) << "Expected Convert for LM head FP16 weight + attention mask";
+}
+
+// ============== Modular Building Block Tests ==============
+
+TEST(ModelBuilderBlocksTest, MakeLinear_CreatesCorrectStructure) {
+    ModelBuilder mb;
+    mb.clear();
+
+    auto input = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 8, 64});
+    mb.track(input);
+
+    auto output = mb.make_linear(input->output(0), 128, "test_linear", ov::element::f32, false);
+
+    auto shape = output.get_partial_shape();
+    EXPECT_EQ(shape.rank().get_length(), 3);
+    EXPECT_EQ(shape[2].get_length(), 128);
+}
+
+TEST(ModelBuilderBlocksTest, MakeLinear_CompressedWeights) {
+    ModelBuilder mb;
+    mb.clear();
+
+    auto input = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 8, 64});
+    mb.track(input);
+
+    // FP16 compressed weight
+    auto output = mb.make_linear(input->output(0), 128, "test_linear_fp16",
+                                  ov::element::f32, false, WeightFormat::FP16);
+
+    auto shape = output.get_partial_shape();
+    EXPECT_EQ(shape[2].get_length(), 128);
+
+    // Verify the MatMul input has a Convert in its chain (from FP16 weight)
+    auto matmul_node = output.get_node_shared_ptr();
+    EXPECT_EQ(matmul_node->get_type_name(), std::string("MatMul"));
+    auto weight_input = matmul_node->input(1).get_source_output().get_node_shared_ptr();
+    EXPECT_EQ(weight_input->get_type_name(), std::string("Convert"));
+}
+
+TEST(ModelBuilderBlocksTest, MakeNorm_CreatesLayerNormalization) {
+    ModelBuilder mb;
+    mb.clear();
+
+    auto input = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 8, 64});
+    mb.track(input);
+
+    auto output = mb.make_norm(input->output(0), 64, "test_ln", NormType::LAYER_NORM);
+
+    auto shape = output.get_partial_shape();
+    EXPECT_EQ(shape[2].get_length(), 64);
+}
+
+TEST(ModelBuilderBlocksTest, MakeNorm_CreatesRMSNormalization) {
+    ModelBuilder mb;
+    mb.clear();
+
+    auto input = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 8, 64});
+    mb.track(input);
+
+    auto output = mb.make_norm(input->output(0), 64, "test_rms", NormType::RMS_NORM);
+
+    auto shape = output.get_partial_shape();
+    EXPECT_EQ(shape[2].get_length(), 64);
+}
+
+TEST(ModelBuilderBlocksTest, MakeFFN_CreatesSwiGLU) {
+    ModelBuilder mb;
+    mb.clear();
+
+    auto input = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 8, 64});
+    mb.track(input);
+
+    auto output = mb.make_ffn(input->output(0), 64, 256, "test_ffn", FFNType::SWIGLU);
+
+    auto shape = output.get_partial_shape();
+    EXPECT_EQ(shape[2].get_length(), 64);
+}
+
+TEST(ModelBuilderBlocksTest, MakeFFN_CreatesGELU) {
+    ModelBuilder mb;
+    mb.clear();
+
+    auto input = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 8, 64});
+    mb.track(input);
+
+    auto output = mb.make_ffn(input->output(0), 64, 256, "test_ffn_gelu", FFNType::GELU);
+
+    auto shape = output.get_partial_shape();
+    EXPECT_EQ(shape[2].get_length(), 64);
+}
+
+TEST(ModelBuilderBlocksTest, MakeKVCacheConcat_CreatesNPUWPattern) {
+    ModelBuilder mb;
+    mb.clear();
+
+    auto current_kv = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 4, 1, 16});
+    auto batch_src = std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::Shape{1, 1});
+    auto beam_idx = std::make_shared<ov::op::v0::Parameter>(ov::element::i32, ov::Shape{1});
+    mb.track(current_kv);
+    mb.track(batch_src);
+    mb.track(beam_idx);
+
+    auto result = mb.make_kv_cache_concat(current_kv->output(0), batch_src->output(0),
+                                           beam_idx->output(0), 4, 16, "past_key_values.0.key");
+
+    ASSERT_NE(result.assign, nullptr);
+    EXPECT_EQ(result.assign->get_type_name(), std::string("Assign"));
+
+    auto concat_node = result.concatenated.get_node_shared_ptr();
+    EXPECT_EQ(concat_node->get_type_name(), std::string("Concat"));
+}
+
+TEST(ModelBuilderBlocksTest, MakeRoPE_HalfRotation) {
+    ModelBuilder mb;
+    mb.clear();
+
+    // Input: [batch, seq, heads, head_dim]
+    auto input = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 8, 4, 16});
+    auto pos_ids = std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::Shape{1, 8});
+    mb.track(input);
+    mb.track(pos_ids);
+
+    auto output = mb.make_rope(input->output(0), pos_ids->output(0), 16, 128,
+                                "test_rope", RoPEType::HALF_ROTATION);
+
+    // Output should have same shape as input
+    auto shape = output.get_partial_shape();
+    EXPECT_EQ(shape.rank().get_length(), 4);
+    EXPECT_EQ(shape[3].get_length(), 16);
+}
+
+TEST(ModelBuilderBlocksTest, MakeRoPE_Interleaved) {
+    ModelBuilder mb;
+    mb.clear();
+
+    auto input = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 8, 4, 16});
+    auto pos_ids = std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::Shape{1, 8});
+    mb.track(input);
+    mb.track(pos_ids);
+
+    auto output = mb.make_rope(input->output(0), pos_ids->output(0), 16, 128,
+                                "test_rope_interleaved", RoPEType::INTERLEAVED);
+
+    auto shape = output.get_partial_shape();
+    EXPECT_EQ(shape.rank().get_length(), 4);
+    EXPECT_EQ(shape[3].get_length(), 16);
+}
+
+TEST(ModelBuilderBlocksTest, MakeDecoderLayer_CreatesCompleteBlock) {
+    ModelBuilder mb;
+    mb.clear();
+
+    LLMConfig config;
+    config.hidden_size = 64;
+    config.num_heads = 4;
+    config.head_dim = 16;
+    config.intermediate_size = 256;
+    config.use_kv_cache = true;
+    config.use_position_ids = false;
+
+    auto input = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, -1, 64});
+    auto batch_src = std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::PartialShape{-1, -1});
+    auto beam_idx = std::make_shared<ov::op::v0::Parameter>(ov::element::i32, ov::PartialShape{-1});
+    auto attn_mask = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 1, 1, -1});
+    mb.track(input);
+    mb.track(batch_src);
+    mb.track(beam_idx);
+    mb.track(attn_mask);
+
+    ov::Output<ov::Node> empty_pos_ids;
+    auto result = mb.make_decoder_layer(input->output(0), config, 0, empty_pos_ids,
+                                         batch_src->output(0), beam_idx->output(0),
+                                         attn_mask->output(0));
+
+    EXPECT_EQ(result.sinks.size(), 2) << "Expected K and V cache Assign sinks";
+
+    auto shape = result.output.get_partial_shape();
+    EXPECT_EQ(shape[2].get_length(), 64);
+}
+
+TEST(ModelBuilderBlocksTest, LLMModel_WithoutKVCache) {
+    ModelBuilder mb;
+    LLMConfig config;
+    config.num_layers = 1;
+    config.use_kv_cache = false;
+
+    auto model = mb.build_llm(config);
+
+    auto variables = model->get_variables();
+    EXPECT_EQ(variables.size(), 0) << "Should have no KV cache variables when disabled";
+
+    auto sinks = model->get_sinks();
+    EXPECT_EQ(sinks.size(), 0) << "Should have no Assign sinks when KV cache disabled";
+}
+
+TEST(ModelBuilderBlocksTest, LLMModel_GQA_DifferentKVHeads) {
+    ModelBuilder mb;
+    LLMConfig config;
+    config.num_layers = 1;
+    config.num_heads = 8;
+    config.num_kv_heads = 2;
+    config.head_dim = 16;
+    config.hidden_size = 128;
+
+    auto model = mb.build_llm(config);
+    ASSERT_NE(model, nullptr);
+
+    // KV cache is stateful — check variables have correct kv_heads dimension
+    auto variables = model->get_variables();
+    size_t kv_var_count = 0;
+    for (const auto& var : variables) {
+        if (var->get_info().variable_id.find("past_key_values") != std::string::npos) {
+            auto shape = var->get_info().data_shape;
+            EXPECT_EQ(shape[1].get_length(), config.num_kv_heads);
+            kv_var_count++;
+        }
+    }
+    EXPECT_EQ(kv_var_count, config.num_layers * 2) << "Expected K and V cache variables per layer";
+
+    size_t sdpa_count = 0;
+    for (const auto& op : model->get_ops()) {
+        if (op->get_type_name() == std::string("ScaledDotProductAttention")) {
+            sdpa_count++;
+        }
+    }
+    EXPECT_EQ(sdpa_count, config.num_layers) << "Expected one SDPA per layer";
+}
+
+// ============== Builder Pattern Tests ==============
+
+TEST(ModelBuilderPatternTest, BuilderPattern_ManualModel) {
+    ModelBuilder mb;
+    mb.clear();
+
+    auto input = mb.parameter(ov::element::f32, ov::PartialShape{-1, -1, 64}, "input");
+    auto normed = mb.make_norm(input->output(0), 64, "norm", NormType::RMS_NORM);
+    auto ffn_out = mb.make_ffn(normed, 64, 256, "ffn", FFNType::SWIGLU);
+    mb.result(ffn_out, "output");
+
+    auto model = mb.build("test_builder_model");
+
+    ASSERT_NE(model, nullptr);
+    EXPECT_EQ(model->get_friendly_name(), "test_builder_model");
+    EXPECT_EQ(model->get_parameters().size(), 1);
+    EXPECT_EQ(model->get_results().size(), 1);
+    EXPECT_EQ(model->get_parameters()[0]->get_friendly_name(), "input");
+    EXPECT_EQ(model->get_results()[0]->get_friendly_name(), "output");
+}
+
+// ============== KV Cache Pattern Tests ==============
+
+TEST(KVCachePatternTest, LLMModel_KVCacheNaming_MatchesNPUWPattern) {
+    ModelBuilder mb;
+    LLMConfig config;
+    config.num_layers = 2;
+    config.use_kv_cache = true;
+
+    auto model = mb.build_llm(config);
+    ASSERT_NE(model, nullptr);
+
+    // KV cache is stateful — check variable naming follows past_key_values.N.key/value pattern
+    auto variables = model->get_variables();
+    size_t key_count = 0;
+    size_t value_count = 0;
+
+    std::regex key_pattern(R"(past_key_values\.\d+\.key)");
+    std::regex value_pattern(R"(past_key_values\.\d+\.value)");
+
+    for (const auto& var : variables) {
+        const std::string name = var->get_info().variable_id;
+        if (std::regex_match(name, key_pattern)) {
+            key_count++;
+        }
+        if (std::regex_match(name, value_pattern)) {
+            value_count++;
+        }
+    }
+
+    EXPECT_EQ(key_count, config.num_layers) << "Expected one key cache variable per layer";
+    EXPECT_EQ(value_count, config.num_layers) << "Expected one value cache variable per layer";
+}
+
+TEST(KVCachePatternTest, LLMModel_ConcatPattern_ForKVCache) {
+    ModelBuilder mb;
+    LLMConfig config;
+    config.num_layers = 1;
+    config.use_kv_cache = true;
+
+    auto model = mb.build_llm(config);
+    ASSERT_NE(model, nullptr);
+
+    // Stateful KV cache pattern: ReadValue -> Gather(beam_idx) -> Concat
+    // Check for Concat nodes whose input chain contains a Gather fed by ReadValue
+    size_t kv_concat_count = 0;
+    for (const auto& op : model->get_ops()) {
+        if (op->get_type_name() == std::string("Concat")) {
+            auto input0 = op->input(0).get_source_output().get_node_shared_ptr();
+            // input0 should be Gather (beam search reordering)
+            if (input0->get_type_name() == std::string("Gather")) {
+                auto gather_input = input0->input(0).get_source_output().get_node_shared_ptr();
+                if (gather_input->get_type_name() == std::string("ReadValue")) {
+                    kv_concat_count++;
+                }
+            }
+        }
+    }
+    EXPECT_EQ(kv_concat_count, config.num_layers * 2) << "Expected ReadValue->Gather->Concat pattern for K and V";
+}

@@ -13,7 +13,9 @@
 #include "serialization.hpp"
 #include "compiled_model.hpp"
 #include "spatial.hpp"
-#include "model_generator/model_generator.hpp"
+#include "model_builder/model_builder.hpp"
+
+using namespace ov::test::npuw;
 
 // FIXME: parametrize all the tests below
 
@@ -298,11 +300,11 @@ TEST(SerializationTest, Stress_ParallelImport) {
     const std::string device = "NPU";
 
     // Create model
-    ModelGenerator mg;
-    auto model1 = mg.get_model_with_repeated_blocks();
-    auto model2 = mg.get_model_with_repeated_blocks();
-    auto model3 = mg.get_model_with_repeated_blocks();
-    auto model4 = mg.get_model_with_repeated_blocks();
+    ModelBuilder mb;
+    auto model1 = mb.get_model_with_repeated_blocks();
+    auto model2 = mb.get_model_with_repeated_blocks();
+    auto model3 = mb.get_model_with_repeated_blocks();
+    auto model4 = mb.get_model_with_repeated_blocks();
 
     // NPUW config
     ov::AnyMap config = {

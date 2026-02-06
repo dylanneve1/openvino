@@ -7,7 +7,9 @@
 #include <iostream>
 
 #include "openvino/openvino.hpp"
-#include "model_generator/model_generator.hpp"
+#include "model_builder/model_builder.hpp"
+
+using namespace ov::test::npuw;
 
 // FIXME: parametrize all the tests below
 
@@ -23,8 +25,8 @@ TEST(SetTensorNPUW, RemoteTensorOutputJust) {
     const std::string device = "NPU";
 
     // Create model
-    ModelGenerator mg;
-    auto model = mg.get_model_with_one_op();
+    ModelBuilder mb;
+    auto model = mb.get_model_with_one_op();
 
     ov::element::Type element_type = ov::element::i64;
     auto output_tensor_shape = model->outputs()[0].get_shape();
@@ -127,8 +129,8 @@ TEST_P(SetTensorNPUW_RemoteTensorInputTests, RemoteTensorInput) {
     const std::string device = "NPU";
 
     // Create model
-    ModelGenerator mg;
-    auto model = mg.get_model_with_repeated_blocks();
+    ModelBuilder mb;
+    auto model = mb.get_model_with_repeated_blocks();
 
     ov::element::Type element_type = ov::element::i32;
     auto input_tensor_shape = model->inputs()[0].get_shape();
