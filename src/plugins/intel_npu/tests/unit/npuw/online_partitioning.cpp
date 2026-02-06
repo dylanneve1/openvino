@@ -706,7 +706,7 @@ TEST(LLMModelBuilderTest, BasicLLMModel_HasCorrectStructure) {
     EXPECT_GE(results.size(), 1) << "Expected at least logits result";
 }
 
-TEST(LLMModelBuilderTest, BasicLLMModel_ContainsDecomposedAttention) {
+TEST(LLMModelBuilderTest, BasicLLMModel_ContainsSDPA) {
     ModelBuilder mb;
     LLMConfig config;
     config.num_layers = 1;
@@ -1127,13 +1127,14 @@ TEST(KVCachePatternTest, LLMModel_KVCacheNaming_MatchesNPUWPattern) {
     auto model = mb.build_llm(config);
     ASSERT_NE(model, nullptr);
 
-    // KV cache is stateful — check variable naming follows past_key_values.N.key/value pattern
+    // KV cache is stateful — check variable naming follows StatefulToStateless convention:
+    //   "past_key_values.N.keypresent.N.key" (input name + output name concatenated)
     auto variables = model->get_variables();
     size_t key_count = 0;
     size_t value_count = 0;
 
-    std::regex key_pattern(R"(past_key_values\.\d+\.key)");
-    std::regex value_pattern(R"(past_key_values\.\d+\.value)");
+    std::regex key_pattern(R"(past_key_values\.\d+\.keypresent\.\d+\.key)");
+    std::regex value_pattern(R"(past_key_values\.\d+\.valuepresent\.\d+\.value)");
 
     for (const auto& var : variables) {
         const std::string name = var->get_info().variable_id;

@@ -27,7 +27,7 @@ static void print_help(const char* prog) {
     std::cout << "  -o, --output <dir>      Output directory (default: npuw_test_models)\n";
     std::cout << "  -n, --name <name>       Model subdirectory name (default: model)\n\n";
     std::cout << "LLM options (--type llm):\n";
-    std::cout << "  --num-layers <N>        Number of decoder layers (default: 2)\n";
+    std::cout << "  --num-layers <N>        Number of decoder layers (default: 6)\n";
     std::cout << "  --hidden-size <N>       Hidden dimension (default: 256)\n";
     std::cout << "  --num-heads <N>         Number of attention heads (default: 8)\n";
     std::cout << "  --num-kv-heads <N>      Number of KV heads, 0=MHA (default: 0)\n";
@@ -121,7 +121,7 @@ int main(int argc, char* argv[]) {
 
     // LLM config defaults (Llama-like)
     LLMConfig config;
-    config.num_layers = 2;
+    config.num_layers = 6;
     config.hidden_size = 256;
     config.num_heads = 8;
     config.head_dim = 32;

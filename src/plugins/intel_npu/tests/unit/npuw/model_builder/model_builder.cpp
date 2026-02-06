@@ -1205,10 +1205,15 @@ LayerResult ModelBuilder::make_attention_block(const ov::Output<ov::Node>& input
     ov::Output<ov::Node> v_for_attn = v_trans;
 
     if (config.use_kv_cache) {
+        // Variable IDs follow the naming convention expected by StatefulToStateless:
+        //   "past_key_values.N.keypresent.N.key" (input name + output name concatenated)
+        // This ensures parameter names in the converted stateless model are "past_key_values.N.key"
+        // (without "input_restored." prefix), which is required by NPUW's HFA/Pyramid attention detection.
+        auto layer_str = std::to_string(layer_idx);
         auto k_cache = make_kv_cache_concat(k_trans, batch_source, beam_idx, kv_heads, head_dim,
-            "past_key_values." + std::to_string(layer_idx) + ".key", prec);
+            "past_key_values." + layer_str + ".key" + "present." + layer_str + ".key", prec);
         auto v_cache = make_kv_cache_concat(v_trans, batch_source, beam_idx, kv_heads, head_dim,
-            "past_key_values." + std::to_string(layer_idx) + ".value", prec);
+            "past_key_values." + layer_str + ".value" + "present." + layer_str + ".value", prec);
 
         sinks.push_back(k_cache.assign);
         sinks.push_back(v_cache.assign);
