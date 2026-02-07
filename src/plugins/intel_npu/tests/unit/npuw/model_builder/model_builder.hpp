@@ -228,7 +228,7 @@ public:
     // ===== Composite blocks =====
 
     /// Complete attention block: norm -> Q/K/V proj -> [RoPE] -> transpose -> [KV cache] -> SDPA -> O proj + residual
-    /// attention_mask should be pre-transformed to float [batch, 1, 1, total_seq] additive mask.
+    /// attention_mask should be pre-transformed to float [batch, 1, seq_len, total_seq] additive mask.
     /// Transform once before the layer loop (not per-layer) for proper NPUW repeating block detection.
     LayerResult make_attention_block(const ov::Output<ov::Node>& input,
                                      const LLMConfig& config, size_t layer_idx,

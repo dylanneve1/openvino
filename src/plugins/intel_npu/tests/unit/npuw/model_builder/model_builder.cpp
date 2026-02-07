@@ -860,7 +860,7 @@ ov::Output<ov::Node> ModelBuilder::make_attention(const ov::Output<ov::Node>& q,
                                                    const ov::Output<ov::Node>& attention_mask) {
     // Use native ScaledDotProductAttention op (v13) which is required by
     // SDPAToPagedAttention transformation and compatible with all backends.
-    // Input shapes: Q,K,V = [batch, heads, seq, head_dim], mask = [batch, 1, 1, total_seq]
+    // Input shapes: Q,K,V = [batch, heads, seq, head_dim], mask = [batch, 1, seq_len, total_seq]
 
     std::shared_ptr<ov::op::v13::ScaledDotProductAttention> sdpa;
     if (attention_mask.get_node()) {
@@ -1337,11 +1337,14 @@ std::shared_ptr<ov::Model> ModelBuilder::build_llm(const LLMConfig& config) {
     auto hidden_states = make_embedding(input_ids->output(0), config.vocab_size, config.hidden_size,
                                         "model.embed_tokens", prec);
 
-    // ===== Attention mask: transform once before layer loop =====
-    // Convert [batch, total_seq] i64 mask to [batch, 1, 1, total_seq] float additive mask
+    // ===== Attention mask: create proper 4D causal + padding mask =====
+    // Convert [batch, total_seq] i64 mask to [batch, 1, seq_len, total_seq] float additive mask.
+    // Uses causal (lower triangular) mask combined with padding mask, matching
+    // the HuggingFace LLaMA export pattern required by NPUW HFA tiled attention.
     // All layers share the same pre-transformed mask node (required for NPUW repeating block detection)
     ov::Output<ov::Node> sdpa_mask;
     {
+        // --- Padding mask component: [batch, total_seq] -> [batch, 1, 1, total_seq] ---
         auto mask_float = std::make_shared<ov::opset11::Convert>(attention_mask->output(0), prec);
         mask_float->set_friendly_name("model.mask_convert");
         m_nodes.push_back(mask_float);
@@ -1354,18 +1357,111 @@ std::shared_ptr<ov::Model> ModelBuilder::build_llm(const LLMConfig& config) {
 
         auto neg_inf = ov::opset11::Constant::create(prec, ov::Shape{}, {-10000.0f});
         m_nodes.push_back(neg_inf);
-        auto float_mask = std::make_shared<ov::opset11::Multiply>(inv_mask, neg_inf);
-        float_mask->set_friendly_name("model.mask_scaled");
-        m_nodes.push_back(float_mask);
+        auto padding_mask = std::make_shared<ov::opset11::Multiply>(inv_mask, neg_inf);
+        padding_mask->set_friendly_name("model.padding_mask");
+        m_nodes.push_back(padding_mask);
 
-        auto mask_shape = ov::opset11::Constant::create(ov::element::i64, ov::Shape{4},
+        auto pad_shape = ov::opset11::Constant::create(ov::element::i64, ov::Shape{4},
             std::vector<int64_t>{0, 1, 1, -1});
-        m_nodes.push_back(mask_shape);
-        auto mask_4d = std::make_shared<ov::opset11::Reshape>(float_mask, mask_shape, true);
-        mask_4d->set_friendly_name("model.mask_4d");
-        m_nodes.push_back(mask_4d);
+        m_nodes.push_back(pad_shape);
+        auto padding_4d = std::make_shared<ov::opset11::Reshape>(padding_mask, pad_shape, true);
+        padding_4d->set_friendly_name("model.padding_mask_4d");
+        m_nodes.push_back(padding_4d);
 
-        sdpa_mask = mask_4d->output(0);
+        // --- Causal mask component: [1, 1, seq_len, total_seq] ---
+        // Extract dynamic dimensions
+        auto ids_shape = std::make_shared<ov::opset11::ShapeOf>(input_ids, ov::element::i64);
+        ids_shape->set_friendly_name("model.ids_shape");
+        m_nodes.push_back(ids_shape);
+
+        auto mask_shape_node = std::make_shared<ov::opset11::ShapeOf>(attention_mask, ov::element::i64);
+        mask_shape_node->set_friendly_name("model.mask_shape");
+        m_nodes.push_back(mask_shape_node);
+
+        // Scalar index for Gather (scalar indices -> scalar output)
+        auto idx1 = ov::opset11::Constant::create(ov::element::i64, ov::Shape{}, {1});
+        auto gather_axis = ov::opset11::Constant::create(ov::element::i64, ov::Shape{}, {0});
+        m_nodes.push_back(idx1);
+        m_nodes.push_back(gather_axis);
+
+        auto seq_len_s = std::make_shared<ov::opset11::Gather>(ids_shape, idx1, gather_axis);
+        seq_len_s->set_friendly_name("model.seq_len");
+        m_nodes.push_back(seq_len_s);
+
+        auto total_seq_s = std::make_shared<ov::opset11::Gather>(mask_shape_node, idx1, gather_axis);
+        total_seq_s->set_friendly_name("model.total_seq");
+        m_nodes.push_back(total_seq_s);
+
+        // offset = total_seq - seq_len (= past sequence length)
+        auto offset = std::make_shared<ov::opset11::Subtract>(total_seq_s, seq_len_s);
+        offset->set_friendly_name("model.causal_offset");
+        m_nodes.push_back(offset);
+
+        // kv_range = [0, 1, ..., total_seq-1]
+        auto range_start = ov::opset11::Constant::create(ov::element::i64, ov::Shape{}, {0});
+        auto range_step = ov::opset11::Constant::create(ov::element::i64, ov::Shape{}, {1});
+        m_nodes.push_back(range_start);
+        m_nodes.push_back(range_step);
+
+        auto kv_range = std::make_shared<ov::op::v4::Range>(range_start, total_seq_s, range_step, ov::element::i64);
+        kv_range->set_friendly_name("model.kv_range");
+        m_nodes.push_back(kv_range);
+
+        // q_range = [0, 1, ..., seq_len-1], then add offset for absolute positions
+        auto q_range = std::make_shared<ov::op::v4::Range>(range_start, seq_len_s, range_step, ov::element::i64);
+        q_range->set_friendly_name("model.q_range");
+        m_nodes.push_back(q_range);
+
+        auto q_abs = std::make_shared<ov::opset11::Add>(q_range, offset);
+        q_abs->set_friendly_name("model.q_abs_positions");
+        m_nodes.push_back(q_abs);
+
+        // Reshape for broadcasting comparison:
+        // q_abs: [seq_len] -> [seq_len, 1]
+        // kv_range: [total_seq] -> [1, total_seq]
+        auto axis_last = ov::opset11::Constant::create(ov::element::i64, ov::Shape{1}, {1});
+        auto axis_first = ov::opset11::Constant::create(ov::element::i64, ov::Shape{1}, {0});
+        m_nodes.push_back(axis_last);
+        m_nodes.push_back(axis_first);
+
+        auto q_col = std::make_shared<ov::opset11::Unsqueeze>(q_abs, axis_last);
+        q_col->set_friendly_name("model.q_col");
+        m_nodes.push_back(q_col);
+
+        auto kv_row = std::make_shared<ov::opset11::Unsqueeze>(kv_range, axis_first);
+        kv_row->set_friendly_name("model.kv_row");
+        m_nodes.push_back(kv_row);
+
+        // causal_bool[i,j] = (kv_range[j] <= q_abs[i]) -> [seq_len, total_seq]
+        auto causal_bool = std::make_shared<ov::op::v1::LessEqual>(kv_row, q_col);
+        causal_bool->set_friendly_name("model.causal_bool");
+        m_nodes.push_back(causal_bool);
+
+        // Convert to additive float mask: True -> 0.0, False -> -10000.0
+        auto select_true = ov::opset11::Constant::create(prec, ov::Shape{}, {0.0f});
+        auto select_false = ov::opset11::Constant::create(prec, ov::Shape{}, {-10000.0f});
+        m_nodes.push_back(select_true);
+        m_nodes.push_back(select_false);
+
+        auto causal_float = std::make_shared<ov::op::v1::Select>(causal_bool, select_true, select_false);
+        causal_float->set_friendly_name("model.causal_mask");
+        m_nodes.push_back(causal_float);
+
+        // [seq_len, total_seq] -> [1, 1, seq_len, total_seq]
+        auto unsqueeze_axes = ov::opset11::Constant::create(ov::element::i64, ov::Shape{2}, {0, 1});
+        m_nodes.push_back(unsqueeze_axes);
+
+        auto causal_4d = std::make_shared<ov::opset11::Unsqueeze>(causal_float, unsqueeze_axes);
+        causal_4d->set_friendly_name("model.causal_mask_4d");
+        m_nodes.push_back(causal_4d);
+
+        // --- Combine: padding [batch, 1, 1, total_seq] + causal [1, 1, seq_len, total_seq] ---
+        // Broadcasts to [batch, 1, seq_len, total_seq]
+        auto combined = std::make_shared<ov::opset11::Add>(padding_4d, causal_4d);
+        combined->set_friendly_name("model.mask_4d");
+        m_nodes.push_back(combined);
+
+        sdpa_mask = combined->output(0);
     }
 
     // ===== MIDDLE: Decoder Layers =====
