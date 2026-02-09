@@ -257,8 +257,25 @@ ov::Output<ov::Node> InterleavedRoPE::operator()(const ov::Output<ov::Node>& inp
 // PositionIds Functor Implementations
 // ============================================================================
 
-ov::Output<ov::Node> Input2DPositionIds::operator()(ModelBuilder& b) const {
-    return b.parameter(ov::element::i64, ov::PartialShape{-1, -1}, "position_ids")->output(0);
+ov::Output<ov::Node> Input2DPositionIds::operator()(const ov::Output<ov::Node>& /*attention_mask*/) const {
+    auto param = std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::PartialShape{-1, -1});
+    param->set_friendly_name("position_ids");
+    param->output(0).set_names({"position_ids"});
+    return param->output(0);
+}
+
+ov::Output<ov::Node> CumsumPositionIds::operator()(const ov::Output<ov::Node>& attention_mask) const {
+    // cumsum(attention_mask, axis=1) - 1
+    // For mask [1,1,1,0,0] -> cumsum [1,2,3,3,3] -> positions [0,1,2,2,2]
+    auto axis = ov::opset11::Constant::create(ov::element::i64, ov::Shape{}, {1});
+    auto cumsum = std::make_shared<ov::op::v0::CumSum>(attention_mask, axis, false, false);
+    cumsum->set_friendly_name("position_ids_cumsum");
+
+    auto one = ov::opset11::Constant::create(ov::element::i64, ov::Shape{}, {1});
+    auto positions = std::make_shared<ov::opset11::Subtract>(cumsum, one);
+    positions->set_friendly_name("position_ids");
+
+    return positions->output(0);
 }
 
 // ============================================================================
@@ -1082,7 +1099,13 @@ std::shared_ptr<ov::Model> ModelBuilder::build_llm(const LLMConfig& config_in) {
 
     ov::Output<ov::Node> position_ids_output;
     if (config.position_ids) {
-        position_ids_output = config.position_ids(*this);
+        position_ids_output = config.position_ids(attention_mask->output(0));
+        // Auto-track if the functor created a Parameter node
+        auto param = std::dynamic_pointer_cast<ov::op::v0::Parameter>(
+            position_ids_output.get_node_shared_ptr());
+        if (param) {
+            m_parameters.push_back(param);
+        }
     }
 
     // beam_idx is required for stateful models used with LLMPipeline
