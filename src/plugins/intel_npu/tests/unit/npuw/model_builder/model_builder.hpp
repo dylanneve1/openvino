@@ -56,9 +56,8 @@ using RoPEFn = std::function<ov::Output<ov::Node>(
     const ov::Output<ov::Node>&, const ov::Output<ov::Node>&, const std::string&)>;
 
 /// PositionIds functor: creates the position_ids tensor (as input parameter or subgraph).
-/// Receives attention_mask so subgraph-based variants can derive position_ids from it.
-/// For input-based variants (e.g. Input2DPositionIds), the attention_mask is ignored.
-using PositionIdsFn = std::function<ov::Output<ov::Node>(const ov::Output<ov::Node>& attention_mask)>;
+/// For input-based variants, creates a Parameter node (auto-tracked by build_llm).
+using PositionIdsFn = std::function<ov::Output<ov::Node>()>;
 
 // ============================================================================
 // Weight functors
@@ -179,15 +178,8 @@ RoPEEmbeddings gather_rope_embeddings(size_t head_dim, size_t max_position,
 // ============================================================================
 
 /// 2D position_ids as a model input parameter: [batch, seq]
-/// The attention_mask argument is accepted but ignored (position_ids comes from input).
 struct Input2DPositionIds {
-    ov::Output<ov::Node> operator()(const ov::Output<ov::Node>& attention_mask) const;
-};
-
-/// Subgraph-based position_ids computed from attention_mask: cumsum(mask, axis=1) - 1.
-/// Produces correct position indices for padded sequences (0-based from first non-pad token).
-struct CumsumPositionIds {
-    ov::Output<ov::Node> operator()(const ov::Output<ov::Node>& attention_mask) const;
+    ov::Output<ov::Node> operator()() const;
 };
 
 // ============================================================================
