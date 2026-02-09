@@ -17,6 +17,7 @@
 
 namespace {
 
+using ov::test::npuw::Input2DPositionIds;
 using ov::test::npuw::LLMConfig;
 using ov::test::npuw::ModelBuilder;
 
@@ -28,8 +29,6 @@ LLMConfig make_small_config() {
     config.intermediate_size = 32;
     config.vocab_size = 32;
     config.num_layers = 1;
-    config.context_len = 8;
-    config.seq_len = 2;
     config.precision = ov::element::f32;
     return config;
 }
@@ -68,7 +67,7 @@ std::shared_ptr<ov::Node> find_by_name(const std::shared_ptr<ov::Model>& model, 
 TEST(LLMBuilderTest, KVCacheCreatesStateOpsAndSinks) {
     auto config = make_small_config();
     config.use_kv_cache = true;
-    config.use_position_ids = false;
+    config.position_ids = {};
 
     ModelBuilder builder;
     auto model = builder.build_llm(config);
@@ -82,7 +81,7 @@ TEST(LLMBuilderTest, KVCacheCreatesStateOpsAndSinks) {
 TEST(LLMBuilderTest, StatefulToStatelessRemovesStateOps) {
     auto config = make_small_config();
     config.use_kv_cache = true;
-    config.use_position_ids = false;
+    config.position_ids = {};
 
     ModelBuilder builder;
     auto model = builder.build_llm(config);
@@ -98,7 +97,7 @@ TEST(LLMBuilderTest, StatefulToStatelessRemovesStateOps) {
 TEST(LLMBuilderTest, SDPAToPagedAttentionTransforms) {
     auto config = make_small_config();
     config.use_kv_cache = true;
-    config.use_position_ids = true;
+    config.position_ids = Input2DPositionIds{};
 
     ModelBuilder builder;
     auto model = builder.build_llm(config);
@@ -112,7 +111,7 @@ TEST(LLMBuilderTest, SDPAToPagedAttentionTransforms) {
 TEST(LLMBuilderTest, RoPEToggleAddsAndRemovesSubgraph) {
     auto config = make_small_config();
     config.use_kv_cache = false;
-    config.use_position_ids = true;
+    config.position_ids = Input2DPositionIds{};
 
     ModelBuilder builder;
     auto model_with_rope = builder.build_llm(config);
@@ -120,7 +119,7 @@ TEST(LLMBuilderTest, RoPEToggleAddsAndRemovesSubgraph) {
     EXPECT_NE(find_by_name(model_with_rope, "model.layers.0.q_rope"), nullptr);
     EXPECT_NE(find_by_name(model_with_rope, "model.layers.0.k_rope"), nullptr);
 
-    config.use_position_ids = false;
+    config.position_ids = {};
     auto model_without_rope = builder.build_llm(config);
 
     EXPECT_EQ(find_by_name(model_without_rope, "model.layers.0.q_rope"), nullptr);
@@ -149,7 +148,7 @@ TEST(LLMBuilderTest, GQAToggleAddsAndRemovesRepeatKV) {
 TEST(LLMBuilderTest, AttentionMaskIs4DAndBroadcastable) {
     auto config = make_small_config();
     config.use_kv_cache = false;
-    config.use_position_ids = false;
+    config.position_ids = {};
 
     ModelBuilder builder;
     auto model = builder.build_llm(config);
@@ -173,7 +172,7 @@ TEST(LLMBuilderTest, CpuInferenceSmokeTest) {
 
     auto config = make_small_config();
     config.use_kv_cache = false;
-    config.use_position_ids = false;
+    config.position_ids = {};
 
     ModelBuilder builder;
     auto model = builder.build_llm(config);
