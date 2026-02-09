@@ -77,18 +77,25 @@ struct FP16Weight {
                                      size_t rows, size_t cols, ov::element::Type compute_precision) const;
 };
 
-/// i8 weights -> Convert(f16) -> Multiply(f16 per-channel scale)
-/// Matches DCOFF SymmNoZP pattern
-struct INT8Weight {
+/// Compressed integer weights -> Convert(f16) -> Multiply(f16 per-channel scale)
+/// Matches DCOFF SymmNoZP pattern. Parameterized by storage element type (i8, i4, u4, etc.)
+struct CompressedWeight {
+    ov::element::Type storage_type;
+
+    explicit CompressedWeight(ov::element::Type st) : storage_type(st) {}
+
     ov::Output<ov::Node> operator()(const std::string& name,
                                      size_t rows, size_t cols, ov::element::Type compute_precision) const;
 };
 
-/// i4 weights -> Convert(f16) -> Multiply(f16 per-channel scale)
-/// Matches DCOFF SymmNoZP pattern
-struct INT4Weight {
-    ov::Output<ov::Node> operator()(const std::string& name,
-                                     size_t rows, size_t cols, ov::element::Type compute_precision) const;
+/// i8 compressed weights
+struct INT8Weight : CompressedWeight {
+    INT8Weight() : CompressedWeight(ov::element::i8) {}
+};
+
+/// i4 compressed weights
+struct INT4Weight : CompressedWeight {
+    INT4Weight() : CompressedWeight(ov::element::i4) {}
 };
 
 // ============================================================================
@@ -152,6 +159,23 @@ struct InterleavedRoPE {
 };
 
 // ============================================================================
+// RoPE embedding helper
+// ============================================================================
+
+/// Gathered cos/sin embeddings for RoPE, unsqueezed for broadcasting
+struct RoPEEmbeddings {
+    ov::Output<ov::Node> cos;
+    ov::Output<ov::Node> sin;
+};
+
+/// Create cos/sin embedding tables, gather by position_ids, and unsqueeze for broadcast.
+/// Shared preamble used by both HalfRotationRoPE and InterleavedRoPE.
+RoPEEmbeddings gather_rope_embeddings(size_t head_dim, size_t max_position,
+                                       ov::element::Type precision,
+                                       const ov::Output<ov::Node>& position_ids,
+                                       const std::string& name);
+
+// ============================================================================
 // PositionIds functors
 // ============================================================================
 
@@ -198,6 +222,7 @@ struct GELUFn {
 
 /// Linear projection (MatMul with weight + optional bias)
 ov::Output<ov::Node> make_linear(const ov::Output<ov::Node>& input,
+                                  size_t in_features,
                                   size_t out_features,
                                   const std::string& name,
                                   ov::element::Type precision = ov::element::f32,
@@ -316,9 +341,6 @@ struct LLMConfig {
     size_t num_layers = 2;
 
     bool use_kv_cache = true;
-
-    bool use_dynamic_shapes = true;
-    size_t batch_size = 1;
 
     ov::element::Type precision = ov::element::f32;
 

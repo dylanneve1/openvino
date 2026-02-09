@@ -48,36 +48,11 @@ ov::Output<ov::Node> FP16Weight::operator()(const std::string& name,
     return convert->output(0);
 }
 
-ov::Output<ov::Node> INT8Weight::operator()(const std::string& name,
-                                             size_t rows, size_t cols,
-                                             ov::element::Type compute_precision) const {
+ov::Output<ov::Node> CompressedWeight::operator()(const std::string& name,
+                                                   size_t rows, size_t cols,
+                                                   ov::element::Type compute_precision) const {
     auto weight =
-        ov::opset11::Constant::create(ov::element::i8, ov::Shape{rows, cols}, std::vector<int8_t>(rows * cols, 1));
-    weight->set_friendly_name(name);
-
-    auto convert = std::make_shared<ov::opset11::Convert>(weight, ov::element::f16);
-    convert->set_friendly_name(name + "_convert");
-
-    auto scale =
-        ov::opset11::Constant::create(ov::element::f16, ov::Shape{rows, 1}, std::vector<float>(rows, 0.01f));
-    scale->set_friendly_name(name + "_scale");
-
-    auto scaled = std::make_shared<ov::opset11::Multiply>(convert, scale);
-    scaled->set_friendly_name(name + "_decompress");
-
-    if (compute_precision != ov::element::f16) {
-        auto to_compute = std::make_shared<ov::opset11::Convert>(scaled, compute_precision);
-        to_compute->set_friendly_name(name + "_to_compute");
-        return to_compute->output(0);
-    }
-    return scaled->output(0);
-}
-
-ov::Output<ov::Node> INT4Weight::operator()(const std::string& name,
-                                             size_t rows, size_t cols,
-                                             ov::element::Type compute_precision) const {
-    auto weight =
-        ov::opset11::Constant::create(ov::element::i4, ov::Shape{rows, cols}, std::vector<int8_t>(rows * cols, 1));
+        ov::opset11::Constant::create(storage_type, ov::Shape{rows, cols}, std::vector<int8_t>(rows * cols, 1));
     weight->set_friendly_name(name);
 
     auto convert = std::make_shared<ov::opset11::Convert>(weight, ov::element::f16);
@@ -155,9 +130,10 @@ ov::Output<ov::Node> RMSNorm::operator()(const ov::Output<ov::Node>& input,
 // RoPE Functor Implementations
 // ============================================================================
 
-ov::Output<ov::Node> HalfRotationRoPE::operator()(const ov::Output<ov::Node>& input,
-                                                    const ov::Output<ov::Node>& position_ids,
-                                                    const std::string& name) const {
+RoPEEmbeddings gather_rope_embeddings(size_t head_dim, size_t max_position,
+                                       ov::element::Type precision,
+                                       const ov::Output<ov::Node>& position_ids,
+                                       const std::string& name) {
     auto cos_table = ov::opset11::Constant::create(precision,
                                                    ov::Shape{max_position, head_dim},
                                                    std::vector<float>(max_position * head_dim, 0.5f));
@@ -183,6 +159,14 @@ ov::Output<ov::Node> HalfRotationRoPE::operator()(const ov::Output<ov::Node>& in
 
     auto sin_unsqueezed = std::make_shared<ov::opset11::Unsqueeze>(sin_embed, unsqueeze_axis);
     sin_unsqueezed->set_friendly_name(name + "_sin_unsqueeze");
+
+    return {cos_unsqueezed->output(0), sin_unsqueezed->output(0)};
+}
+
+ov::Output<ov::Node> HalfRotationRoPE::operator()(const ov::Output<ov::Node>& input,
+                                                    const ov::Output<ov::Node>& position_ids,
+                                                    const std::string& name) const {
+    auto [cos, sin] = gather_rope_embeddings(head_dim, max_position, precision, position_ids, name);
 
     const int64_t half = static_cast<int64_t>(head_dim / 2);
     auto zero = ov::opset11::Constant::create(ov::element::i64, ov::Shape{1}, {0});
@@ -206,10 +190,10 @@ ov::Output<ov::Node> HalfRotationRoPE::operator()(const ov::Output<ov::Node>& in
     auto rotated = std::make_shared<ov::opset11::Concat>(ov::OutputVector{neg_x2, x1}, -1);
     rotated->set_friendly_name(name + "_rotated");
 
-    auto input_cos = std::make_shared<ov::opset11::Multiply>(input, cos_unsqueezed);
+    auto input_cos = std::make_shared<ov::opset11::Multiply>(input, cos);
     input_cos->set_friendly_name(name + "_input_cos");
 
-    auto rotated_sin = std::make_shared<ov::opset11::Multiply>(rotated, sin_unsqueezed);
+    auto rotated_sin = std::make_shared<ov::opset11::Multiply>(rotated, sin);
     rotated_sin->set_friendly_name(name + "_rotated_sin");
 
     auto output = std::make_shared<ov::opset11::Add>(input_cos, rotated_sin);
@@ -221,31 +205,7 @@ ov::Output<ov::Node> HalfRotationRoPE::operator()(const ov::Output<ov::Node>& in
 ov::Output<ov::Node> InterleavedRoPE::operator()(const ov::Output<ov::Node>& input,
                                                    const ov::Output<ov::Node>& position_ids,
                                                    const std::string& name) const {
-    auto cos_table = ov::opset11::Constant::create(precision,
-                                                   ov::Shape{max_position, head_dim},
-                                                   std::vector<float>(max_position * head_dim, 0.5f));
-    cos_table->set_friendly_name(name + ".cos_table");
-
-    auto sin_table = ov::opset11::Constant::create(precision,
-                                                   ov::Shape{max_position, head_dim},
-                                                   std::vector<float>(max_position * head_dim, 0.5f));
-    sin_table->set_friendly_name(name + ".sin_table");
-
-    auto gather_axis = ov::opset11::Constant::create(ov::element::i64, ov::Shape{}, {0});
-
-    auto cos_embed = std::make_shared<ov::opset11::Gather>(cos_table, position_ids, gather_axis, 0);
-    cos_embed->set_friendly_name(name + "_cos_gather");
-
-    auto sin_embed = std::make_shared<ov::opset11::Gather>(sin_table, position_ids, gather_axis, 0);
-    sin_embed->set_friendly_name(name + "_sin_gather");
-
-    auto unsqueeze_axis = ov::opset11::Constant::create(ov::element::i64, ov::Shape{1}, {2});
-
-    auto cos_unsqueezed = std::make_shared<ov::opset11::Unsqueeze>(cos_embed, unsqueeze_axis);
-    cos_unsqueezed->set_friendly_name(name + "_cos_unsqueeze");
-
-    auto sin_unsqueezed = std::make_shared<ov::opset11::Unsqueeze>(sin_embed, unsqueeze_axis);
-    sin_unsqueezed->set_friendly_name(name + "_sin_unsqueeze");
+    auto [cos, sin] = gather_rope_embeddings(head_dim, max_position, precision, position_ids, name);
 
     const int64_t half_dim = static_cast<int64_t>(head_dim / 2);
     auto reshape_5d =
@@ -281,10 +241,10 @@ ov::Output<ov::Node> InterleavedRoPE::operator()(const ov::Output<ov::Node>& inp
     auto rotated = std::make_shared<ov::opset11::Reshape>(rotated_pairs, reshape_4d, true);
     rotated->set_friendly_name(name + "_rotated");
 
-    auto input_cos = std::make_shared<ov::opset11::Multiply>(input, cos_unsqueezed);
+    auto input_cos = std::make_shared<ov::opset11::Multiply>(input, cos);
     input_cos->set_friendly_name(name + "_input_cos");
 
-    auto rotated_sin = std::make_shared<ov::opset11::Multiply>(rotated, sin_unsqueezed);
+    auto rotated_sin = std::make_shared<ov::opset11::Multiply>(rotated, sin);
     rotated_sin->set_friendly_name(name + "_rotated_sin");
 
     auto output = std::make_shared<ov::opset11::Add>(input_cos, rotated_sin);
@@ -306,16 +266,12 @@ ov::Output<ov::Node> Input2DPositionIds::operator()(ModelBuilder& b) const {
 // ============================================================================
 
 ov::Output<ov::Node> make_linear(const ov::Output<ov::Node>& input,
+                                  size_t in_features,
                                   size_t out_features,
                                   const std::string& name,
                                   ov::element::Type precision,
                                   bool add_bias,
                                   const WeightFn& weight_fn) {
-    const auto& shape = input.get_partial_shape();
-    const size_t in_features = shape.rank().is_static() && shape[shape.rank().get_length() - 1].is_static()
-                                   ? static_cast<size_t>(shape[shape.rank().get_length() - 1].get_length())
-                                   : 64;
-
     auto weight_output = weight_fn(name + ".weight", out_features, in_features, precision);
 
     auto matmul = std::make_shared<ov::opset11::MatMul>(input, weight_output, false, true);
@@ -364,7 +320,7 @@ ov::Output<ov::Node> make_repeat_kv(const ov::Output<ov::Node>& kv,
                                      size_t num_kv_heads,
                                      size_t head_dim,
                                      const std::string& name) {
-    if (num_heads == num_kv_heads) {
+    if (num_kv_heads == 0 || num_heads == num_kv_heads) {
         return kv;
     }
 
@@ -509,7 +465,7 @@ ov::Output<ov::Node> make_lm_head(const ov::Output<ov::Node>& hidden_states,
                                     const std::string& name,
                                     ov::element::Type precision,
                                     const WeightFn& weight_fn) {
-    return make_linear(hidden_states, vocab_size, name, precision, false, weight_fn);
+    return make_linear(hidden_states, hidden_size, vocab_size, name, precision, false, weight_fn);
 }
 
 // ============================================================================
@@ -518,8 +474,8 @@ ov::Output<ov::Node> make_lm_head(const ov::Output<ov::Node>& hidden_states,
 
 ov::Output<ov::Node> SwiGLU::operator()(const ov::Output<ov::Node>& input,
                                           const std::string& name) const {
-    auto gate = make_linear(input, intermediate_size, name + ".gate_proj", precision, false, weight_fn);
-    auto up = make_linear(input, intermediate_size, name + ".up_proj", precision, false, weight_fn);
+    auto gate = make_linear(input, hidden_size, intermediate_size, name + ".gate_proj", precision, false, weight_fn);
+    auto up = make_linear(input, hidden_size, intermediate_size, name + ".up_proj", precision, false, weight_fn);
 
     auto sigmoid = std::make_shared<ov::opset11::Sigmoid>(gate);
 
@@ -529,19 +485,19 @@ ov::Output<ov::Node> SwiGLU::operator()(const ov::Output<ov::Node>& input,
     auto gate_up = std::make_shared<ov::opset11::Multiply>(silu, up);
     gate_up->set_friendly_name(name + "_gate_up");
 
-    auto down = make_linear(gate_up, hidden_size, name + ".down_proj", precision, false, weight_fn);
+    auto down = make_linear(gate_up, intermediate_size, hidden_size, name + ".down_proj", precision, false, weight_fn);
 
     return down;
 }
 
 ov::Output<ov::Node> GELUFn::operator()(const ov::Output<ov::Node>& input,
                                           const std::string& name) const {
-    auto up = make_linear(input, intermediate_size, name + ".up_proj", precision, false, weight_fn);
+    auto up = make_linear(input, hidden_size, intermediate_size, name + ".up_proj", precision, false, weight_fn);
 
     auto gelu = std::make_shared<ov::opset11::Gelu>(up);
     gelu->set_friendly_name(name + "_gelu");
 
-    auto down = make_linear(gelu, hidden_size, name + ".down_proj", precision, false, weight_fn);
+    auto down = make_linear(gelu, intermediate_size, hidden_size, name + ".down_proj", precision, false, weight_fn);
 
     return down;
 }
@@ -554,9 +510,9 @@ LayerResult SDPAttention::operator()(const ov::Output<ov::Node>& input, const st
     const size_t kv_heads = num_kv_heads;
 
     // Q, K, V projections
-    auto q = make_linear(input, num_heads * head_dim, prefix + "self_attn.q_proj", precision, false, weight_fn);
-    auto k = make_linear(input, kv_heads * head_dim, prefix + "self_attn.k_proj", precision, false, weight_fn);
-    auto v = make_linear(input, kv_heads * head_dim, prefix + "self_attn.v_proj", precision, false, weight_fn);
+    auto q = make_linear(input, hidden_size, num_heads * head_dim, prefix + "self_attn.q_proj", precision, false, weight_fn);
+    auto k = make_linear(input, hidden_size, kv_heads * head_dim, prefix + "self_attn.k_proj", precision, false, weight_fn);
+    auto v = make_linear(input, hidden_size, kv_heads * head_dim, prefix + "self_attn.v_proj", precision, false, weight_fn);
 
     // Reshape for multi-head: [batch, seq, heads, head_dim]
     auto q_reshaped = make_multihead_reshape(q, num_heads, head_dim, prefix + "q_reshape");
@@ -623,7 +579,7 @@ LayerResult SDPAttention::operator()(const ov::Output<ov::Node>& input, const st
     attn_reshaped->set_friendly_name(prefix + "attn_reshape");
 
     // Output projection
-    auto o_proj = make_linear(attn_reshaped->output(0), hidden_size, prefix + "self_attn.o_proj", precision, false, weight_fn);
+    auto o_proj = make_linear(attn_reshaped->output(0), hidden_size, hidden_size, prefix + "self_attn.o_proj", precision, false, weight_fn);
 
     return {o_proj, sinks};
 }
