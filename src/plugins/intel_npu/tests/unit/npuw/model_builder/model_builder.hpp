@@ -26,6 +26,12 @@ struct KVCacheResult {
     std::shared_ptr<ov::Node> assign;  // Sink node for stateful model
 };
 
+/// Read-side state from a KV cache Variable (before concat/assign)
+struct KVCacheReadState {
+    std::shared_ptr<ov::op::util::Variable> variable;
+    ov::Output<ov::Node> beam_gather;  // ReadValue -> Gather(beam_idx)
+};
+
 /// Result from building a decoder layer or attention block
 struct LayerResult {
     ov::Output<ov::Node> output;
@@ -261,6 +267,14 @@ ov::Output<ov::Node> make_repeat_kv(const ov::Output<ov::Node>& kv,
                                     size_t head_dim,
                                     const std::string& name);
 
+/// Create KV cache read state: Variable + init(zeros) + ReadValue + Gather(beam_idx)
+KVCacheReadState make_kv_cache_read(const ov::Output<ov::Node>& batch_source,
+                                    const ov::Output<ov::Node>& beam_idx,
+                                    size_t num_heads,
+                                    size_t head_dim,
+                                    const std::string& name,
+                                    ov::element::Type precision = ov::element::f32);
+
 /// Create stateful KV cache pattern (ReadValue -> Gather(beam_idx) -> Concat -> Assign)
 KVCacheResult make_kv_cache_concat(const ov::Output<ov::Node>& current_kv,
                                    const ov::Output<ov::Node>& batch_source,
@@ -276,6 +290,14 @@ ov::Output<ov::Node> make_sdpa(const ov::Output<ov::Node>& q,
                                const ov::Output<ov::Node>& v,
                                const std::string& name,
                                const ov::Output<ov::Node>& attention_mask = ov::Output<ov::Node>());
+
+/// Attention output: transpose back + reshape [batch, seq, hidden] + O projection
+ov::Output<ov::Node> make_attention_output(const ov::Output<ov::Node>& sdpa_output,
+                                           size_t hidden_size,
+                                           const std::string& name,
+                                           ov::element::Type precision,
+                                           bool add_bias,
+                                           const WeightFn& weight_fn);
 
 /// Token embedding lookup
 ov::Output<ov::Node> make_embedding(const ov::Output<ov::Node>& input_ids,
@@ -345,8 +367,6 @@ struct WhisperSelfAttention {
     ov::element::Type precision;
     WeightFn weight_fn;
     bool use_kv_cache;
-    bool causal;
-    size_t max_target_positions;          // for causal mask construction + Slice→SDPA pattern
     ov::Output<ov::Node> batch_source;    // for KV cache init shape
     ov::Output<ov::Node> beam_idx;        // for beam search reordering
     size_t layer_idx;
@@ -368,7 +388,6 @@ struct WhisperCrossAttention {
     ov::element::Type precision;
     WeightFn weight_fn;
     ov::Output<ov::Node> encoder_hidden_states;
-    ov::Output<ov::Node> beam_idx;
     size_t layer_idx;
 
     LayerResult operator()(const ov::Output<ov::Node>& input, const std::string& prefix) const;

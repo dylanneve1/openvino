@@ -408,13 +408,12 @@ ov::Output<ov::Node> make_repeat_kv(const ov::Output<ov::Node>& kv,
     return reshaped->output(0);
 }
 
-KVCacheResult make_kv_cache_concat(const ov::Output<ov::Node>& current_kv,
-                                   const ov::Output<ov::Node>& batch_source,
-                                   const ov::Output<ov::Node>& beam_idx,
-                                   size_t num_heads,
-                                   size_t head_dim,
-                                   const std::string& name,
-                                   ov::element::Type precision) {
+KVCacheReadState make_kv_cache_read(const ov::Output<ov::Node>& batch_source,
+                                    const ov::Output<ov::Node>& beam_idx,
+                                    size_t num_heads,
+                                    size_t head_dim,
+                                    const std::string& name,
+                                    ov::element::Type precision) {
     auto var_shape = ov::PartialShape{-1, static_cast<int64_t>(num_heads), -1, static_cast<int64_t>(head_dim)};
     auto variable = std::make_shared<ov::op::util::Variable>(ov::op::util::VariableInfo{var_shape, precision, name});
 
@@ -455,17 +454,26 @@ KVCacheResult make_kv_cache_concat(const ov::Output<ov::Node>& current_kv,
     auto beam_gather = std::make_shared<ov::opset11::Gather>(read_value, beam_idx, beam_gather_axis);
     beam_gather->set_friendly_name(name + "_beam_gather");
 
-    auto concat = std::make_shared<ov::opset11::Concat>(ov::OutputVector{beam_gather->output(0), current_kv}, 2);
+    return {variable, beam_gather->output(0)};
+}
+
+KVCacheResult make_kv_cache_concat(const ov::Output<ov::Node>& current_kv,
+                                   const ov::Output<ov::Node>& batch_source,
+                                   const ov::Output<ov::Node>& beam_idx,
+                                   size_t num_heads,
+                                   size_t head_dim,
+                                   const std::string& name,
+                                   ov::element::Type precision) {
+    auto read_state = make_kv_cache_read(batch_source, beam_idx, num_heads, head_dim, name, precision);
+
+    auto concat = std::make_shared<ov::opset11::Concat>(
+        ov::OutputVector{read_state.beam_gather, current_kv}, 2);
     concat->set_friendly_name(name + "_concat");
 
-    auto assign = std::make_shared<ov::op::v6::Assign>(concat, variable);
+    auto assign = std::make_shared<ov::op::v6::Assign>(concat, read_state.variable);
     assign->set_friendly_name(name + "_assign");
 
-    KVCacheResult result;
-    result.concatenated = concat->output(0);
-    result.beam_gather = beam_gather->output(0);
-    result.assign = assign;
-    return result;
+    return {concat->output(0), read_state.beam_gather, assign};
 }
 
 ov::Output<ov::Node> make_sdpa(const ov::Output<ov::Node>& q,
@@ -482,6 +490,23 @@ ov::Output<ov::Node> make_sdpa(const ov::Output<ov::Node>& q,
     sdpa->set_friendly_name(name + ".sdpa");
 
     return sdpa->output(0);
+}
+
+ov::Output<ov::Node> make_attention_output(const ov::Output<ov::Node>& sdpa_output,
+                                           size_t hidden_size,
+                                           const std::string& name,
+                                           ov::element::Type precision,
+                                           bool add_bias,
+                                           const WeightFn& weight_fn) {
+    auto attn_trans = make_attention_transpose(sdpa_output, name + "_transpose");
+
+    auto reshape_shape = ov::opset11::Constant::create(
+        ov::element::i64, ov::Shape{3},
+        std::vector<int64_t>{0, -1, static_cast<int64_t>(hidden_size)});
+    auto attn_reshaped = std::make_shared<ov::opset11::Reshape>(attn_trans, reshape_shape, true);
+    attn_reshaped->set_friendly_name(name + "_reshape");
+
+    return make_linear(attn_reshaped->output(0), hidden_size, hidden_size, name, precision, add_bias, weight_fn);
 }
 
 ov::Output<ov::Node> make_embedding(const ov::Output<ov::Node>& input_ids,
@@ -673,24 +698,8 @@ LayerResult SDPAttention::operator()(const ov::Output<ov::Node>& input, const st
     // SDPA
     auto attn_output = make_sdpa(q_trans, k_expanded, v_expanded, prefix + "attn", attention_mask);
 
-    // Transpose back and reshape
-    auto attn_trans = make_attention_transpose(attn_output, prefix + "attn_out_transpose");
-
-    auto reshape_shape = ov::opset11::Constant::create(ov::element::i64,
-                                                       ov::Shape{3},
-                                                       std::vector<int64_t>{0, -1, static_cast<int64_t>(hidden_size)});
-
-    auto attn_reshaped = std::make_shared<ov::opset11::Reshape>(attn_trans, reshape_shape, true);
-    attn_reshaped->set_friendly_name(prefix + "attn_reshape");
-
-    // Output projection
-    auto o_proj = make_linear(attn_reshaped->output(0),
-                              hidden_size,
-                              hidden_size,
-                              prefix + "self_attn.o_proj",
-                              precision,
-                              false,
-                              weight_fn);
+    auto o_proj = make_attention_output(attn_output, hidden_size,
+                                        prefix + "self_attn.o_proj", precision, false, weight_fn);
 
     return {o_proj, sinks};
 }
@@ -757,18 +766,8 @@ LayerResult WhisperSelfAttention::operator()(const ov::Output<ov::Node>& input, 
     // because NPUW's AttentionMaskInput picks one layer's Slice and feeds it to all layers)
     auto attn_output = make_sdpa(q_trans, k_for_attn, v_for_attn, prefix + "attn", sdpa_mask);
 
-    // Transpose back and reshape
-    auto attn_trans = make_attention_transpose(attn_output, prefix + "attn_out_transpose");
-
-    auto reshape_shape = ov::opset11::Constant::create(
-        ov::element::i64, ov::Shape{3},
-        std::vector<int64_t>{0, -1, static_cast<int64_t>(hidden_size)});
-    auto attn_reshaped = std::make_shared<ov::opset11::Reshape>(attn_trans, reshape_shape, true);
-    attn_reshaped->set_friendly_name(prefix + "attn_reshape");
-
-    // Output projection (with bias)
-    auto o_proj = make_linear(attn_reshaped->output(0), hidden_size, hidden_size,
-                              prefix + "self_attn.out_proj", precision, true, weight_fn);
+    auto o_proj = make_attention_output(attn_output, hidden_size,
+                                        prefix + "self_attn.out_proj", precision, true, weight_fn);
 
     return {o_proj, sinks};
 }
@@ -812,18 +811,8 @@ LayerResult WhisperCrossAttention::operator()(const ov::Output<ov::Node>& input,
     // SDPA (non-causal, no mask)
     auto attn_output = make_sdpa(q_trans, k_cache.concatenated, v_cache.concatenated, prefix + "cross_attn");
 
-    // Transpose back and reshape
-    auto attn_trans = make_attention_transpose(attn_output, prefix + "cross_attn_out_transpose");
-
-    auto reshape_shape = ov::opset11::Constant::create(
-        ov::element::i64, ov::Shape{3},
-        std::vector<int64_t>{0, -1, static_cast<int64_t>(hidden_size)});
-    auto attn_reshaped = std::make_shared<ov::opset11::Reshape>(attn_trans, reshape_shape, true);
-    attn_reshaped->set_friendly_name(prefix + "cross_attn_reshape");
-
-    // Output projection (with bias)
-    auto o_proj = make_linear(attn_reshaped->output(0), hidden_size, hidden_size,
-                              prefix + "encoder_attn.out_proj", precision, true, weight_fn);
+    auto o_proj = make_attention_output(attn_output, hidden_size,
+                                        prefix + "encoder_attn.out_proj", precision, true, weight_fn);
 
     return {o_proj, sinks};
 }
@@ -1472,8 +1461,6 @@ std::shared_ptr<ov::Model> ModelBuilder::build_whisper_encoder(const WhisperConf
 
         WhisperSelfAttention self_attn{d, heads, hd, prec, wf,
                                        false,    // use_kv_cache
-                                       false,    // causal
-                                       0,        // max_target_positions (unused for encoder)
                                        {},       // batch_source
                                        {},       // beam_idx
                                        layer};
@@ -1546,52 +1533,13 @@ std::shared_ptr<ov::Model> ModelBuilder::build_whisper_decoder(const WhisperConf
     // need kv_seq_len from ShapeOf(beam_gather)[2] to construct patterns
     // that match the real whisper model's graph structure.
     // ================================================================
-    std::shared_ptr<ov::op::util::Variable> layer0_k_variable;
-    ov::Output<ov::Node> layer0_k_beam_gather;
-    {
-        std::string layer0_k_var_name = "past_key_values.0.decoder.key"
-                                       "present.0.decoder.key";
-        auto var_shape = ov::PartialShape{
-            -1, static_cast<int64_t>(heads), -1, static_cast<int64_t>(hd)};
-        layer0_k_variable = std::make_shared<ov::op::util::Variable>(
-            ov::op::util::VariableInfo{var_shape, prec, layer0_k_var_name});
-
-        // Init shape: [batch, heads, 0, head_dim]
-        auto batch_dim = std::make_shared<ov::opset11::Gather>(
-            ids_shape,
-            ov::opset11::Constant::create(ov::element::i64, ov::Shape{1}, {0}),
-            ov::opset11::Constant::create(ov::element::i64, ov::Shape{}, {0}));
-        batch_dim->set_friendly_name(layer0_k_var_name + "_batch_dim");
-
-        auto init_shape = std::make_shared<ov::opset11::Concat>(
-            ov::OutputVector{
-                batch_dim->output(0),
-                ov::opset11::Constant::create(ov::element::i64, ov::Shape{1},
-                    {static_cast<int64_t>(heads)})->output(0),
-                ov::opset11::Constant::create(ov::element::i64, ov::Shape{1}, {0})->output(0),
-                ov::opset11::Constant::create(ov::element::i64, ov::Shape{1},
-                    {static_cast<int64_t>(hd)})->output(0)},
-            0);
-        init_shape->set_friendly_name(layer0_k_var_name + "_init_shape");
-
-        auto zero_scalar = ov::opset11::Constant::create(prec, ov::Shape{}, {0.0f});
-        auto init_value = std::make_shared<ov::opset11::Broadcast>(zero_scalar, init_shape);
-        init_value->set_friendly_name(layer0_k_var_name + "_init");
-
-        auto read_value = std::make_shared<ov::op::v6::ReadValue>(init_value, layer0_k_variable);
-        read_value->set_friendly_name(layer0_k_var_name + "_read");
-
-        auto beam_gather = std::make_shared<ov::opset11::Gather>(
-            read_value, beam_idx,
-            ov::opset11::Constant::create(ov::element::i64, ov::Shape{}, {0}));
-        beam_gather->set_friendly_name(layer0_k_var_name + "_beam_gather");
-
-        layer0_k_beam_gather = beam_gather->output(0);
-    }
+    auto layer0_k_read = make_kv_cache_read(
+        input_ids->output(0), beam_idx->output(0), heads, hd,
+        "past_key_values.0.decoder.key" "present.0.decoder.key", prec);
 
     // kv_seq_len = ShapeOf(beam_gather)[2]
     // This Gather is the ROOT of the CachePositionInput pattern.
-    auto kv_shape = std::make_shared<ov::opset11::ShapeOf>(layer0_k_beam_gather, ov::element::i64);
+    auto kv_shape = std::make_shared<ov::opset11::ShapeOf>(layer0_k_read.beam_gather, ov::element::i64);
     kv_shape->set_friendly_name("model.decoder.kv_shape");
     auto kv_seq_len = std::make_shared<ov::opset11::Gather>(
         kv_shape,
@@ -1772,19 +1720,16 @@ std::shared_ptr<ov::Model> ModelBuilder::build_whisper_decoder(const WhisperConf
         // WhisperSelfAttention reuses them (avoids duplicate Variable IDs).
         WhisperSelfAttention self_attn{d, heads, hd, prec, wf,
                                        true,   // use_kv_cache
-                                       true,   // causal
-                                       config.max_target_positions,
                                        input_ids->output(0),   // batch_source
                                        beam_idx->output(0),    // beam_idx
                                        layer,
                                        shared_mask,
-                                       (layer == 0) ? layer0_k_variable : nullptr,
-                                       (layer == 0) ? layer0_k_beam_gather : ov::Output<ov::Node>{}};
+                                       (layer == 0) ? layer0_k_read.variable : nullptr,
+                                       (layer == 0) ? layer0_k_read.beam_gather : ov::Output<ov::Node>{}};
 
         // Cross-attention to encoder (uses converted encoder hidden states)
         WhisperCrossAttention cross_attn{d, heads, hd, prec, wf,
                                          enc_hs,
-                                         beam_idx->output(0),
                                          layer};
 
         auto layer_result = make_whisper_decoder_layer(current, norm, self_attn, cross_attn, ffn, prefix);
