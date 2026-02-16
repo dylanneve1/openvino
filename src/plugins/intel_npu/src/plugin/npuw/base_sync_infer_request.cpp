@@ -621,20 +621,22 @@ void ov::npuw::IBaseInferRequest::bind_global_params(std::size_t idx, RqPtr requ
     });
 
     // Run host-side gather, if required
-    if (comp_model_desc.host_gather.dst_idx != -1) {
-        const auto& gport = comp_model_desc.compiled_model->inputs()[comp_model_desc.host_gather.dst_idx];
-        const auto gather = request->get_tensor(gport);
+    m_profile["gather"].record([&]() {
+        if (comp_model_desc.host_gather.dst_idx != -1) {
+            const auto& gport = comp_model_desc.compiled_model->inputs()[comp_model_desc.host_gather.dst_idx];
+            const auto gather = request->get_tensor(gport);
 
-        const auto& vocab =
-            comp_model_desc.closure.get().closure[comp_model_desc.host_gather.src_idx - comp_model_desc.param_base];
-        const auto& lport = comp_model_desc.compiled_model->inputs()[comp_model_desc.host_gather.idx_idx];
-        const auto lookup = request->get_tensor(lport);
+            const auto& vocab =
+                comp_model_desc.closure.get().closure[comp_model_desc.host_gather.src_idx - comp_model_desc.param_base];
+            const auto& lport = comp_model_desc.compiled_model->inputs()[comp_model_desc.host_gather.idx_idx];
+            const auto lookup = request->get_tensor(lport);
 
-        ov::npuw::util::gather(ov::get_tensor_impl(vocab), lookup, gather);
-    }
+            ov::npuw::util::gather(ov::get_tensor_impl(vocab), lookup, gather);
+        }
 
-    // Run host-side quantized gather, if required
-    handle_quant_host_gather(idx, request);
+        // Run host-side quantized gather, if required
+        handle_quant_host_gather(idx, request);
+    });
 
     // Handle attention inputs, if required
     m_profile["attn(io)"].record([&]() {
