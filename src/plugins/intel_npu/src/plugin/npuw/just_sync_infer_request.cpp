@@ -635,14 +635,18 @@ void ov::npuw::JustInferRequest::prepare_for_infer() {
     }
 
     // Submit global parameters (if needed) for the first subgraph
-    bind_global_parameters(next(0));
+    m_profile["gather"].record([&]() {
+        bind_global_parameters(next(0));
+    });
 
     // If funcall pipelining is enabled, prefill the function "heads"
     // with constant arguments. The list of heads is empty otherwise.
-    for (auto&& id : m_funcall_heads) {
-        LOG_DEBUG("Pre-initializing weights for subgraph[" << id << "]");
-        unpack_closure(id, m_subrequests[id]);
-    }
+    m_profile["unpack"].record([&]() {
+        for (auto&& id : m_funcall_heads) {
+            LOG_DEBUG("Pre-initializing weights for subgraph[" << id << "]");
+            unpack_closure(id, m_subrequests[id]);
+        }
+    });
 
     // Adjust spatial input range, if supported
     if (m_spatial_selector) {
