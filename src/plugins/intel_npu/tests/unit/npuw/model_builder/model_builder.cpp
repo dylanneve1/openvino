@@ -746,47 +746,44 @@ ov::Output<ov::Node> GELUFn::operator()(const ov::Output<ov::Node>& input, const
 }
 
 // ============================================================================
-// Config fill_defaults and make_attention implementations
+// ModelConfig factory methods
 // ============================================================================
 
-void LLMConfig::fill_defaults() {
-    if (!norm)
-        norm = LayerNorm(hidden_size, precision);
-    if (!ffn)
-        ffn = SwiGLU(hidden_size, intermediate_size, precision, weight);
+Attention ModelConfig::make_self_attention() const {
+    switch (model_type) {
+    case ModelType::WhisperEncoder: {
+        FloatWeight bias_wf(precision);
+        Attention a{hidden_size, num_heads, num_heads, head_dim, precision, weight};
+        a.bias_fn = bias_wf;
+        a.o_proj_name = "self_attn.out_proj";
+        return a;
+    }
+    case ModelType::WhisperDecoder: {
+        FloatWeight bias_wf(precision);
+        Attention a{hidden_size, num_heads, num_heads, head_dim, precision, weight};
+        a.bias_fn = bias_wf;
+        a.cache_infix = ".decoder.";
+        a.o_proj_name = "self_attn.out_proj";
+        return a;
+    }
+    case ModelType::EmbeddingEncoder: {
+        FloatWeight bias_wf(precision);
+        Attention a{hidden_size, num_heads, num_heads, head_dim, precision, weight};
+        a.bias_fn = bias_wf;
+        return a;
+    }
+    default: {
+        // LLM, VLM, EmbeddingDecoder
+        Attention a{hidden_size, num_heads, get_kv_heads(), head_dim, precision, weight};
+        a.qk_norm = qk_norm;
+        return a;
+    }
+    }
 }
 
-Attention LLMConfig::make_attention() const {
-    Attention a{hidden_size, num_heads, get_kv_heads(), head_dim, precision, weight};
-    a.qk_norm = qk_norm;
-    return a;
-}
-
-void WhisperConfig::fill_defaults() {
-    if (!weight)
-        weight = FP32Weight{};
-}
-
-Attention WhisperConfig::make_encoder_attention() const {
+Attention ModelConfig::make_cross_attention() const {
     FloatWeight bias_wf(precision);
-    Attention a{d_model, encoder_attention_heads, encoder_attention_heads, head_dim(), precision, weight};
-    a.bias_fn = bias_wf;
-    a.o_proj_name = "self_attn.out_proj";
-    return a;
-}
-
-Attention WhisperConfig::make_decoder_self_attention() const {
-    FloatWeight bias_wf(precision);
-    Attention a{d_model, decoder_attention_heads, decoder_attention_heads, head_dim(), precision, weight};
-    a.bias_fn = bias_wf;
-    a.cache_infix = ".decoder.";
-    a.o_proj_name = "self_attn.out_proj";
-    return a;
-}
-
-Attention WhisperConfig::make_decoder_cross_attention() const {
-    FloatWeight bias_wf(precision);
-    Attention a{d_model, decoder_attention_heads, decoder_attention_heads, head_dim(), precision, weight};
+    Attention a{hidden_size, num_heads, num_heads, head_dim, precision, weight};
     a.bias_fn = bias_wf;
     a.cache_infix = ".encoder.";
     a.q_proj_name = "encoder_attn.q_proj";
@@ -796,41 +793,110 @@ Attention WhisperConfig::make_decoder_cross_attention() const {
     return a;
 }
 
-void BERTConfig::fill_defaults() {
-    if (!norm)
-        norm = LayerNorm(hidden_size, precision);
+// ============================================================================
+// Deprecated config conversion methods
+// ============================================================================
+
+ModelConfig WhisperConfig::to_encoder_config() const {
+    ModelConfig c;
+    c.model_type = ModelType::WhisperEncoder;
+    c.hidden_size = d_model;
+    c.num_heads = encoder_attention_heads;
+    c.head_dim = d_model / encoder_attention_heads;
+    c.num_kv_heads = 0;
+    c.intermediate_size = encoder_ffn_dim;
+    c.vocab_size = vocab_size;
+    c.num_layers = encoder_layers;
+    c.encoder_layers = encoder_layers;
+    c.decoder_layers = decoder_layers;
+    c.num_mel_bins = num_mel_bins;
+    c.max_source_positions = max_source_positions;
+    c.max_target_positions = max_target_positions;
+    c.precision = precision;
+    c.weight = weight;
+    c.use_kv_cache = false;
+    c.use_lm_head = false;
     FloatWeight bias_wf(precision);
-    if (!ffn)
-        ffn = GELUFn(hidden_size, intermediate_size, precision, weight, bias_wf);
+    c.norm = LayerNorm(d_model, precision);
+    c.ffn = GELUFn(d_model, encoder_ffn_dim, precision, weight, bias_wf);
+    return c;
 }
 
-Attention BERTConfig::make_attention() const {
+ModelConfig WhisperConfig::to_decoder_config() const {
+    ModelConfig c;
+    c.model_type = ModelType::WhisperDecoder;
+    c.hidden_size = d_model;
+    c.num_heads = decoder_attention_heads;
+    c.head_dim = d_model / decoder_attention_heads;
+    c.num_kv_heads = 0;
+    c.intermediate_size = decoder_ffn_dim;
+    c.vocab_size = vocab_size;
+    c.num_layers = decoder_layers;
+    c.encoder_layers = encoder_layers;
+    c.decoder_layers = decoder_layers;
+    c.num_mel_bins = num_mel_bins;
+    c.max_source_positions = max_source_positions;
+    c.max_target_positions = max_target_positions;
+    c.precision = precision;
+    c.weight = weight;
+    c.use_kv_cache = true;
+    c.use_lm_head = true;
     FloatWeight bias_wf(precision);
-    Attention a{hidden_size, num_heads, num_heads, head_dim, precision, weight};
-    a.bias_fn = bias_wf;
-    return a;
+    c.norm = LayerNorm(d_model, precision);
+    c.ffn = GELUFn(d_model, decoder_ffn_dim, precision, weight, bias_wf);
+    return c;
+}
+
+ModelConfig BERTConfig::to_config() const {
+    ModelConfig c;
+    c.model_type = ModelType::EmbeddingEncoder;
+    c.hidden_size = hidden_size;
+    c.num_heads = num_heads;
+    c.head_dim = head_dim;
+    c.num_kv_heads = 0;
+    c.intermediate_size = intermediate_size;
+    c.vocab_size = vocab_size;
+    c.num_layers = num_layers;
+    c.max_position_embeddings = max_position_embeddings;
+    c.type_vocab_size = type_vocab_size;
+    c.precision = precision;
+    c.weight = weight;
+    c.norm = norm;
+    c.ffn = ffn;
+    c.use_kv_cache = false;
+    c.use_lm_head = false;
+    return c;
+}
+
+// Deprecated make_*_attention() wrappers
+Attention WhisperConfig::make_encoder_attention() const {
+    return to_encoder_config().make_self_attention();
+}
+Attention WhisperConfig::make_decoder_self_attention() const {
+    return to_decoder_config().make_self_attention();
+}
+Attention WhisperConfig::make_decoder_cross_attention() const {
+    return to_decoder_config().make_cross_attention();
+}
+Attention BERTConfig::make_attention() const {
+    return to_config().make_self_attention();
 }
 
 // ============================================================================
 // Transformer layer loop helper
 // ============================================================================
 
-std::pair<ov::Output<ov::Node>, ov::SinkVector> run_transformer_layers(
+ov::Output<ov::Node> run_transformer_layers(
     const ov::Output<ov::Node>& initial,
     size_t num_layers,
     const std::string& prefix_base,
     const LayerFn& layer_fn) {
     ov::Output<ov::Node> current = initial;
-    ov::SinkVector all_sinks;
     for (size_t layer = 0; layer < num_layers; ++layer) {
         std::string prefix = prefix_base + std::to_string(layer) + ".";
-        auto layer_result = layer_fn(current, prefix, layer);
-        current = layer_result.output;
-        for (auto& sink : layer_result.sinks) {
-            all_sinks.push_back(std::dynamic_pointer_cast<ov::op::Sink>(sink));
-        }
+        current = layer_fn(current, prefix, layer);
     }
-    return {current, all_sinks};
+    return current;
 }
 
 // ============================================================================
@@ -883,13 +949,13 @@ static std::string make_kv_var_id(const std::string& layer,
 // Attention Functor Implementation
 // ============================================================================
 
-LayerResult Attention::operator()(const ov::Output<ov::Node>& input,
-                                  const std::string& prefix,
-                                  size_t layer_idx,
-                                  CacheMode cache_mode,
-                                  const ov::Output<ov::Node>& kv_source,
-                                  const ov::Output<ov::Node>& batch_source,
-                                  const ov::Output<ov::Node>& beam_idx) const {
+ov::Output<ov::Node> Attention::operator()(const ov::Output<ov::Node>& input,
+                                           const std::string& prefix,
+                                           size_t layer_idx,
+                                           CacheMode cache_mode,
+                                           const ov::Output<ov::Node>& kv_source,
+                                           const ov::Output<ov::Node>& batch_source,
+                                           const ov::Output<ov::Node>& beam_idx) const {
     // K/V source: self-attention uses input, cross-attention uses kv_source
     auto kv_input = kv_source.get_node() ? kv_source : input;
 
@@ -932,7 +998,6 @@ LayerResult Attention::operator()(const ov::Output<ov::Node>& input,
     }
 
     // KV cache
-    std::vector<std::shared_ptr<ov::Node>> sinks;
     ov::Output<ov::Node> k_for_attn = k_roped;
     ov::Output<ov::Node> v_for_attn = v_trans;
 
@@ -958,8 +1023,10 @@ LayerResult Attention::operator()(const ov::Output<ov::Node>& input,
             v_trans, batch_source, beam_idx, num_kv_heads, head_dim,
             make_kv_var_id(layer_str, cache_infix, "value"), precision);
 
-        sinks.push_back(k_cache.assign);
-        sinks.push_back(v_cache.assign);
+        if (on_sink) {
+            on_sink(k_cache.assign);
+            on_sink(v_cache.assign);
+        }
         k_for_attn = k_cache.concatenated;
         v_for_attn = v_cache.concatenated;
     } else if (cache_mode == CacheMode::StoreOnly) {
@@ -971,7 +1038,10 @@ LayerResult Attention::operator()(const ov::Output<ov::Node>& input,
             v_trans, num_kv_heads, head_dim,
             make_kv_var_id(layer_str, cache_infix, "value"), precision);
 
-        sinks = {k_cache.assign, v_cache.assign};
+        if (on_sink) {
+            on_sink(k_cache.assign);
+            on_sink(v_cache.assign);
+        }
         k_for_attn = k_cache.concatenated;
         v_for_attn = v_cache.concatenated;
     }
@@ -991,7 +1061,7 @@ LayerResult Attention::operator()(const ov::Output<ov::Node>& input,
     auto o_proj = make_attention_output(attn_output, hidden_size,
                                         prefix + o_proj_name, precision, weight_fn, bias_fn);
 
-    return {o_proj, sinks};
+    return o_proj;
 }
 
 // ============================================================================
@@ -1473,6 +1543,7 @@ void ModelBuilder::clear() {
     m_nodes.clear();
     m_parameters.clear();
     m_results.clear();
+    m_sinks.clear();
     m_name_idx = 0;
 }
 
@@ -1504,31 +1575,10 @@ ov::Output<ov::Node> ModelBuilder::setup_position_ids(LLMConfig& config,
     } else if (config.position_ids.get_node()) {
         // User provided custom position_ids (3D, Range subgraph, etc.)
         position_ids_output = config.position_ids;
-        // Auto-track any Parameter nodes in the position_ids subgraph
-        std::vector<ov::Node*> stack = {position_ids_output.get_node()};
-        std::set<ov::Node*> visited;
-        while (!stack.empty()) {
-            auto* node = stack.back();
-            stack.pop_back();
-            if (!visited.insert(node).second)
-                continue;
-            auto param = std::dynamic_pointer_cast<ov::op::v0::Parameter>(node->shared_from_this());
-            if (param) {
-                m_parameters.push_back(param);
-            }
-            for (size_t i = 0; i < node->get_input_size(); ++i) {
-                stack.push_back(node->get_input_node_ptr(i));
-            }
-        }
     } else if (!config.rope) {
         // No explicit position_ids and no explicit rope: auto-create 2D Parameter
         // (default LLM behavior — standard position_ids input)
         position_ids_output = make_position_ids_2d();
-        auto param = std::dynamic_pointer_cast<ov::op::v0::Parameter>(
-            position_ids_output.get_node_shared_ptr());
-        if (param) {
-            m_parameters.push_back(param);
-        }
     }
     // else: config.rope is set but no position_ids — RoPE was pre-built with position_ids baked in
 
@@ -1541,14 +1591,93 @@ ov::Output<ov::Node> ModelBuilder::setup_position_ids(LLMConfig& config,
 }
 
 // ============================================================================
-// LLM Model Builder (convenience wrapper using building blocks)
+// Sink tracking + model construction helpers
 // ============================================================================
 
-std::shared_ptr<ov::Model> ModelBuilder::build_llm(const LLMConfig& config_in) {
+void ModelBuilder::setup_sink_tracking(Attention& attn) {
+    attn.on_sink = [this](std::shared_ptr<ov::Node> sink) {
+        m_sinks.push_back(std::dynamic_pointer_cast<ov::op::Sink>(sink));
+    };
+}
+
+std::shared_ptr<ov::Model> ModelBuilder::make_model(const ov::Output<ov::Node>& output,
+                                                      const std::string& result_name,
+                                                      const std::string& model_name) {
+    auto res = std::make_shared<ov::op::v0::Result>(output);
+    res->set_friendly_name(result_name);
+    res->output(0).set_names({result_name});
+
+    // Auto-discover Parameters by walking the graph from results and sinks
+    ov::ParameterVector params;
+    std::set<ov::Node*> visited;
+    std::vector<ov::Node*> stack;
+    stack.push_back(res.get());
+    for (auto& sink : m_sinks)
+        stack.push_back(sink.get());
+    while (!stack.empty()) {
+        auto* node = stack.back();
+        stack.pop_back();
+        if (!visited.insert(node).second)
+            continue;
+        auto param = std::dynamic_pointer_cast<ov::op::v0::Parameter>(node->shared_from_this());
+        if (param)
+            params.push_back(param);
+        for (size_t i = 0; i < node->get_input_size(); ++i)
+            stack.push_back(node->get_input_node_ptr(i));
+    }
+
+    return std::make_shared<ov::Model>(ov::ResultVector{res}, m_sinks, params, model_name);
+}
+
+// ============================================================================
+// Unified build entry point
+// ============================================================================
+
+std::shared_ptr<ov::Model> ModelBuilder::build_model(const ModelConfig& config) {
+    switch (config.model_type) {
+    case ModelType::LLM:
+    case ModelType::VLM:
+    case ModelType::EmbeddingDecoder:
+        return build_llm_impl(config);
+    case ModelType::WhisperEncoder:
+        return build_whisper_encoder_impl(config);
+    case ModelType::WhisperDecoder:
+        return build_whisper_decoder_impl(config);
+    case ModelType::EmbeddingEncoder:
+        return build_embedding_encoder_impl(config);
+    default:
+        OPENVINO_THROW("Unknown model_type");
+    }
+}
+
+// ============================================================================
+// Deprecated wrappers
+// ============================================================================
+
+std::shared_ptr<ov::Model> ModelBuilder::build_llm(const LLMConfig& config) {
+    return build_llm_impl(config);
+}
+
+std::shared_ptr<ov::Model> ModelBuilder::build_whisper_encoder(const WhisperConfig& config) {
+    return build_whisper_encoder_impl(config.to_encoder_config());
+}
+
+std::shared_ptr<ov::Model> ModelBuilder::build_whisper_decoder(const WhisperConfig& config) {
+    return build_whisper_decoder_impl(config.to_decoder_config());
+}
+
+std::shared_ptr<ov::Model> ModelBuilder::build_bert_encoder(const BERTConfig& config) {
+    return build_embedding_encoder_impl(config.to_config());
+}
+
+// ============================================================================
+// LLM / VLM / EmbeddingDecoder build implementation
+// ============================================================================
+
+std::shared_ptr<ov::Model> ModelBuilder::build_llm_impl(const ModelConfig& config_in) {
     clear();
 
     LLMConfig config = config_in;
-    config.fill_defaults();
     const auto prec = config.precision;
 
     // ===== Inputs =====
@@ -1591,13 +1720,14 @@ std::shared_ptr<ov::Model> ModelBuilder::build_llm(const LLMConfig& config_in) {
     }
 
     // ===== Decoder Layers =====
-    auto attn = config.make_attention();
+    auto attn = config.make_self_attention();
     attn.rope_fn = config.rope;
     attn.sdpa_mask = sdpa_mask;
     attn.shared_broadcast_shape = shared_broadcast;
+    setup_sink_tracking(attn);
     auto cache_mode = config.use_kv_cache ? Attention::CacheMode::ConcatBeam : Attention::CacheMode::None;
 
-    auto [current, all_sinks] = run_transformer_layers(hidden_states, config.num_layers, "model.layers.",
+    auto current = run_transformer_layers(hidden_states, config.num_layers, "model.layers.",
         [&](const ov::Output<ov::Node>& input, const std::string& prefix, size_t layer) {
             return make_decoder_layer(input, config.norm, attn, config.ffn, prefix,
                                       layer, cache_mode, ov::Output<ov::Node>{},
@@ -1607,38 +1737,32 @@ std::shared_ptr<ov::Model> ModelBuilder::build_llm(const LLMConfig& config_in) {
     // ===== Final Norm + optional LM Head =====
     auto final_norm = config.norm(current, "model.norm");
 
-    if (config.use_lm_head) {
-        auto logits =
-            make_lm_head(final_norm, config.hidden_size, config.vocab_size, "lm_head", prec, config.lm_head_weight);
-        result(logits, "logits");
-    } else {
-        result(final_norm, "last_hidden_state");
-    }
-
-    // ===== Build Model =====
     std::string model_name = "synthetic_";
-    if (!config.use_lm_head)
-        model_name += "embedding_";
-    else if (config.use_inputs_embeds)
-        model_name += "vlm_";
-    else
-        model_name += "llm_";
+    switch (config.model_type) {
+    case ModelType::EmbeddingDecoder: model_name += "embedding_"; break;
+    case ModelType::VLM:             model_name += "vlm_"; break;
+    default:                         model_name += "llm_"; break;
+    }
     model_name += "decoder";
 
-    return std::make_shared<ov::Model>(m_results, all_sinks, m_parameters, model_name);
+    if (config.use_lm_head) {
+        auto lm_weight = config.lm_head_weight ? config.lm_head_weight : config.weight;
+        auto logits =
+            make_lm_head(final_norm, config.hidden_size, config.vocab_size, "lm_head", prec, lm_weight);
+        return make_model(logits, "logits", model_name);
+    } else {
+        return make_model(final_norm, "last_hidden_state", model_name);
+    }
 }
 
 // ============================================================================
-// Whisper Encoder Builder
+// Whisper Encoder build implementation
 // ============================================================================
 
-std::shared_ptr<ov::Model> ModelBuilder::build_whisper_encoder(const WhisperConfig& config_in) {
+std::shared_ptr<ov::Model> ModelBuilder::build_whisper_encoder_impl(const ModelConfig& config) {
     clear();
-    WhisperConfig config = config_in;
-    config.fill_defaults();
-
     const auto prec = config.precision;
-    const auto d = config.d_model;
+    const auto d = config.hidden_size;
 
     // Input: [batch, num_mel_bins, 3000] — always f32 (audio features from feature extractor)
     auto input_features = parameter(ov::element::f32,
@@ -1679,18 +1803,16 @@ std::shared_ptr<ov::Model> ModelBuilder::build_whisper_encoder(const WhisperConf
     embedded->set_friendly_name("model.encoder.pos_embed_add");
 
     // Encoder layers
-    LayerNorm norm(d, prec);
-    FloatWeight bias_wf(prec);
-    GELUFn ffn(d, config.encoder_ffn_dim, prec, config.weight, bias_wf);
-    auto enc_attn = config.make_encoder_attention();
+    auto enc_attn = config.make_self_attention();
 
-    auto [current, _] = run_transformer_layers(embedded->output(0), config.encoder_layers, "model.encoder.layers.",
+    auto current = run_transformer_layers(embedded->output(0), config.get_encoder_layers(),
+        "model.encoder.layers.",
         [&](const ov::Output<ov::Node>& input, const std::string& prefix, size_t /*layer*/) {
-            return make_decoder_layer(input, norm, enc_attn, ffn, prefix);
+            return make_decoder_layer(input, config.norm, enc_attn, config.ffn, prefix);
         });
 
     // Final LayerNorm
-    auto final_norm = norm(current, "model.encoder.layer_norm");
+    auto final_norm = config.norm(current, "model.encoder.layer_norm");
 
     // Result — always f32 output (WhisperPipeline reads encoder output as f32)
     ov::Output<ov::Node> encoder_output = final_norm;
@@ -1699,27 +1821,20 @@ std::shared_ptr<ov::Model> ModelBuilder::build_whisper_encoder(const WhisperConf
         cvt->set_friendly_name("model.encoder.output_convert");
         encoder_output = cvt->output(0);
     }
-    result(encoder_output, "last_hidden_state");
 
-    return std::make_shared<ov::Model>(
-        ov::ResultVector(m_results.begin(), m_results.end()),
-        ov::ParameterVector(m_parameters.begin(), m_parameters.end()),
-        "synthetic_whisper_encoder");
+    return make_model(encoder_output, "last_hidden_state", "synthetic_whisper_encoder");
 }
 
 // ============================================================================
-// Whisper Decoder Builder
+// Whisper Decoder Builder (unified ModelConfig)
 // ============================================================================
 
-std::shared_ptr<ov::Model> ModelBuilder::build_whisper_decoder(const WhisperConfig& config_in) {
+std::shared_ptr<ov::Model> ModelBuilder::build_whisper_decoder_impl(const ModelConfig& config) {
     clear();
-    WhisperConfig config = config_in;
-    config.fill_defaults();
-
     const auto prec = config.precision;
-    const auto d = config.d_model;
-    const auto heads = config.decoder_attention_heads;
-    const auto hd = config.head_dim();
+    const auto d = config.hidden_size;
+    const auto heads = config.num_heads;
+    const auto hd = config.head_dim;
 
     // Inputs — encoder_hidden_states is always f32 (matches encoder output)
     auto input_ids = parameter(ov::element::i64, ov::PartialShape{-1, -1}, "input_ids");
@@ -1927,17 +2042,15 @@ std::shared_ptr<ov::Model> ModelBuilder::build_whisper_decoder(const WhisperConf
         shared_mask = causal_sliced->output(0);
     }
 
-    // Decoder layers
-    LayerNorm norm(d, prec);
-    FloatWeight bias_wf(prec);
-    GELUFn ffn(d, config.decoder_ffn_dim, prec, config.weight, bias_wf);
-
-    auto self_attn = config.make_decoder_self_attention();
+    // Decoder layers — use config.norm and config.ffn (set by conversion or user)
+    auto self_attn = config.make_self_attention();
     self_attn.sdpa_mask = shared_mask;
+    setup_sink_tracking(self_attn);
 
-    auto cross_attn = config.make_decoder_cross_attention();
+    auto cross_attn = config.make_cross_attention();
+    setup_sink_tracking(cross_attn);
 
-    auto [current, all_sinks] = run_transformer_layers(hidden_states->output(0), config.decoder_layers,
+    auto current = run_transformer_layers(hidden_states->output(0), config.get_decoder_layers(),
         "model.decoder.layers.",
         [&](const ov::Output<ov::Node>& input, const std::string& prefix, size_t layer) {
             if (layer == 0) {
@@ -1956,11 +2069,11 @@ std::shared_ptr<ov::Model> ModelBuilder::build_whisper_decoder(const WhisperConf
                 return cross_attn(inp, pfx, layer, Attention::CacheMode::StoreOnly, enc_hs);
             };
 
-            return make_whisper_decoder_layer(input, norm, call_self, call_cross, ffn, prefix);
+            return make_whisper_decoder_layer(input, config.norm, call_self, call_cross, config.ffn, prefix);
         });
 
     // Final LayerNorm
-    auto final_norm = norm(current, "model.decoder.layer_norm");
+    auto final_norm = config.norm(current, "model.decoder.layer_norm");
 
     // LM head
     auto logits = make_lm_head(final_norm, d, config.vocab_size, "proj_out", prec, config.weight);
@@ -1972,20 +2085,16 @@ std::shared_ptr<ov::Model> ModelBuilder::build_whisper_decoder(const WhisperConf
         cvt->set_friendly_name("model.decoder.logits_convert");
         logits_out = cvt->output(0);
     }
-    result(logits_out, "logits");
 
-    return std::make_shared<ov::Model>(m_results, all_sinks, m_parameters, "synthetic_whisper_decoder");
+    return make_model(logits_out, "logits", "synthetic_whisper_decoder");
 }
 
 // ============================================================================
-// BERT Encoder Builder
+// BERT / Embedding Encoder Builder (unified ModelConfig)
 // ============================================================================
 
-std::shared_ptr<ov::Model> ModelBuilder::build_bert_encoder(const BERTConfig& config_in) {
+std::shared_ptr<ov::Model> ModelBuilder::build_embedding_encoder_impl(const ModelConfig& config) {
     clear();
-
-    BERTConfig config = config_in;
-    config.fill_defaults();
 
     const auto prec = config.precision;
     const auto hs = config.hidden_size;
@@ -2026,18 +2135,16 @@ std::shared_ptr<ov::Model> ModelBuilder::build_bert_encoder(const BERTConfig& co
     auto sdpa_mask = make_padding_mask(attention_mask->output(0), prec);
 
     // ===== Encoder Layers (post-norm) =====
-    auto bert_attn = config.make_attention();
+    auto bert_attn = config.make_self_attention();
     bert_attn.sdpa_mask = sdpa_mask;
 
-    auto [current, _] = run_transformer_layers(embed_normed, config.num_layers, "encoder.layer.",
+    auto current = run_transformer_layers(embed_normed, config.num_layers, "encoder.layer.",
         [&](const ov::Output<ov::Node>& input, const std::string& prefix, size_t /*layer*/) {
             return make_post_norm_layer(input, config.norm, bert_attn, config.ffn, prefix);
         });
 
     // ===== Output =====
-    result(current, "last_hidden_state");
-
-    return std::make_shared<ov::Model>(m_results, ov::SinkVector{}, m_parameters, "synthetic_encoder_model");
+    return make_model(current, "last_hidden_state", "synthetic_encoder_model");
 }
 
 }  // namespace npuw
