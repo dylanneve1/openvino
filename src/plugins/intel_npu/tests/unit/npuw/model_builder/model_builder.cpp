@@ -1350,7 +1350,7 @@ void ModelBuilder::clear() {
     m_name_idx = 0;
 }
 
-ov::Output<ov::Node> ModelBuilder::setup_position_ids(ModelConfig& config, const ov::Output<ov::Node>& seq_source) {
+ov::Output<ov::Node> ModelBuilder::setup_position_ids(LLMConfig& config, const ov::Output<ov::Node>& seq_source) {
     OPENVINO_ASSERT(!(config.internal_position_ids && config.position_ids.get_node()),
                     "internal_position_ids and position_ids are mutually exclusive");
     ov::Output<ov::Node> position_ids_output;
@@ -1392,26 +1392,10 @@ std::shared_ptr<ov::Model> ModelBuilder::make_model(const ov::Output<ov::Node>& 
     return std::make_shared<ov::Model>(ov::OutputVector{res->output(0)}, m_sinks, model_name);
 }
 
-std::shared_ptr<ov::Model> ModelBuilder::build_model(const ModelConfig& config) {
-    OPENVINO_ASSERT(
-        (int)config.use_conv_features + (int)config.use_cross_attention + (int)config.use_token_type_embedding <= 1,
-        "At most one structural dispatch flag may be set");
-    if (config.use_conv_features) {
-        return build_whisper_encoder(config);
-    }
-    if (config.use_cross_attention) {
-        return build_whisper_decoder(config);
-    }
-    if (config.use_token_type_embedding) {
-        return build_embedding_encoder(config);
-    }
-    return build_llm(config);
-}
-
-std::shared_ptr<ov::Model> ModelBuilder::build_llm(const ModelConfig& config_in) {
+std::shared_ptr<ov::Model> ModelBuilder::build_llm(const LLMConfig& config_in) {
     clear();
 
-    ModelConfig config = config_in;
+    LLMConfig config = config_in;
     const auto prec = config.precision;
 
     auto attention_mask = parameter(ov::element::i64, ov::PartialShape{-1, -1}, "attention_mask");
@@ -1529,7 +1513,7 @@ std::shared_ptr<ov::Model> ModelBuilder::build_llm(const ModelConfig& config_in)
     return make_model(final_norm, "last_hidden_state", model_name);
 }
 
-std::shared_ptr<ov::Model> ModelBuilder::build_whisper_encoder(const ModelConfig& config) {
+std::shared_ptr<ov::Model> ModelBuilder::build_whisper_encoder(const WhisperEncoderConfig& config) {
     clear();
     const auto prec = config.precision;
     const auto d = config.hidden_size;
@@ -1777,7 +1761,7 @@ static ov::Output<ov::Node> make_whisper_positional_embedding(const ov::Output<o
     return hidden_states->output(0);
 }
 
-std::shared_ptr<ov::Model> ModelBuilder::build_whisper_decoder(const ModelConfig& config) {
+std::shared_ptr<ov::Model> ModelBuilder::build_whisper_decoder(const WhisperDecoderConfig& config) {
     clear();
     const auto prec = config.precision;
     const auto d = config.hidden_size;
@@ -1912,7 +1896,7 @@ std::shared_ptr<ov::Model> ModelBuilder::build_whisper_decoder(const ModelConfig
     return make_model(logits_out, "logits", "synthetic_whisper_decoder");
 }
 
-std::shared_ptr<ov::Model> ModelBuilder::build_embedding_encoder(const ModelConfig& config) {
+std::shared_ptr<ov::Model> ModelBuilder::build_embedding_encoder(const BertConfig& config) {
     clear();
 
     const auto prec = config.precision;
