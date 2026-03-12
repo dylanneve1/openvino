@@ -460,8 +460,8 @@ ov::Output<ov::Node> InterleavedRoPE::operator()(const ov::Output<ov::Node>& inp
     return output->output(0);
 }
 
-ov::Output<ov::Node> make_position_ids_2d() {
-    auto param = std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::PartialShape{-1, -1});
+ov::Output<ov::Node> make_position_ids_2d(ov::Dimension batch, ov::Dimension seq) {
+    auto param = std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::PartialShape{batch, seq});
     param->set_friendly_name("position_ids");
     param->output(0).set_names({"position_ids"});
     return param->output(0);
@@ -653,6 +653,45 @@ KVCacheResult make_kv_cache_concat(const ov::Output<ov::Node>& current_kv,
     assign->set_friendly_name(name + "_assign");
 
     return {concat->output(0), read_state.beam_gather, assign};
+}
+
+/// Stateless KV cache: Parameter(past) → beam Gather → Concat(current) → Result(present).
+/// Returns the concatenated output for SDPA, and the Result node to register as model output.
+/// The Parameter is auto-discovered by ov::Model when walking the graph from outputs.
+struct StatelessKVResult {
+    ov::Output<ov::Node> concatenated;
+    std::shared_ptr<ov::op::v0::Result> result;
+};
+
+StatelessKVResult make_stateless_kv_concat(const ov::Output<ov::Node>& current_kv,
+                                           const ov::Output<ov::Node>& beam_idx,
+                                           size_t num_heads,
+                                           size_t head_dim,
+                                           const std::string& past_name,
+                                           const std::string& present_name,
+                                           ov::element::Type precision,
+                                           ov::Dimension batch) {
+    auto kv_shape = ov::PartialShape{batch,
+                                     static_cast<int64_t>(num_heads),
+                                     ov::Dimension::dynamic(),
+                                     static_cast<int64_t>(head_dim)};
+
+    auto past_kv = std::make_shared<ov::op::v0::Parameter>(precision, kv_shape);
+    past_kv->set_friendly_name(past_name);
+    past_kv->output(0).set_names({past_name});
+
+    auto gather_axis = ov::opset11::Constant::create(ov::element::i64, ov::Shape{}, std::vector<int64_t>{0});
+    auto beam_gather = std::make_shared<ov::opset11::Gather>(past_kv, beam_idx, gather_axis);
+    beam_gather->set_friendly_name(past_name + "_beam_gather");
+
+    auto concat = std::make_shared<ov::opset11::Concat>(ov::OutputVector{beam_gather->output(0), current_kv}, 2);
+    concat->set_friendly_name(present_name + "_concat");
+
+    auto result = std::make_shared<ov::op::v0::Result>(concat);
+    result->set_friendly_name(present_name);
+    result->output(0).set_names({present_name});
+
+    return {concat->output(0), result};
 }
 
 ov::Output<ov::Node> make_sdpa(const ov::Output<ov::Node>& q,
@@ -1347,6 +1386,7 @@ std::shared_ptr<ov::op::v0::Parameter> ModelBuilder::parameter(ov::element::Type
 void ModelBuilder::clear() {
     m_nodes.clear();
     m_sinks.clear();
+    m_extra_results.clear();
     m_name_idx = 0;
 }
 
@@ -1372,7 +1412,7 @@ ov::Output<ov::Node> ModelBuilder::setup_position_ids(ModelConfig& config, const
     } else if (config.position_ids.get_node()) {
         position_ids_output = config.position_ids;
     } else if (!config.rope) {
-        position_ids_output = make_position_ids_2d();
+        position_ids_output = make_position_ids_2d(config.batch_dim(), config.seq_dim());
     }
     // config.rope set without position_ids means RoPE was pre-built with position_ids baked in
     if (position_ids_output.get_node() && !config.rope) {
@@ -1389,13 +1429,29 @@ std::shared_ptr<ov::Model> ModelBuilder::make_model(const ov::Output<ov::Node>& 
     res->set_friendly_name(result_name);
     res->output(0).set_names({result_name});
 
-    return std::make_shared<ov::Model>(ov::OutputVector{res->output(0)}, m_sinks, model_name);
+    ov::OutputVector outputs;
+    outputs.push_back(res->output(0));
+    for (const auto& extra : m_extra_results) {
+        outputs.push_back(extra->output(0));
+    }
+
+    return std::make_shared<ov::Model>(outputs, m_sinks, model_name);
 }
 
-std::shared_ptr<ov::Model> ModelBuilder::build_model(const ModelConfig& config) {
+std::shared_ptr<ov::Model> ModelBuilder::build_model(const ModelConfig& config_in) {
     OPENVINO_ASSERT(
-        (int)config.use_conv_features + (int)config.use_cross_attention + (int)config.use_token_type_embedding <= 1,
+        (int)config_in.use_conv_features + (int)config_in.use_cross_attention + (int)config_in.use_token_type_embedding <= 1,
         "At most one structural dispatch flag may be set");
+
+    // Fill in norm/ffn defaults from actual config sizes when the caller left them empty.
+    ModelConfig config = config_in;
+    if (!config.norm) {
+        config.norm = LayerNorm(config.hidden_size, config.precision);
+    }
+    if (!config.ffn) {
+        config.ffn = SwiGLU(config.hidden_size, config.intermediate_size, config.precision, config.weight);
+    }
+
     if (config.use_conv_features) {
         return build_whisper_encoder(config);
     }
@@ -1414,18 +1470,21 @@ std::shared_ptr<ov::Model> ModelBuilder::build_llm(const ModelConfig& config_in)
     ModelConfig config = config_in;
     const auto prec = config.precision;
 
-    auto attention_mask = parameter(ov::element::i64, ov::PartialShape{-1, -1}, "attention_mask");
+    const auto B = config.batch_dim();
+    const auto S = config.seq_dim();
+
+    auto attention_mask = parameter(ov::element::i64, ov::PartialShape{B, S}, "attention_mask");
 
     ov::Output<ov::Node> hidden_states;
     ov::Output<ov::Node> seq_source;
 
     if (config.use_inputs_embeds) {
         auto inputs_embeds =
-            parameter(prec, ov::PartialShape{-1, -1, static_cast<int64_t>(config.hidden_size)}, "inputs_embeds");
+            parameter(prec, ov::PartialShape{B, S, static_cast<int64_t>(config.hidden_size)}, "inputs_embeds");
         hidden_states = inputs_embeds->output(0);
         seq_source = inputs_embeds->output(0);
     } else {
-        auto input_ids = parameter(ov::element::i64, ov::PartialShape{-1, -1}, "input_ids");
+        auto input_ids = parameter(ov::element::i64, ov::PartialShape{B, S}, "input_ids");
         hidden_states =
             make_embedding(input_ids->output(0), config.vocab_size, config.hidden_size, "model.embed_tokens", prec);
         seq_source = input_ids->output(0);
@@ -1435,7 +1494,7 @@ std::shared_ptr<ov::Model> ModelBuilder::build_llm(const ModelConfig& config_in)
 
     ov::Output<ov::Node> beam_idx_output;
     if (config.use_kv_cache) {
-        auto beam_idx = parameter(ov::element::i32, ov::PartialShape{-1}, "beam_idx");
+        auto beam_idx = parameter(ov::element::i32, ov::PartialShape{B}, "beam_idx");
         beam_idx_output = beam_idx->output(0);
     }
 
@@ -1466,7 +1525,8 @@ std::shared_ptr<ov::Model> ModelBuilder::build_llm(const ModelConfig& config_in)
     attn.sdpa_mask = sdpa_mask;
     attn.shared_broadcast_shape = shared_broadcast;
 
-    if (config.use_kv_cache) {
+    if (config.use_kv_cache && config.stateful) {
+        // Stateful: ReadValue → beam Gather → Concat → Assign
         attn.kv_cache_fn = [&](const ov::Output<ov::Node>& k,
                                const ov::Output<ov::Node>& v,
                                size_t layer) -> std::pair<ov::Output<ov::Node>, ov::Output<ov::Node>> {
@@ -1488,6 +1548,22 @@ std::shared_ptr<ov::Model> ModelBuilder::build_llm(const ModelConfig& config_in)
             m_sinks.push_back(std::dynamic_pointer_cast<ov::op::Sink>(k_cache.assign));
             m_sinks.push_back(std::dynamic_pointer_cast<ov::op::Sink>(v_cache.assign));
             return {k_cache.concatenated, v_cache.concatenated};
+        };
+    } else if (config.use_kv_cache && !config.stateful) {
+        // Stateless: Parameter(past_kv) → beam Gather → Concat → Result(present_kv)
+        attn.kv_cache_fn = [&](const ov::Output<ov::Node>& k,
+                                const ov::Output<ov::Node>& v,
+                                size_t layer) -> std::pair<ov::Output<ov::Node>, ov::Output<ov::Node>> {
+            auto layer_str = std::to_string(layer);
+            auto k_kv = make_stateless_kv_concat(k, beam_idx_output, kv_heads, config.head_dim,
+                                                  "past_key_values." + layer_str + ".key",
+                                                  "present." + layer_str + ".key", prec, B);
+            auto v_kv = make_stateless_kv_concat(v, beam_idx_output, kv_heads, config.head_dim,
+                                                  "past_key_values." + layer_str + ".value",
+                                                  "present." + layer_str + ".value", prec, B);
+            m_extra_results.push_back(k_kv.result);
+            m_extra_results.push_back(v_kv.result);
+            return {k_kv.concatenated, v_kv.concatenated};
         };
     }
 

@@ -149,8 +149,9 @@ struct InterleavedRoPE {
     ov::Output<ov::Node> operator()(const ov::Output<ov::Node>& input, const std::string& name) const;
 };
 
-/// [batch, seq] position_ids Parameter.
-ov::Output<ov::Node> make_position_ids_2d();
+/// [batch, seq] position_ids Parameter. Pass explicit dims for static shapes.
+ov::Output<ov::Node> make_position_ids_2d(ov::Dimension batch = ov::Dimension::dynamic(),
+                                           ov::Dimension seq = ov::Dimension::dynamic());
 
 /// [3, batch, seq] position_ids Parameter for m-rope. Returns [batch, seq] slice.
 ov::Output<ov::Node> make_position_ids_3d();
@@ -381,6 +382,9 @@ struct ModelConfig {
     bool use_kv_cache = true;
     bool use_inputs_embeds = false;
     bool internal_position_ids = false;
+    bool stateful = true;       ///< false = KV cache as Parameter/Result (no ReadValue/Assign)
+    size_t batch_size = 0;      ///< 0 = dynamic batch dimension
+    size_t seq_len = 0;         ///< 0 = dynamic sequence length
 
     // Structural flags — build_model() dispatches on these
     bool use_conv_features = false;
@@ -411,10 +415,21 @@ struct ModelConfig {
     size_t max_position_embeddings = 512;
     size_t type_vocab_size = 2;
 
-    ModelConfig()
-        : lm_head_weight(weight),
-          norm(LayerNorm(hidden_size, precision)),
-          ffn(SwiGLU(hidden_size, intermediate_size, precision, weight)) {}
+    ModelConfig() : lm_head_weight(weight) {}
+    // NOTE: norm and ffn are left empty by default so that build_model() can
+    // create them from the *actual* hidden_size / intermediate_size / precision
+    // at build time.  Setting config.hidden_size after construction would
+    // otherwise silently leave norm/ffn using the old default values.
+
+    /// Batch dimension: dynamic if batch_size==0, else static.
+    ov::Dimension batch_dim() const {
+        return batch_size > 0 ? ov::Dimension(batch_size) : ov::Dimension::dynamic();
+    }
+
+    /// Sequence dimension: dynamic if seq_len==0, else static.
+    ov::Dimension seq_dim() const {
+        return seq_len > 0 ? ov::Dimension(seq_len) : ov::Dimension::dynamic();
+    }
 
     size_t get_kv_heads() const {
         return num_kv_heads == 0 ? num_heads : num_kv_heads;
@@ -474,6 +489,7 @@ private:
 
     std::vector<std::shared_ptr<ov::Node>> m_nodes;
     ov::SinkVector m_sinks;
+    ov::ResultVector m_extra_results;  ///< Additional results (e.g. stateless KV cache outputs)
     size_t m_name_idx = 0;
 };
 
