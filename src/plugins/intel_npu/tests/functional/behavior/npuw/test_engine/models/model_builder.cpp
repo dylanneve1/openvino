@@ -1455,15 +1455,6 @@ std::shared_ptr<ov::Model> ModelBuilder::build_llm(const LLMConfig& config_in) {
 
     auto sdpa_mask = make_causal_mask(seq_source, attention_mask->output(0), prec);
 
-    // Shared GQA broadcast shape (embedding models only)
-    ov::Output<ov::Node> shared_broadcast;
-    if (!config.use_kv_cache && !config.lm_head_weight) {
-        shared_broadcast = make_shared_gqa_broadcast(attention_mask->output(0),
-                                                     config.get_kv_heads(),
-                                                     config.num_heads,
-                                                     config.head_dim);
-    }
-
     const auto hs = config.hidden_size;
     const auto kv_heads = config.get_kv_heads();
 
@@ -1478,7 +1469,6 @@ std::shared_ptr<ov::Model> ModelBuilder::build_llm(const LLMConfig& config_in) {
     attn.qk_norm = config.qk_norm;
     attn.rope_fn = config.rope;
     attn.sdpa_mask = sdpa_mask;
-    attn.shared_broadcast_shape = shared_broadcast;
 
     if (config.use_kv_cache) {
         attn.kv_cache_fn = [&](const ov::Output<ov::Node>& k,
@@ -1533,14 +1523,9 @@ std::shared_ptr<ov::Model> ModelBuilder::build_llm(const LLMConfig& config_in) {
 
     auto final_norm = config.norm(current, "model.norm");
 
-    std::string model_name = "synthetic_decoder";
-
-    if (config.lm_head_weight) {
-        auto logits =
-            make_lm_head(final_norm, config.hidden_size, config.vocab_size, "lm_head", prec, config.lm_head_weight);
-        return make_model(logits, "logits", model_name);
-    }
-    return make_model(final_norm, "last_hidden_state", model_name);
+    auto logits =
+        make_lm_head(final_norm, config.hidden_size, config.vocab_size, "lm_head", prec, config.lm_head_weight);
+    return make_model(logits, "logits", "synthetic_decoder");
 }
 
 std::shared_ptr<ov::Model> ModelBuilder::build_whisper_encoder(const WhisperEncoderConfig& config_in) {
@@ -1810,7 +1795,9 @@ std::shared_ptr<ov::Model> ModelBuilder::build_whisper_decoder(const WhisperDeco
 
     auto input_ids = parameter(ov::element::i64, ov::PartialShape{-1, -1}, "input_ids");
     auto encoder_hidden_states =
-        parameter(ov::element::f32, ov::PartialShape{-1, -1, static_cast<int64_t>(d)}, "encoder_hidden_states");
+        parameter(ov::element::f32,
+                  ov::PartialShape{-1, static_cast<int64_t>(config.encoder_seq_len), static_cast<int64_t>(d)},
+                  "encoder_hidden_states");
     auto beam_idx = parameter(ov::element::i32, ov::PartialShape{-1}, "beam_idx");
 
     ov::Output<ov::Node> enc_hs = encoder_hidden_states->output(0);
@@ -2001,6 +1988,67 @@ std::shared_ptr<ov::Model> ModelBuilder::build_embedding_encoder(const BertConfi
                                 });
 
     return make_model(current, "last_hidden_state", "synthetic_encoder_model");
+}
+
+std::shared_ptr<ov::Model> ModelBuilder::build_qwen3_embedding(const Qwen3EmbeddingConfig& config_in) {
+    clear();
+
+    Qwen3EmbeddingConfig config = config_in;
+    if (!config.norm)
+        config.norm = RMSNorm(config.hidden_size, config.precision);
+    if (!config.ffn)
+        config.ffn = SwiGLU(config.hidden_size, config.intermediate_size, config.precision, config.weight);
+    if (!config.qk_norm)
+        config.qk_norm = RMSNorm(config.head_dim, config.precision);
+
+    const auto prec = config.precision;
+    const auto hs = config.hidden_size;
+    const auto kv_heads = config.get_kv_heads();
+
+    auto attention_mask = parameter(ov::element::i64, ov::PartialShape{-1, -1}, "attention_mask");
+    auto input_ids = parameter(ov::element::i64, ov::PartialShape{-1, -1}, "input_ids");
+    auto hidden_states =
+        make_embedding(input_ids->output(0), config.vocab_size, hs, "model.embed_tokens", prec);
+
+    setup_position_ids(config, input_ids->output(0));
+
+    auto sdpa_mask = make_causal_mask(input_ids->output(0), attention_mask->output(0), prec);
+
+    auto shared_broadcast = make_shared_gqa_broadcast(attention_mask->output(0),
+                                                      kv_heads,
+                                                      config.num_heads,
+                                                      config.head_dim);
+
+    Attention attn{};
+    attn.hidden_size = hs;
+    attn.num_heads = config.num_heads;
+    attn.num_kv_heads = kv_heads;
+    attn.head_dim = config.head_dim;
+    attn.precision = prec;
+    attn.weight_fn = config.weight;
+    attn.bias_fn = config.attn_bias;
+    attn.qk_norm = config.qk_norm;
+    attn.rope_fn = config.rope;
+    attn.sdpa_mask = sdpa_mask;
+    attn.shared_broadcast_shape = shared_broadcast;
+
+    auto current =
+        make_transformer_layers(hidden_states,
+                                config.num_layers,
+                                "model.layers.",
+                                [&](const ov::Output<ov::Node>& input, const std::string& prefix, size_t layer) {
+                                    return make_pre_norm_layer(
+                                        input,
+                                        config.norm,
+                                        [&](const ov::Output<ov::Node>& normed, const std::string& pfx) {
+                                            return attn(normed, {}, pfx, layer);
+                                        },
+                                        config.ffn,
+                                        prefix);
+                                });
+
+    auto final_norm = config.norm(current, "model.norm");
+    return make_model(final_norm, "last_hidden_state", "synthetic_decoder");
 }
 
 }  // namespace npuw

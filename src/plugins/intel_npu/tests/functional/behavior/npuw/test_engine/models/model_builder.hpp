@@ -380,7 +380,6 @@ struct BaseModelConfig {
     ov::element::Type precision = ov::element::f32;
 
     WeightFn weight = FP32Weight{};
-    WeightFn lm_head_weight;  ///< Truthy = append LM head. Empty = no LM head.
     WeightFn attn_bias;
 
     NormFn norm;
@@ -388,8 +387,6 @@ struct BaseModelConfig {
     RoPEFn rope;                        ///< Empty = auto HalfRotationRoPE. Set identity lambda to disable.
     ov::Output<ov::Node> position_ids;  ///< Empty = auto-creates 2D Parameter + HalfRotationRoPE
     NormFn qk_norm;
-
-    BaseModelConfig() : lm_head_weight(weight) {}
 
     virtual ~BaseModelConfig() = default;
 
@@ -399,10 +396,13 @@ struct BaseModelConfig {
 };
 
 struct LLMConfig : public BaseModelConfig {
+    WeightFn lm_head_weight;  ///< Weight function for the LM head projection.
     bool use_kv_cache = true;
     bool use_inputs_embeds = false;
     bool internal_position_ids = false; ///< embedding model
     bool pre_norm = true;
+
+    LLMConfig() : lm_head_weight(weight) {}
 };
 
 struct WhisperEncoderConfig : public BaseModelConfig {
@@ -418,6 +418,7 @@ struct WhisperEncoderConfig : public BaseModelConfig {
 struct WhisperDecoderConfig : public BaseModelConfig {
     size_t decoder_layers = 0;
     size_t max_target_positions = 448;
+    size_t encoder_seq_len = 1500;  ///< Encoder output sequence length (matches max_source_positions)
 
     size_t get_decoder_layers() const {
         return decoder_layers == 0 ? num_layers : decoder_layers;
@@ -427,6 +428,15 @@ struct WhisperDecoderConfig : public BaseModelConfig {
 struct BertConfig : public BaseModelConfig {
     size_t max_position_embeddings = 512;
     size_t type_vocab_size = 2;
+};
+
+/// Qwen3-style decoder embedding model (no KV cache, no LM head, internal position IDs, QK-norm).
+struct Qwen3EmbeddingConfig : public LLMConfig {
+    Qwen3EmbeddingConfig() {
+        use_kv_cache = false;
+        internal_position_ids = true;  // Range→Unsqueeze chain for AddPositionIdsNode
+        pre_norm = true;
+    }
 };
 
 class ModelBuilder {
@@ -457,6 +467,7 @@ public:
     std::shared_ptr<ov::Model> build_whisper_encoder(const WhisperEncoderConfig& config);
     std::shared_ptr<ov::Model> build_whisper_decoder(const WhisperDecoderConfig& config);
     std::shared_ptr<ov::Model> build_embedding_encoder(const BertConfig& config);
+    std::shared_ptr<ov::Model> build_qwen3_embedding(const Qwen3EmbeddingConfig& config);
 
     void clear();
 

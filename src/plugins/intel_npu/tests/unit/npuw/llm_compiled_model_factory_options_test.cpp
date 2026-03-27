@@ -39,6 +39,10 @@ protected:
         return ov::test::npuw::build_embedding_test_model();
     }
 
+    std::shared_ptr<ov::Model> build_qwen3_embedding_model() const {
+        return ov::test::npuw::build_qwen3_embedding_test_model();
+    }
+
     static ov::AnyMap base_props() {
         return {{"NPUW_LLM", "YES"}, {"NPUW_LLM_MAX_PROMPT_LEN", "128"}, {"NPUW_LLM_MIN_RESPONSE_LEN", "64"}};
     }
@@ -428,13 +432,17 @@ TEST_F(LLMCompiledModelFactoryOptionsTest, CacheRopeDisabledRoundsTripThroughCom
     EXPECT_EQ(recorder.count_contains("_kv"), 1u);
 }
 
-TEST_F(LLMCompiledModelFactoryOptionsTest, WhisperOptionRejectsCurrentSyntheticDecoderModel) {
+TEST_F(LLMCompiledModelFactoryOptionsTest, WhisperOptionCompilesSyntheticDecoderModel) {
     RecordingFactory recorder;
     std::unique_ptr<ov::npuw::LLMCompiledModel> compiled;
 
-    EXPECT_ANY_THROW(compiled = create_compiled_model(build_whisper_decoder_model(),
+    ASSERT_NO_THROW(compiled = create_compiled_model(build_whisper_decoder_model(),
                                                       {{"NPUW_WHISPER", "YES"}, {"NPUW_WHISPER_EOS_TOKEN", "42"}},
                                                       recorder));
+    ASSERT_NE(compiled, nullptr);
+    EXPECT_GE(recorder.calls().size(), 2u);
+    EXPECT_NE(recorder.find_suffix("_prefill"), nullptr);
+    EXPECT_EQ(recorder.count_contains("_kv"), 1u);
 }
 
 TEST_F(LLMCompiledModelFactoryOptionsTest, WhisperPreparationAddsKvCacheInputsAndPresentOutputs) {
@@ -462,12 +470,26 @@ TEST_F(LLMCompiledModelFactoryOptionsTest, WhisperPrefillPreparationAddsCrossAtt
     ov::pass::StatefulToStateless().run_on_model(model);
     model = model->clone();
 
-    EXPECT_TRUE(ov::npuw::util::PrepareWhisperPrefillModel(128, 256).run_on_model(model));
+    auto lhs_seq_size = static_cast<uint32_t>(
+        model->input("encoder_hidden_states").get_partial_shape()[1].get_length());
+    EXPECT_TRUE(ov::npuw::util::PrepareWhisperPrefillModel(128, lhs_seq_size).run_on_model(model));
     auto prepared = model;
 
     EXPECT_TRUE(has_input_name(prepared, "attention_mask"));
     EXPECT_FALSE(has_input_name(prepared, "cache_position"));
     EXPECT_TRUE(has_output_name(prepared, "present"));
+}
+
+TEST_F(LLMCompiledModelFactoryOptionsTest, TextEmbedOptionCompilesQwen3EmbeddingModel) {
+    RecordingFactory recorder;
+    std::unique_ptr<ov::npuw::LLMCompiledModel> compiled;
+
+    ASSERT_NO_THROW(compiled = create_compiled_model(build_qwen3_embedding_model(),
+                                                      {{"NPUW_TEXT_EMBED", "YES"}},
+                                                      recorder));
+    ASSERT_NE(compiled, nullptr);
+    EXPECT_GE(recorder.calls().size(), 1u);
+    EXPECT_NE(recorder.find_suffix("_prefill"), nullptr);
 }
 
 }  // namespace

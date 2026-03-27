@@ -38,12 +38,21 @@ inline std::shared_ptr<ov::Model> build_llm_test_model() {
 
 inline std::shared_ptr<ov::Model> build_whisper_decoder_test_model() {
     ModelBuilder mb;
-    return mb.build_whisper_decoder(make_test_model_config<WhisperDecoderConfig>());
+    auto cfg = make_test_model_config<WhisperDecoderConfig>();
+    cfg.encoder_seq_len = 32;  // Small value for fast test model creation
+    return mb.build_whisper_decoder(cfg);
 }
 
 inline std::shared_ptr<ov::Model> build_embedding_test_model() {
     ModelBuilder mb;
     return mb.build_embedding_encoder(make_test_model_config<BertConfig>());
+}
+
+inline std::shared_ptr<ov::Model> build_qwen3_embedding_test_model() {
+    ModelBuilder mb;
+    auto cfg = make_test_model_config<Qwen3EmbeddingConfig>();
+    cfg.num_kv_heads = 2;  // GQA (n_rep=2) triggers shared broadcast shape
+    return mb.build_qwen3_embedding(cfg);
 }
 
 class NullPlugin : public ov::IPlugin {
