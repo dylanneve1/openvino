@@ -401,8 +401,11 @@ struct BaseModelConfig {
 struct LLMConfig : public BaseModelConfig {
     bool use_kv_cache = true;
     bool use_inputs_embeds = false;
-    bool internal_position_ids = false; ///< embedding model
+    bool internal_position_ids = false;    ///< embedding model
     bool pre_norm = true;
+    size_t sliding_window_size = 0;        ///< 0 = no sliding window. >0 = window size (Phi-3, Gemma 2/3)
+    bool alternating_attention = false;    ///< false = all layers same mask. true = even=sliding, odd=full (Gemma 2)
+    bool use_token_type_ids = false;       ///< Gemma 3 VLM: token_type_ids param (0=text/causal, 1=image/bidir)
 };
 
 struct WhisperEncoderConfig : public BaseModelConfig {
