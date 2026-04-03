@@ -401,8 +401,27 @@ struct BaseModelConfig {
 struct LLMConfig : public BaseModelConfig {
     bool use_kv_cache = true;
     bool use_inputs_embeds = false;
-    bool internal_position_ids = false; ///< embedding model
+    bool internal_position_ids = false;  ///< embedding model
     bool pre_norm = true;
+
+    /// Mamba-2/SSM hybrid support (Qwen3.5-style).
+    /// 0 = pure attention.  N = N consecutive Mamba layers per 1 attention layer.
+    /// Example: mamba_ratio=3, 12 layers -> layers 0-2 Mamba, 3 Attn, 4-6 Mamba, 7 Attn, ...
+    size_t mamba_ratio = 0;
+    size_t ssm_inner_size = 0;    ///< 0 = 2 * hidden_size
+    size_t ssm_num_heads = 0;     ///< 0 = num_heads
+    size_t ssm_state_size = 64;
+    size_t conv_kernel_size = 4;
+
+    size_t get_ssm_inner() const {
+        return ssm_inner_size ? ssm_inner_size : 2 * hidden_size;
+    }
+    size_t get_ssm_heads() const {
+        return ssm_num_heads ? ssm_num_heads : num_heads;
+    }
+    size_t get_ssm_head_dim() const {
+        return get_ssm_inner() / get_ssm_heads();
+    }
 };
 
 struct WhisperConfig : public BaseModelConfig {
@@ -428,6 +447,21 @@ struct BertConfig : public BaseModelConfig {
     size_t max_position_embeddings = 512;
     size_t type_vocab_size = 2;
 };
+
+using WhisperEncoderConfig = WhisperConfig;
+using WhisperDecoderConfig = WhisperConfig;
+using Qwen3EmbeddingConfig = LLMConfig;
+
+/// Fixed-size state variable (SSM/conv states — no sequence growth, no beam gather).
+struct FixedStateResult {
+    std::shared_ptr<ov::op::util::Variable> variable;
+    ov::Output<ov::Node> read_value;
+};
+
+FixedStateResult make_fixed_state(const ov::Output<ov::Node>& batch_source,
+                                  const std::vector<int64_t>& state_dims,
+                                  const std::string& name,
+                                  ov::element::Type precision = ov::element::f32);
 
 class ModelBuilder {
 public:
@@ -457,6 +491,7 @@ public:
     std::shared_ptr<ov::Model> build_whisper_encoder(const WhisperConfig& config);
     std::shared_ptr<ov::Model> build_whisper_decoder(const WhisperConfig& config);
     std::shared_ptr<ov::Model> build_embedding_encoder(const BertConfig& config);
+    std::shared_ptr<ov::Model> build_qwen3_embedding(const Qwen3EmbeddingConfig& config);
 
     void clear();
 
