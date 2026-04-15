@@ -431,13 +431,18 @@ struct BaseModelConfig {
 struct LLMConfig : public BaseModelConfig {
     bool use_kv_cache = true;
     bool use_inputs_embeds = false;
-    bool internal_position_ids = false; ///< embedding model
+    bool internal_position_ids = false;    ///< embedding model
     bool pre_norm = true;
 
     // MoE configuration (num_experts=0 means dense, no MoE)
     size_t num_experts = 0;           ///< Total experts. 0 = dense model.
     size_t num_experts_per_tok = 0;   ///< Top-K. 0 = default to 2.
     size_t moe_intermediate_size = 0; ///< Expert FFN intermediate size. 0 = use intermediate_size.
+
+    // Sliding window attention
+    size_t sliding_window_size = 0;        ///< 0 = no sliding window. >0 = window size (Phi-3, Gemma 2/3)
+    bool alternating_attention = false;    ///< false = all layers same mask. true = even=sliding, odd=full (Gemma 2)
+    bool use_token_type_ids = false;       ///< Gemma 3 VLM: token_type_ids param (0=text/causal, 1=image/bidir)
 };
 
 struct WhisperConfig : public BaseModelConfig {

@@ -8,6 +8,7 @@
 
 #include "intel_npu/config/config.hpp"
 #include "intel_npu/config/npuw.hpp"
+#include "llm_test_helpers.hpp"
 #include "model_builder.hpp"
 #include "openvino/op/ops.hpp"
 #include "openvino/op/util/op_types.hpp"
@@ -732,4 +733,77 @@ TEST(OnlinePartitioningTest, IsRegularParameterCase_PrefillModel_InputsEmbeds) {
     // Layer 0 reads inputs_embeds (ov::Parameter); layers 1+ read from prior computation.
     // isRegularParameterCase must detect this structural asymmetry and set irregular_io=true.
     EXPECT_TRUE(ens.irregular_io);
+}
+
+TEST(OnlinePartitioningTest, SlidingWindowAllLayers_ModelBuilds) {
+    auto model = ov::test::npuw::build_sliding_window_test_model();
+    ASSERT_NE(model, nullptr);
+
+    bool has_attention_mask = false;
+    for (const auto& param : model->get_parameters()) {
+        if (param->get_friendly_name() == "attention_mask")
+            has_attention_mask = true;
+    }
+    EXPECT_TRUE(has_attention_mask);
+}
+
+TEST(OnlinePartitioningTest, SlidingWindowAlternating_ModelBuilds) {
+    auto model = ov::test::npuw::build_sliding_window_test_model(512, true);
+    ASSERT_NE(model, nullptr);
+}
+
+TEST(OnlinePartitioningTest, TokenTypeIds_HasCorrectInputs) {
+    auto model = ov::test::npuw::build_token_type_ids_test_model();
+    ASSERT_NE(model, nullptr);
+
+    bool has_token_type_ids = false;
+    bool has_inputs_embeds = false;
+    for (const auto& param : model->get_parameters()) {
+        if (param->get_friendly_name() == "token_type_ids")
+            has_token_type_ids = true;
+        if (param->get_friendly_name() == "inputs_embeds")
+            has_inputs_embeds = true;
+    }
+    EXPECT_TRUE(has_token_type_ids);
+    EXPECT_TRUE(has_inputs_embeds);
+}
+
+// Verify token_type_ids mask modifier handles seq != total_seq (KV-cache scenario).
+// Mirrors production: stateful→stateless, reshape to static shapes, validate+clone.
+TEST(OnlinePartitioningTest, TokenTypeIds_StaticReshape_SeqNeTotalSeq) {
+    auto model = ov::test::npuw::build_token_type_ids_test_model();
+    ASSERT_NE(model, nullptr);
+
+    ov::pass::StatefulToStateless().run_on_model(model);
+    model = model->clone();
+
+    // seq_len=1 (generate), total_seq=17 (past + current) — tests the offset slicing
+    const int64_t seq_len = 1;
+    const int64_t past_kv_len = 16;
+    const int64_t total_seq = seq_len + past_kv_len;
+    std::map<std::string, ov::PartialShape> new_shapes;
+    for (const auto& input : model->inputs()) {
+        const auto& name = input.get_any_name();
+        const auto& pshape = input.get_partial_shape();
+        ov::PartialShape new_shape;
+        if (name.find("inputs_embeds") != std::string::npos) {
+            new_shape = {1, seq_len, pshape[2]};
+        } else if (name.find("attention_mask") != std::string::npos ||
+                   name.find("token_type_ids") != std::string::npos) {
+            new_shape = {1, total_seq};
+        } else if (name.find("position_ids") != std::string::npos) {
+            new_shape = {1, seq_len};
+        } else if (name.find("beam_idx") != std::string::npos) {
+            new_shape = {1};
+        } else {
+            new_shape = pshape;
+            new_shape[0] = 1;
+            new_shape[2] = past_kv_len;
+        }
+        new_shapes[name] = new_shape;
+    }
+
+    // Must not throw — validates that the token_type_ids mask modifier
+    // correctly handles the offset slice when seq != total_seq.
+    EXPECT_NO_THROW(model->reshape(new_shapes));
 }
