@@ -1505,79 +1505,111 @@ std::shared_ptr<ov::Model> ModelBuilder::build_llm(const LLMConfig& config_in) {
         };
     }
 
-    // Mamba-2/SSM layer function (used only when mamba_ratio > 0).
-    // Structure: in_proj -> SiLU -> conv_state bias -> ssm_state bias -> out_proj
-    // Conv/SSM states use fixed-size ReadValue/Assign (not growing like KV cache).
-    const auto ssm_inner = config.get_ssm_inner();
-    const auto ssm_heads = config.get_ssm_heads();
-    const auto ssm_head_dim = config.get_ssm_head_dim();
-    const auto ssm_state_sz = config.ssm_state_size;
-    const auto conv_k = config.conv_kernel_size;
+    // Linear Attention layer function (Qwen3-Next Gated DeltaNet style).
+    // Structure matches real HuggingFace Qwen3-Next: in_proj -> Q/K/V split -> SiLU ->
+    // conv_state bias -> recurrent_state bias -> gated output -> out_proj.
+    // Conv/recurrent states use fixed-size ReadValue/Assign (not growing like KV cache).
+    const auto la_num_k_heads = config.get_linear_num_key_heads();
+    const auto la_num_v_heads = config.get_linear_num_value_heads();
+    const auto la_k_head_dim = config.get_linear_key_head_dim();
+    const auto la_v_head_dim = config.get_linear_value_head_dim();
+    const auto la_key_dim = config.get_key_dim();
+    const auto la_value_dim = config.get_value_dim();
+    const auto la_conv_dim = config.get_conv_dim();  // 2*key_dim + value_dim (Q+K+V conv)
+    const auto la_conv_k = config.linear_conv_kernel_dim;
 
-    auto mamba_fn = [&](const ov::Output<ov::Node>& input, const std::string& prefix, size_t layer) {
-        // in_proj: hidden -> ssm_inner
-        auto projected = make_linear(input, hs, ssm_inner, prefix + "mamba.in_proj", prec, config.weight);
-        auto activated = std::make_shared<ov::opset11::Swish>(projected);
-        activated->set_friendly_name(prefix + "mamba.silu");
-        auto x = activated->output(0);
+    auto linear_attn_fn = [&](const ov::Output<ov::Node>& input, const std::string& prefix, size_t layer) {
+        const std::string ns = prefix + "linear_attn.";
 
-        // --- Conv state side-chain ---
+        // Q, K, V projections (linear attention uses separate projections like GatedDeltaNet).
+        auto q = make_linear(input, hs, la_key_dim,   ns + "q_proj", prec, config.weight);
+        auto k = make_linear(input, hs, la_key_dim,   ns + "k_proj", prec, config.weight);
+        auto v = make_linear(input, hs, la_value_dim, ns + "v_proj", prec, config.weight);
+        // Gate projection (value_dim matches output of Gated DeltaNet before out_proj).
+        auto z = make_linear(input, hs, la_value_dim, ns + "z_proj", prec, config.weight);
+        auto z_act = std::make_shared<ov::opset11::Swish>(z);
+        z_act->set_friendly_name(ns + "z_silu");
+
+        // Concat Q+K+V along last dim for conv: [batch, seq, conv_dim]
+        auto qkv_cat = std::make_shared<ov::opset11::Concat>(
+            ov::OutputVector{q, k, v}, -1);
+        qkv_cat->set_friendly_name(ns + "qkv_concat");
+
+        // --- Conv state side-chain (causal conv1d over Q+K+V) ---
         auto conv_state_name = "cache_params.past.conv." + std::to_string(layer);
         auto conv_state = make_fixed_state(
             seq_source,
-            {static_cast<int64_t>(ssm_inner), static_cast<int64_t>(conv_k)},
+            {static_cast<int64_t>(la_conv_dim), static_cast<int64_t>(la_conv_k)},
             conv_state_name, prec);
-        // Bias from conv state: ReduceSum over kernel dim -> [batch, inner] -> unsqueeze -> [batch, 1, inner]
+        // Conv bias from state: ReduceSum over kernel dim -> [batch, conv_dim] -> unsqueeze -> [batch, 1, conv_dim]
         auto conv_reduce_axes = ov::opset11::Constant::create(ov::element::i64, ov::Shape{1}, {2});
         auto conv_reduced = std::make_shared<ov::opset11::ReduceSum>(conv_state.read_value, conv_reduce_axes, false);
-        conv_reduced->set_friendly_name(prefix + "mamba.conv_reduce");
+        conv_reduced->set_friendly_name(ns + "conv_reduce");
         auto conv_unsq_axis = ov::opset11::Constant::create(ov::element::i64, ov::Shape{1}, {1});
         auto conv_bias = std::make_shared<ov::opset11::Unsqueeze>(conv_reduced, conv_unsq_axis);
-        conv_bias->set_friendly_name(prefix + "mamba.conv_bias");
-        auto x_with_conv = std::make_shared<ov::opset11::Add>(x, conv_bias);
-        x_with_conv->set_friendly_name(prefix + "mamba.conv_add");
-        x = x_with_conv->output(0);
-        // Update conv state: MatMul(state, transition_weight) preserves shape.
-        // Always use float weights for state transitions (small dims, not DCOFF targets).
-        auto conv_transition = FloatWeight{prec}(prefix + "mamba.conv_transition.weight",
-                                                  ov::Shape{conv_k, conv_k}, prec);
+        conv_bias->set_friendly_name(ns + "conv_bias");
+        auto qkv_conv = std::make_shared<ov::opset11::Add>(qkv_cat, conv_bias);
+        qkv_conv->set_friendly_name(ns + "conv_add");
+        auto qkv_act = std::make_shared<ov::opset11::Swish>(qkv_conv);
+        qkv_act->set_friendly_name(ns + "conv_silu");
+        // Update conv state: MatMul(state, transition) preserves shape [batch, conv_dim, conv_k].
+        auto conv_transition = FloatWeight{prec}(ns + "conv_transition.weight",
+                                                  ov::Shape{la_conv_k, la_conv_k}, prec);
         auto conv_state_new = std::make_shared<ov::opset11::MatMul>(conv_state.read_value, conv_transition, false, false);
-        conv_state_new->set_friendly_name(prefix + "mamba.conv_state_update");
+        conv_state_new->set_friendly_name(ns + "conv_state_update");
         auto conv_assign = std::make_shared<ov::op::v6::Assign>(conv_state_new, conv_state.variable);
         conv_assign->set_friendly_name(conv_state_name + "_assign");
         m_sinks.push_back(std::dynamic_pointer_cast<ov::op::Sink>(conv_assign));
 
-        // --- SSM state side-chain ---
-        auto ssm_state_name = "cache_params.past.ssm." + std::to_string(layer);
-        auto ssm_state = make_fixed_state(
-            seq_source,
-            {static_cast<int64_t>(ssm_heads), static_cast<int64_t>(ssm_state_sz), static_cast<int64_t>(ssm_head_dim)},
-            ssm_state_name, prec);
-        // Bias from SSM state: ReduceSum over heads+state dims -> [batch, head_dim]
-        auto ssm_reduce_axes = ov::opset11::Constant::create(ov::element::i64, ov::Shape{2}, {1, 2});
-        auto ssm_reduced = std::make_shared<ov::opset11::ReduceSum>(ssm_state.read_value, ssm_reduce_axes, false);
-        ssm_reduced->set_friendly_name(prefix + "mamba.ssm_reduce");
-        // Project head_dim -> inner and unsqueeze to [batch, 1, inner]
-        auto ssm_proj = make_linear(ssm_reduced, ssm_head_dim, ssm_inner,
-                                    prefix + "mamba.ssm_proj", prec, FloatWeight{prec});
-        auto ssm_unsq_axis = ov::opset11::Constant::create(ov::element::i64, ov::Shape{1}, {1});
-        auto ssm_bias = std::make_shared<ov::opset11::Unsqueeze>(ssm_proj, ssm_unsq_axis);
-        ssm_bias->set_friendly_name(prefix + "mamba.ssm_bias");
-        auto x_with_ssm = std::make_shared<ov::opset11::Add>(x, ssm_bias);
-        x_with_ssm->set_friendly_name(prefix + "mamba.ssm_add");
-        x = x_with_ssm->output(0);
-        // Update SSM state: MatMul(state, transition_weight) preserves shape.
-        // Always use float weights for state transitions (not DCOFF targets).
-        auto ssm_transition = FloatWeight{prec}(prefix + "mamba.ssm_transition.weight",
-                                                 ov::Shape{ssm_head_dim, ssm_head_dim}, prec);
-        auto ssm_state_new = std::make_shared<ov::opset11::MatMul>(ssm_state.read_value, ssm_transition, false, false);
-        ssm_state_new->set_friendly_name(prefix + "mamba.ssm_state_update");
-        auto ssm_assign = std::make_shared<ov::op::v6::Assign>(ssm_state_new, ssm_state.variable);
-        ssm_assign->set_friendly_name(ssm_state_name + "_assign");
-        m_sinks.push_back(std::dynamic_pointer_cast<ov::op::Sink>(ssm_assign));
+        // Split conv output back into Q, K, V along last dim.
+        auto split_sizes = ov::opset11::Constant::create(
+            ov::element::i64, ov::Shape{3},
+            std::vector<int64_t>{static_cast<int64_t>(la_key_dim),
+                                  static_cast<int64_t>(la_key_dim),
+                                  static_cast<int64_t>(la_value_dim)});
+        auto split_axis = ov::opset11::Constant::create(ov::element::i64, ov::Shape{}, {-1});
+        auto vsplit = std::make_shared<ov::opset11::VariadicSplit>(qkv_act, split_axis, split_sizes);
+        vsplit->set_friendly_name(ns + "conv_split");
+        auto q_post = vsplit->output(0);
+        auto v_post = vsplit->output(2);
 
-        // out_proj: inner -> hidden
-        return make_linear(x, ssm_inner, hs, prefix + "mamba.out_proj", prec, config.weight);
+        // --- Recurrent state side-chain (Gated DeltaNet recurrent KV state) ---
+        // State shape: [batch, num_v_heads, k_head_dim, v_head_dim]
+        auto recurrent_state_name = "cache_params.past.recurrent." + std::to_string(layer);
+        auto rec_state = make_fixed_state(
+            seq_source,
+            {static_cast<int64_t>(la_num_v_heads),
+             static_cast<int64_t>(la_k_head_dim),
+             static_cast<int64_t>(la_v_head_dim)},
+            recurrent_state_name, prec);
+        // Recurrent bias: reduce state over heads + k_head_dim -> [batch, v_head_dim], project to value_dim.
+        auto rec_reduce_axes = ov::opset11::Constant::create(ov::element::i64, ov::Shape{2}, {1, 2});
+        auto rec_reduced = std::make_shared<ov::opset11::ReduceSum>(rec_state.read_value, rec_reduce_axes, false);
+        rec_reduced->set_friendly_name(ns + "recurrent_reduce");
+        auto rec_proj = make_linear(rec_reduced, la_v_head_dim, la_value_dim,
+                                    ns + "recurrent_proj", prec, FloatWeight{prec});
+        auto rec_unsq_axis = ov::opset11::Constant::create(ov::element::i64, ov::Shape{1}, {1});
+        auto rec_bias = std::make_shared<ov::opset11::Unsqueeze>(rec_proj, rec_unsq_axis);
+        rec_bias->set_friendly_name(ns + "recurrent_bias");
+        auto v_with_rec = std::make_shared<ov::opset11::Add>(v_post, rec_bias);
+        v_with_rec->set_friendly_name(ns + "recurrent_add");
+        // Apply gate: z * v (elementwise).
+        auto gated = std::make_shared<ov::opset11::Multiply>(v_with_rec, z_act);
+        gated->set_friendly_name(ns + "gated_output");
+        // Update recurrent state: MatMul(state, transition) preserves shape.
+        auto rec_transition = FloatWeight{prec}(ns + "recurrent_transition.weight",
+                                                ov::Shape{la_v_head_dim, la_v_head_dim}, prec);
+        auto rec_state_new = std::make_shared<ov::opset11::MatMul>(rec_state.read_value, rec_transition, false, false);
+        rec_state_new->set_friendly_name(ns + "recurrent_state_update");
+        auto rec_assign = std::make_shared<ov::op::v6::Assign>(rec_state_new, rec_state.variable);
+        rec_assign->set_friendly_name(recurrent_state_name + "_assign");
+        m_sinks.push_back(std::dynamic_pointer_cast<ov::op::Sink>(rec_assign));
+
+        // Suppress unused-variable warning for q_post (kept named for graph clarity / future use).
+        (void)q_post;
+
+        // out_proj: value_dim -> hidden
+        return make_linear(gated, la_value_dim, hs, ns + "out_proj", prec, config.weight);
     };
 
     auto current =
@@ -1585,14 +1617,14 @@ std::shared_ptr<ov::Model> ModelBuilder::build_llm(const LLMConfig& config_in) {
                                 config.num_layers,
                                 "model.layers.",
                                 [&](const ov::Output<ov::Node>& input, const std::string& prefix, size_t layer) {
-                                    // Hybrid dispatch: mamba_ratio=N means N Mamba layers then 1 Attention layer
-                                    const bool is_mamba = config.mamba_ratio > 0 &&
+                                    // Hybrid dispatch: mamba_ratio=N means N linear_attention layers then 1 full_attention layer
+                                    const bool is_linear = config.mamba_ratio > 0 &&
                                         (layer % (config.mamba_ratio + 1)) < config.mamba_ratio;
 
-                                    if (is_mamba) {
+                                    if (is_linear) {
                                         auto fn = [&](const ov::Output<ov::Node>& normed,
                                                       const std::string& pfx) {
-                                            return mamba_fn(normed, pfx, layer);
+                                            return linear_attn_fn(normed, pfx, layer);
                                         };
                                         return config.pre_norm
                                             ? make_pre_norm_layer(input, config.norm, fn, config.ffn, prefix)
@@ -2085,29 +2117,22 @@ FixedStateResult make_fixed_state(const ov::Output<ov::Node>& batch_source,
                                   const std::vector<int64_t>& state_dims,
                                   const std::string& name,
                                   ov::element::Type precision) {
-    // Variable shape: [-1, dim1, dim2, ...]
-    std::vector<int64_t> var_shape_vec = {-1};
+    // Variable shape: [1, dim1, dim2, ...] with static batch=1 for NPU single-batch inference.
+    // Dynamic batch in state variables triggers 'to_shape on dynamic shape' in NPUW partitioning.
+    (void)batch_source;
+    std::vector<int64_t> var_shape_vec = {1};
     var_shape_vec.insert(var_shape_vec.end(), state_dims.begin(), state_dims.end());
     auto var_shape = ov::PartialShape(var_shape_vec);
     auto variable = std::make_shared<ov::op::util::Variable>(ov::op::util::VariableInfo{var_shape, precision, name});
 
-    // Build init shape: [batch, dim1, dim2, ...]
-    auto shape_of = std::make_shared<ov::opset11::ShapeOf>(batch_source, ov::element::i64);
-    shape_of->set_friendly_name(name + "_shapeof");
-    auto zero_idx = ov::opset11::Constant::create(ov::element::i64, ov::Shape{1}, {0});
-    auto gather_axis = ov::opset11::Constant::create(ov::element::i64, ov::Shape{}, {0});
-    auto batch_dim = std::make_shared<ov::opset11::Gather>(shape_of, zero_idx, gather_axis);
-    batch_dim->set_friendly_name(name + "_batch_dim");
-
-    auto dims_const = ov::opset11::Constant::create(ov::element::i64,
-                                                     ov::Shape{state_dims.size()},
-                                                     state_dims);
-    auto init_shape = std::make_shared<ov::opset11::Concat>(
-        ov::OutputVector{batch_dim->output(0), dims_const->output(0)}, 0);
-    init_shape->set_friendly_name(name + "_init_shape");
-
-    auto zero_scalar = ov::opset11::Constant::create(precision, ov::Shape{}, {0.0f});
-    auto init_value = std::make_shared<ov::opset11::Broadcast>(zero_scalar, init_shape);
+    // Init value: constant zero tensor of static shape.
+    ov::Shape init_shape(var_shape_vec.begin(), var_shape_vec.end());
+    size_t total = 1;
+    for (auto d : init_shape) {
+        total *= d;
+    }
+    std::vector<float> zeros(total, 0.0f);
+    auto init_value = std::make_shared<ov::opset11::Constant>(precision, init_shape, zeros);
     init_value->set_friendly_name(name + "_init");
 
     auto read_value = std::make_shared<ov::op::v6::ReadValue>(init_value, variable);

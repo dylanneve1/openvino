@@ -404,23 +404,37 @@ struct LLMConfig : public BaseModelConfig {
     bool internal_position_ids = false;  ///< embedding model
     bool pre_norm = true;
 
-    /// Mamba-2/SSM hybrid support (Qwen3.5-style).
-    /// 0 = pure attention.  N = N consecutive Mamba layers per 1 attention layer.
-    /// Example: mamba_ratio=3, 12 layers -> layers 0-2 Mamba, 3 Attn, 4-6 Mamba, 7 Attn, ...
+    /// Hybrid Linear Attention support (Qwen3-Next / Qwen3.5-style Gated DeltaNet).
+    /// 0 = pure attention.  N = N consecutive linear_attention layers per 1 full_attention layer.
+    /// Example: mamba_ratio=3, 12 layers -> layers 0-2 linear, 3 full, 4-6 linear, 7 full, ...
     size_t mamba_ratio = 0;
-    size_t ssm_inner_size = 0;    ///< 0 = 2 * hidden_size
-    size_t ssm_num_heads = 0;     ///< 0 = num_heads
-    size_t ssm_state_size = 64;
-    size_t conv_kernel_size = 4;
+    size_t linear_num_key_heads = 0;     ///< 0 = num_heads
+    size_t linear_num_value_heads = 0;   ///< 0 = 2 * num_heads
+    size_t linear_key_head_dim = 0;      ///< 0 = head_dim
+    size_t linear_value_head_dim = 0;    ///< 0 = head_dim
+    size_t linear_conv_kernel_dim = 4;
 
-    size_t get_ssm_inner() const {
-        return ssm_inner_size ? ssm_inner_size : 2 * hidden_size;
+    size_t get_linear_num_key_heads() const {
+        return linear_num_key_heads ? linear_num_key_heads : num_heads;
     }
-    size_t get_ssm_heads() const {
-        return ssm_num_heads ? ssm_num_heads : num_heads;
+    size_t get_linear_num_value_heads() const {
+        return linear_num_value_heads ? linear_num_value_heads : 2 * num_heads;
     }
-    size_t get_ssm_head_dim() const {
-        return get_ssm_inner() / get_ssm_heads();
+    size_t get_linear_key_head_dim() const {
+        return linear_key_head_dim ? linear_key_head_dim : head_dim;
+    }
+    size_t get_linear_value_head_dim() const {
+        return linear_value_head_dim ? linear_value_head_dim : head_dim;
+    }
+    size_t get_key_dim() const {
+        return get_linear_num_key_heads() * get_linear_key_head_dim();
+    }
+    size_t get_value_dim() const {
+        return get_linear_num_value_heads() * get_linear_value_head_dim();
+    }
+    /// Conv operates over K + V + Q projections (Q uses key dims).
+    size_t get_conv_dim() const {
+        return get_key_dim() * 2 + get_value_dim();
     }
 };
 
