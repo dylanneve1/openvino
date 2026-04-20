@@ -294,7 +294,9 @@ ov::Output<ov::Node> RMSNorm::operator()(const ov::Output<ov::Node>& input, cons
         ov::opset11::Constant::create(precision, ov::Shape{hidden_size}, std::vector<float>(hidden_size, w_val));
     weight->set_friendly_name(name + ".weight");
 
-    auto squared = std::make_shared<ov::opset11::Multiply>(input, input);
+    // Match real torch-exported RMSNorm: Power(x, 2) -> ReduceMean -> Add(eps) -> Sqrt -> Divide -> Multiply(weight).
+    auto two = ov::opset11::Constant::create(precision, ov::Shape{}, {2.0f});
+    auto squared = std::make_shared<ov::opset11::Power>(input, two);
 
     auto axes = ov::opset11::Constant::create(ov::element::i64, ov::Shape{1}, {-1});
 
@@ -698,6 +700,7 @@ ov::Output<ov::Node> make_sdpa(const ov::Output<ov::Node>& q,
 
 ov::Output<ov::Node> make_attention_output(const ov::Output<ov::Node>& sdpa_output,
                                            size_t hidden_size,
+                                           size_t attn_dim,
                                            const std::string& name,
                                            ov::element::Type precision,
                                            const WeightFn& weight_fn,
@@ -706,11 +709,11 @@ ov::Output<ov::Node> make_attention_output(const ov::Output<ov::Node>& sdpa_outp
 
     auto reshape_shape = ov::opset11::Constant::create(ov::element::i64,
                                                        ov::Shape{3},
-                                                       std::vector<int64_t>{0, -1, static_cast<int64_t>(hidden_size)});
+                                                       std::vector<int64_t>{0, -1, static_cast<int64_t>(attn_dim)});
     auto attn_reshaped = std::make_shared<ov::opset11::Reshape>(attn_trans, reshape_shape, true);
     attn_reshaped->set_friendly_name(name + "_reshape");
 
-    return make_linear(attn_reshaped->output(0), hidden_size, hidden_size, name, precision, weight_fn, bias_fn);
+    return make_linear(attn_reshaped->output(0), attn_dim, hidden_size, name, precision, weight_fn, bias_fn);
 }
 
 ov::Output<ov::Node> make_embedding(const ov::Output<ov::Node>& input_ids,
@@ -917,7 +920,8 @@ ov::Output<ov::Node> Attention::operator()(const ov::Output<ov::Node>& q,
     auto attn_output =
         make_sdpa(q_roped, k_expanded, v_expanded, prefix + attn_prefix + "attn", sdpa_mask, sdpa_scale_dim);
 
-    return make_attention_output(attn_output, hidden_size, prefix + o_proj_name, precision, weight_fn, bias_fn);
+    return make_attention_output(attn_output, hidden_size, num_heads * head_dim,
+                                  prefix + o_proj_name, precision, weight_fn, bias_fn);
 }
 
 ov::Output<ov::Node> Attention::operator()(const ov::Output<ov::Node>& input,
@@ -925,9 +929,10 @@ ov::Output<ov::Node> Attention::operator()(const ov::Output<ov::Node>& input,
                                            const std::string& prefix,
                                            size_t layer_idx) const {
     auto kv_src = kv_input.get_node() ? kv_input : input;
+    size_t q_dim = num_heads * head_dim;
     size_t kv_dim = num_kv_heads * head_dim;
     auto q =
-        make_linear(input, hidden_size, hidden_size, prefix + attn_prefix + "q_proj", precision, weight_fn, bias_fn);
+        make_linear(input, hidden_size, q_dim, prefix + attn_prefix + "q_proj", precision, weight_fn, bias_fn);
     auto k = make_linear(kv_src, hidden_size, kv_dim, prefix + attn_prefix + "k_proj", precision, weight_fn, bias_fn);
     auto v = make_linear(kv_src, hidden_size, kv_dim, prefix + attn_prefix + "v_proj", precision, weight_fn, bias_fn);
     return (*this)(q, k, v, prefix, layer_idx);
@@ -2096,10 +2101,22 @@ FixedStateResult make_fixed_state(const ov::Output<ov::Node>& batch_source,
 }
 
 ov::Output<ov::Node> L2Norm::operator()(const ov::Output<ov::Node>& input, const std::string& name) const {
+    // Explicit Power/Sqrt chain matching real torch-exported SSM L2 norm
+    // (Power(x,2) -> ReduceSum -> Add(eps) -> Sqrt -> Divide).
+    auto two = ov::opset11::Constant::create(precision, ov::Shape{}, {2.0f});
+    auto squared = std::make_shared<ov::opset11::Power>(input, two);
+
     auto axes = ov::opset11::Constant::create(ov::element::i64, ov::Shape{1}, {-1});
-    auto normed = std::make_shared<ov::op::v0::NormalizeL2>(input, axes, eps, ov::op::EpsMode::ADD);
-    normed->set_friendly_name(name);
-    return normed->output(0);
+    auto sum = std::make_shared<ov::opset11::ReduceSum>(squared, axes, true);
+
+    auto eps_const = ov::opset11::Constant::create(precision, ov::Shape{}, {eps});
+    auto sum_eps = std::make_shared<ov::opset11::Add>(sum, eps_const);
+
+    auto norm = std::make_shared<ov::opset11::Sqrt>(sum_eps);
+
+    auto out = std::make_shared<ov::opset11::Divide>(input, norm);
+    out->set_friendly_name(name);
+    return out->output(0);
 }
 
 CausalConvResult make_causal_conv(const ov::Output<ov::Node>& input,
@@ -2135,8 +2152,40 @@ CausalConvResult make_causal_conv(const ov::Output<ov::Node>& input,
     assign->set_friendly_name(state_name + "_assign");
 
     // Depthwise GroupConvolution: [batch, C, kernel+seq] -> [batch, C, seq+1]
-    auto weight = FloatWeight{prec}(prefix + "weight",
-        ov::Shape{channels, 1, 1, kernel_size}, prec);
+    // Quantized weights (u8 + zero_point + scale) to mirror real Qwen3.5 export.
+    const ov::Shape w_shape{channels, 1, 1, kernel_size};
+    const ov::Shape zs_shape{channels, 1, 1, 1};
+    const std::string w_name = prefix + "conv_weight";
+
+    uint32_t w_state = seed_from_name(w_name);
+    std::vector<int8_t> w_u8(channels * kernel_size);
+    for (size_t i = 0; i < w_u8.size(); ++i) {
+        w_u8[i] = static_cast<int8_t>(128 + (xorshift32(w_state) % 32u));  // around mid
+    }
+    auto w_const = ov::opset11::Constant::create(ov::element::u8, w_shape, w_u8);
+    w_const->set_friendly_name(w_name);
+    auto w_cvt = std::make_shared<ov::opset11::Convert>(w_const, prec);
+    w_cvt->set_friendly_name(w_name + "/convert");
+
+    std::vector<int8_t> zp_u8(channels, static_cast<int8_t>(128));
+    auto zp_const = ov::opset11::Constant::create(ov::element::u8, zs_shape, zp_u8);
+    zp_const->set_friendly_name(w_name + "/zero_point");
+    auto zp_cvt = std::make_shared<ov::opset11::Convert>(zp_const, prec);
+    zp_cvt->set_friendly_name(w_name + "/zero_point/convert");
+
+    auto w_sub = std::make_shared<ov::opset11::Subtract>(w_cvt, zp_cvt);
+    w_sub->set_friendly_name(w_name + "/subtract");
+
+    uint32_t s_state = seed_from_name(w_name + "_scale");
+    std::vector<float> sc_vals(channels);
+    for (size_t i = 0; i < channels; ++i) {
+        sc_vals[i] = 0.05f + 0.01f * static_cast<float>(xorshift32(s_state) % 1000u) / 1000.0f;
+    }
+    auto sc_const = ov::opset11::Constant::create(prec, zs_shape, sc_vals);
+    sc_const->set_friendly_name(w_name + "/scale");
+    auto weight = std::make_shared<ov::opset11::Multiply>(w_sub, sc_const);
+    weight->set_friendly_name(w_name + "/decompress");
+
     auto conv = std::make_shared<ov::opset11::GroupConvolution>(
         cat->output(0), weight,
         ov::Strides{1}, ov::CoordinateDiff{0}, ov::CoordinateDiff{0}, ov::Strides{1});
@@ -2164,11 +2213,15 @@ CausalConvResult make_causal_conv(const ov::Output<ov::Node>& input,
     return result;
 }
 
-/// SSM recurrence Loop body: per-timestep state update and query.
-///   h_new = h_prev * exp(decay) + outer(k, v)
-///   y = (q @ h_new) * gate
-/// params[0..5]: q_t, k_t, v_t, decay_t, gate_t, h_prev
-/// results[0..2]: condition(true), h_new, y
+/// SSM recurrence Loop body: per-timestep state update, query, and scatter into
+/// an output accumulator (matches real torch-exported Qwen3.5 Loop shape).
+/// params[0]: iter_counter (I32 scalar, special_body_port)
+/// params[1..5]: q_t, k_t, v_t, decay_t, gate_t (sliced per iter)
+/// params[6]: h_prev state (merged back-edge)
+/// params[7]: out_buf [B, H, seq, Dv] (merged back-edge, scatter accumulator)
+/// results[0]: cond (true)
+/// results[1]: h_new (state back-edge)
+/// results[2]: out_buf_updated (scatter accumulator back-edge)
 static std::shared_ptr<ov::Model> build_ssm_loop_body(ov::element::Type prec,
                                                        int64_t H, int64_t Dk, int64_t Dv,
                                                        ov::ParameterVector& params,
@@ -2176,30 +2229,59 @@ static std::shared_ptr<ov::Model> build_ssm_loop_body(ov::element::Type prec,
     auto P = [&](ov::element::Type t, ov::PartialShape s) {
         return params.emplace_back(std::make_shared<ov::op::v0::Parameter>(t, s));
     };
+    auto iter  = P(ov::element::i32, {});                       // special_body_port: current iteration
     auto q     = P(prec, {-1, H, 1, Dk});
     auto k     = P(prec, {-1, H, 1, Dk});
     auto v     = P(prec, {-1, H, 1, Dv});
     auto decay = P(prec, {-1, H, 1});
     auto gate  = P(prec, {-1, H, 1});
     auto h     = P(prec, {-1, H, Dk, Dv});
+    auto out_buf = P(prec, {-1, H, -1, Dv});                    // full-seq output accumulator
 
-    // h_new = h_prev * exp(decay)[...,newaxis] + einsum(k, v → outer product)
-    auto unsq3 = ov::opset11::Constant::create(ov::element::i64, ov::Shape{1}, {3});
-    auto h_new = std::make_shared<ov::opset11::Add>(
-        std::make_shared<ov::opset11::Multiply>(h,
-            std::make_shared<ov::opset11::Unsqueeze>(std::make_shared<ov::opset11::Exp>(decay), unsq3)),
-        std::make_shared<ov::opset11::Einsum>(ov::OutputVector{k, v}, "bhsk,bhsv->bhkv"));
+    auto axis_1d = [](int64_t v) {
+        return ov::opset11::Constant::create(ov::element::i64, ov::Shape{1}, {v});
+    };
+    auto unsq_last = axis_1d(-1);
+    auto sq_seq = axis_1d(2);
 
-    // y = einsum(q, h_new → query) * gate[...,newaxis]
-    auto y = std::make_shared<ov::opset11::Multiply>(
-        std::make_shared<ov::opset11::Einsum>(ov::OutputVector{q, h_new}, "bhsk,bhkv->bhsv"),
-        std::make_shared<ov::opset11::Unsqueeze>(gate, unsq3));
+    // Outer product k⊗v via Broadcast/Multiply (matches torch SSM export pattern).
+    //   k_u = Unsqueeze(k, -1) : [B,H,1,Dk,1]
+    //   v_u = Unsqueeze(v, -2) : [B,H,1,1,Dv]
+    //   kv  = Squeeze(k_u * v_u, axis=2) : [B,H,Dk,Dv]
+    auto k_u = std::make_shared<ov::opset11::Unsqueeze>(k, unsq_last);
+    auto v_u = std::make_shared<ov::opset11::Unsqueeze>(v, axis_1d(-2));
+    auto kv_outer = std::make_shared<ov::opset11::Multiply>(k_u, v_u);
+    auto kv = std::make_shared<ov::opset11::Squeeze>(kv_outer, sq_seq);
+
+    // h_new = h_prev * exp(decay)[..., newaxis] + k⊗v
+    auto decay_exp = std::make_shared<ov::opset11::Exp>(decay);
+    auto decay_bc = std::make_shared<ov::opset11::Unsqueeze>(decay_exp, unsq_last);  // [B,H,1,1]
+    auto h_decayed = std::make_shared<ov::opset11::Multiply>(h, decay_bc);
+    auto h_new = std::make_shared<ov::opset11::Add>(h_decayed, kv);
+
+    // y = ReduceSum(q_u * h_new, axis=Dk) * gate
+    //   q_u = Unsqueeze(q, -1) : [B,H,1,Dk,1] — but h_new is [B,H,Dk,Dv]
+    //   Unsqueeze h_new on seq axis to [B,H,1,Dk,Dv], broadcast with q_u to [B,H,1,Dk,Dv],
+    //   ReduceSum over Dk (axis=-2) → [B,H,1,Dv].
+    auto q_u = std::make_shared<ov::opset11::Unsqueeze>(q, unsq_last);               // [B,H,1,Dk,1]
+    auto h_new_u = std::make_shared<ov::opset11::Unsqueeze>(h_new, sq_seq);          // [B,H,1,Dk,Dv]
+    auto y_mul = std::make_shared<ov::opset11::Multiply>(q_u, h_new_u);              // [B,H,1,Dk,Dv]
+    auto reduce_axes = ov::opset11::Constant::create(ov::element::i64, ov::Shape{1}, {-2});
+    auto y_sum = std::make_shared<ov::opset11::ReduceSum>(y_mul, reduce_axes, false);  // [B,H,1,Dv]
+    auto gate_bc2 = std::make_shared<ov::opset11::Unsqueeze>(gate, unsq_last);         // [B,H,1,1]
+    auto y = std::make_shared<ov::opset11::Multiply>(y_sum, gate_bc2);                  // [B,H,1,Dv]
+
+    // Scatter y into out_buf at seq position = iter.
+    //   out_new = ScatterUpdate(out_buf, indices=[iter], updates=y, axis=2)
+    auto iter_idx = std::make_shared<ov::opset11::Unsqueeze>(iter, axis_1d(0));        // [1]
+    auto scatter_axis = ov::opset11::Constant::create(ov::element::i32, ov::Shape{}, {2});
+    auto out_new = std::make_shared<ov::opset11::ScatterUpdate>(out_buf, iter_idx, y, scatter_axis);
 
     results = {
         std::make_shared<ov::op::v0::Result>(
             ov::opset11::Constant::create(ov::element::boolean, ov::Shape{}, {true})),
         std::make_shared<ov::op::v0::Result>(h_new),
-        std::make_shared<ov::op::v0::Result>(y),
+        std::make_shared<ov::op::v0::Result>(out_new),
     };
     return std::make_shared<ov::Model>(results, params);
 }
@@ -2244,22 +2326,32 @@ RecurrentStateResult make_recurrent_state(const ov::Output<ov::Node>& query,
     ov::ParameterVector bp;
     ov::ResultVector br;
     auto body = build_ssm_loop_body(prec, H, Dk, Dv, bp, br);
-    //  bp: [q, k, v, decay, gate, h]    br: [cond, h_new, y]
+    //  bp: [iter, q, k, v, decay, gate, h, out_buf]    br: [cond, h_new, out_new]
 
     auto loop = std::make_shared<ov::op::v5::Loop>(seq_len,
         ov::opset11::Constant::create(ov::element::boolean, ov::Shape{}, {true}));
     loop->set_function(body);
-    loop->set_special_body_ports({-1, 0});
+    // special_body_ports: {body_input_for_current_iter_count, body_result_for_exec_cond}
+    loop->set_special_body_ports({0, 0});
 
-    // Slice Q/K/V/decay/gate per timestep on seq axis (2)
+    // Build initial out_buf = zeros([B, H, seq, Dv]) using ShapeOf(v_mh) with Dv replaced.
+    // v_mh shape: [B, H, seq, Dv]. ShapeOf → [4]. Use as-is (already matches desired shape).
+    auto v_shape = std::make_shared<ov::opset11::ShapeOf>(v_mh, ov::element::i64);
+    auto zero_scalar = ov::opset11::Constant::create(prec, ov::Shape{}, {0.0f});
+    auto out_init = std::make_shared<ov::op::v3::Broadcast>(zero_scalar, v_shape);
+    out_init->set_friendly_name(prefix + "out_init");
+
+    // bp[0] = iter (special — iter_count auto-fed, no set_*_input needed)
+    // Slice Q/K/V/decay/gate per timestep on seq axis (2) into bp[1..5]
     ov::OutputVector sliced_srcs = {q_mh, k_mh, v_mh, decay_mh, gate_mh};
     for (size_t i = 0; i < sliced_srcs.size(); ++i)
-        loop->set_sliced_input(bp[i], sliced_srcs[i], 0, 1, 1, -1, 2);
+        loop->set_sliced_input(bp[i + 1], sliced_srcs[i], 0, 1, 1, -1, 2);
 
-    loop->set_merged_input(bp[5], state.read_value, br[1]);  // h back-edge
+    loop->set_merged_input(bp[6], state.read_value, br[1]);  // h back-edge
+    loop->set_merged_input(bp[7], out_init, br[2]);           // out_buf back-edge
 
-    auto output  = loop->get_concatenated_slices(br[2], 0, 1, 1, -1, 2);  // [batch, H, seq, Dv]
-    auto final_h = loop->get_iter_value(br[1], -1);                        // [batch, H, Dk, Dv]
+    auto output  = loop->get_iter_value(br[2], -1);          // [batch, H, seq, Dv] (final fill)
+    auto final_h = loop->get_iter_value(br[1], -1);          // [batch, H, Dk, Dv]
     loop->set_friendly_name(prefix + "loop");
 
     auto assign = std::make_shared<ov::op::v6::Assign>(final_h, state.variable);
