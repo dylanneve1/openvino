@@ -9,6 +9,11 @@
 #include <string>
 #include <vector>
 
+#include "model_builder_ffn.hpp"
+#include "model_builder_masks.hpp"
+#include "model_builder_norm.hpp"
+#include "model_builder_rope.hpp"
+#include "model_builder_types.hpp"
 #include "openvino/openvino.hpp"
 #include "openvino/opsets/opset11.hpp"
 
@@ -16,27 +21,8 @@ namespace ov {
 namespace test {
 namespace npuw {
 
-struct KVCacheResult {
-    ov::Output<ov::Node> concatenated;
-    ov::Output<ov::Node> beam_gather;
-    std::shared_ptr<ov::Node> assign;
-};
-
-struct KVCacheReadState {
-    std::shared_ptr<ov::op::util::Variable> variable;
-    ov::Output<ov::Node> beam_gather;
-};
-
-using WeightFn = std::function<ov::Output<ov::Node>(const std::string&, const ov::Shape&, ov::element::Type)>;
-using NormFn = std::function<ov::Output<ov::Node>(const ov::Output<ov::Node>&, const std::string&)>;
-using FFNFn = std::function<ov::Output<ov::Node>(const ov::Output<ov::Node>&, const std::string&)>;
-using RoPEFn = std::function<ov::Output<ov::Node>(const ov::Output<ov::Node>&, const std::string&)>;
-using LayerFn = std::function<ov::Output<ov::Node>(const ov::Output<ov::Node>&, const std::string&, size_t)>;
-
-/// (projected_k, projected_v, layer_idx) -> (cached_k, cached_v). Empty = no cache.
-using KVCacheFn =
-    std::function<std::pair<ov::Output<ov::Node>,
-                            ov::Output<ov::Node>>(const ov::Output<ov::Node>&, const ov::Output<ov::Node>&, size_t)>;
+// KVCacheResult, KVCacheReadState, WeightFn / NormFn / FFNFn / RoPEFn / LayerFn /
+// KVCacheFn typedefs live in model_builder_types.hpp (included above).
 
 struct FloatWeight {
     ov::element::Type storage_type;
@@ -104,118 +90,9 @@ struct INT4GroupWeight : CompressedWeight {
     explicit INT4GroupWeight(size_t gs = 128) : CompressedWeight(ov::element::i4, gs) {}
 };
 
-struct LayerNorm {
-    size_t hidden_size;
-    ov::element::Type precision;
-    float eps;
-
-    LayerNorm(size_t hs, ov::element::Type prec = ov::element::f32, float e = 1e-5f)
-        : hidden_size(hs),
-          precision(prec),
-          eps(e) {}
-
-    ov::Output<ov::Node> operator()(const ov::Output<ov::Node>& input, const std::string& name) const;
-};
-
-struct RMSNorm {
-    size_t hidden_size;
-    ov::element::Type precision;
-    float eps;
-
-    RMSNorm(size_t hs, ov::element::Type prec = ov::element::f32, float e = 1e-5f)
-        : hidden_size(hs),
-          precision(prec),
-          eps(e) {}
-
-    ov::Output<ov::Node> operator()(const ov::Output<ov::Node>& input, const std::string& name) const;
-};
-
-/// Position IDs baked in at construction, cos/sin shared across layers.
-/// shape_source provides batch dim for inv_freq Broadcast (matches NPUW RopeCache pattern).
-/// Defaults to position_ids when not specified.
-struct HalfRotationRoPE {
-    size_t head_dim;
-    ov::Output<ov::Node> cos_freq, sin_freq;
-
-    HalfRotationRoPE(size_t head_dim, ov::element::Type precision,
-                     const ov::Output<ov::Node>& position_ids,
-                     const ov::Output<ov::Node>& shape_source = {});
-
-    ov::Output<ov::Node> operator()(const ov::Output<ov::Node>& input, const std::string& name) const;
-};
-
-struct InterleavedRoPE {
-    size_t head_dim;
-    ov::Output<ov::Node> cos_freq, sin_freq;
-
-    InterleavedRoPE(size_t head_dim, ov::element::Type precision,
-                    const ov::Output<ov::Node>& position_ids,
-                    const ov::Output<ov::Node>& shape_source = {});
-
-    ov::Output<ov::Node> operator()(const ov::Output<ov::Node>& input, const std::string& name) const;
-};
-
-/// [batch, seq] position_ids Parameter.
-ov::Output<ov::Node> make_position_ids_2d();
-
-/// [3, batch, seq] position_ids Parameter for m-rope. Returns [batch, seq] slice.
-ov::Output<ov::Node> make_position_ids_3d();
-
-struct SwiGLU {
-    size_t hidden_size;
-    size_t intermediate_size;
-    ov::element::Type precision;
-    WeightFn weight_fn;
-
-    SwiGLU(size_t hs, size_t is, ov::element::Type prec, WeightFn wf)
-        : hidden_size(hs),
-          intermediate_size(is),
-          precision(prec),
-          weight_fn(std::move(wf)) {}
-
-    ov::Output<ov::Node> operator()(const ov::Output<ov::Node>& input, const std::string& name) const;
-};
-
-struct GELU {
-    size_t hidden_size;
-    size_t intermediate_size;
-    ov::element::Type precision;
-    WeightFn weight_fn;
-    WeightFn bias_fn;
-
-    GELU(size_t hs, size_t is, ov::element::Type prec, WeightFn wf, WeightFn bf = {})
-        : hidden_size(hs),
-          intermediate_size(is),
-          precision(prec),
-          weight_fn(std::move(wf)),
-          bias_fn(std::move(bf)) {}
-
-    ov::Output<ov::Node> operator()(const ov::Output<ov::Node>& input, const std::string& name) const;
-};
-
-/// GPT-OSS style batched MoE FFN matching NPUW's GPTOSSExpert + GPTOSSRouter patterns.
-/// All experts compute on all tokens via Tile + 3D batched MatMul (no NonZero).
-/// Weight function must produce a Multiply→Convert→MatMul chain (default: i4 CompressedWeight)
-/// for the isolation patterns to match.  Shared constants across layers enable repeating
-/// block detection.  Conforms to FFNFn for drop-in use in transformer layer templates.
-struct MoEFFN {
-    size_t hidden_size, intermediate_size, num_experts, num_experts_per_tok;
-    ov::element::Type precision;
-    WeightFn weight_fn;
-
-    /// Default weight_fn: CompressedWeight{i4, 0, SYMM_NO_ZP}.
-    MoEFFN(size_t hs, size_t is, size_t ne, size_t k, ov::element::Type prec, WeightFn wf = {});
-
-    ov::Output<ov::Node> operator()(const ov::Output<ov::Node>& input, const std::string& name) const;
-
-private:
-    // Shared across layers for matchRepeatedSubgraphs (created once in ctor)
-    std::shared_ptr<ov::Node> tile_repeats, topk_k_const;
-    std::shared_ptr<ov::Node> slice_step, slice_axis2, slice_start_0, slice_stop_is, slice_start_is, slice_stop_2is;
-    std::shared_ptr<ov::Node> min_const, swish_beta, clamp_add_zero;
-    std::shared_ptr<ov::Node> sl_start, sl_step_r, sl_axes, scatter_axis;
-    std::shared_ptr<ov::Node> tp_order, unsq_axis, reduce_axis;
-};
+// LayerNorm + RMSNorm declared in model_builder_norm.hpp (included above).
+// HalfRotationRoPE, InterleavedRoPE, make_position_ids_* in model_builder_rope.hpp.
+// SwiGLU, GELU, MoEFFN in model_builder_ffn.hpp.
 
 ov::Output<ov::Node> make_linear(const ov::Output<ov::Node>& input,
                                  size_t in_features,
