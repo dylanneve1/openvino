@@ -7,6 +7,7 @@
 #include "../logging.hpp"
 #include "../util.hpp"
 #include "kv_cache_compressed.hpp"
+#include "turboquant_kv_cache.hpp"
 #include "low_precision/concat.hpp"
 #include "low_precision/kv_cache_concat.hpp"
 #include "low_precision/low_precision.hpp"
@@ -67,14 +68,23 @@ public:
 };
 
 std::shared_ptr<ov::Model> cvt_kvcache_to_low_precision(const std::shared_ptr<ov::Model>& model,
-                                                        const ov::element::Type lptype) {
+                                                        const ov::element::Type lptype,
+                                                        const ov::npuw::TurboQuantSettings& tq) {
     // Resolve storage types first and apply them through PPP for both inputs and outputs.
     // Default path keeps KV cache in f16; integer hint uses key=i8/u8 and value=i4.
     auto key_storage_type = lptype;
     auto value_storage_type = lptype;
 
-    const bool use_integer_kv_storage = (lptype == ov::element::i8 || lptype == ov::element::u8);
-    if (use_integer_kv_storage) {
+    bool use_integer_kv_storage = (lptype == ov::element::i8 || lptype == ov::element::u8);
+
+    // TurboQuant produces u8 index tensors regardless of the requested lptype.
+    // Force u8 PPP so the KV input/output element types match what the
+    // TurboQuant pass emits.
+    if (tq.enabled) {
+        key_storage_type = ov::element::u8;
+        value_storage_type = ov::element::u8;
+        use_integer_kv_storage = true;
+    } else if (use_integer_kv_storage) {
         key_storage_type = lptype;
         // TODO: int4 precision for value-cache lead to compilation failure for now
         value_storage_type = ov::element::i8;
@@ -100,7 +110,14 @@ std::shared_ptr<ov::Model> cvt_kvcache_to_low_precision(const std::shared_ptr<ov
     }
     auto new_model = ppp.build();
 
-    if (use_integer_kv_storage) {
+    if (tq.enabled) {
+        ov::npuw::TurboQuantParams tqp;
+        tqp.key.bits = static_cast<uint8_t>(tq.key_bits);
+        tqp.value.bits = static_cast<uint8_t>(tq.value_bits);
+        LOG_DEBUG("Running TurboQuant KV-cache passes: key.bits=" << tq.key_bits << ", value.bits=" << tq.value_bits
+                                                                  << " on model[" << model->get_friendly_name() << "]");
+        ov::npuw::run_turboquant_kv_cache_passes(new_model, tqp);
+    } else if (use_integer_kv_storage) {
         ov::npuw::KVCacheCompressionParams dq_params;
         dq_params.key.quantization_dt = key_storage_type;
         dq_params.key.quantization_type = ov::npuw::KVCacheCompressionConfig::QuantizationType::Asymmetric;
@@ -163,8 +180,12 @@ namespace ov::npuw {
 
 ConvertKVCacheToPrecision::ConvertKVCacheToPrecision(const ov::element::Type lptype) : m_lp_type(lptype) {}
 
+ConvertKVCacheToPrecision::ConvertKVCacheToPrecision(const ov::element::Type lptype, const TurboQuantSettings& turboquant)
+    : m_lp_type(lptype),
+      m_turboquant(turboquant) {}
+
 bool ConvertKVCacheToPrecision::run_on_model(const std::shared_ptr<ov::Model>& model) {
-    auto ppp_result = cvt_kvcache_to_low_precision(model, m_lp_type);
+    auto ppp_result = cvt_kvcache_to_low_precision(model, m_lp_type, m_turboquant);
     // PrePostProcessor currently always modifies the model in-place and returns the same model pointer, but let's
     // be defensive here and check it just in case
     OPENVINO_ASSERT(ppp_result == model,

@@ -935,12 +935,21 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
             ov::npuw::RedirectNewKvToOutput().run_on_model(generate_model_variants[i]);
         }
     }
+    ov::npuw::TurboQuantSettings turboquant;
+    turboquant.enabled = m_cfg.get<::intel_npu::NPUW_LLM_TURBOQUANT>();
+    turboquant.key_bits = m_cfg.get<::intel_npu::NPUW_LLM_TURBOQUANT_KEY_BITS>();
+    turboquant.value_bits = m_cfg.get<::intel_npu::NPUW_LLM_TURBOQUANT_VALUE_BITS>();
+    if (turboquant.enabled) {
+        LOG_DEBUG("TurboQuant enabled: key.bits=" << turboquant.key_bits
+                                                   << ", value.bits=" << turboquant.value_bits);
+    }
+
     LOG_DEBUG("Converting KV-cache in generate model to" << kv_kache_storage_type);
     for (size_t i = 0; i < generate_model_variants.size(); ++i) {
-        ov::npuw::ConvertKVCacheToPrecision(kv_kache_storage_type).run_on_model(generate_model_variants[i]);
+        ov::npuw::ConvertKVCacheToPrecision(kv_kache_storage_type, turboquant).run_on_model(generate_model_variants[i]);
     }
     LOG_DEBUG("Converting KV-cache in prefill model to" << kv_kache_storage_type);
-    ov::npuw::ConvertKVCacheToPrecision(kv_kache_storage_type).run_on_model(prefill_model);
+    ov::npuw::ConvertKVCacheToPrecision(kv_kache_storage_type, turboquant).run_on_model(prefill_model);
 
     auto prefill_config =
         prefill_config_opt.value_or(get_default_prefill_config(prefill_model, npudesc)).as<ov::AnyMap>();
