@@ -361,11 +361,20 @@ void run_turboquant_kv_cache_passes(const std::shared_ptr<ov::Model>& model, con
             const std::string past_prefix = "DynamicQuantize/" + idx_str + "/" + g_past_name + "/" + kv;
             const std::string past_block_name = "TurboQuant/" + idx_str + "/" + kv + "/past";
 
-            // Locate the past-K/V Parameter input feeding this concat.
+            // Locate the past-K/V Parameter input feeding this concat. PPP
+            // retypes past_key_values.* to u8 and inserts a Convert back to
+            // the compute dtype before the Concat — walk through any chain
+            // of Converts to find the underlying Parameter.
+            auto unwrap_converts = [](std::shared_ptr<ov::Node> n) -> std::shared_ptr<ov::Node> {
+                while (n && ov::is_type<ov::op::v0::Convert>(n) && n->get_users().size() == 1) {
+                    n = n->input_value(0).get_node_shared_ptr();
+                }
+                return n;
+            };
             std::shared_ptr<ov::op::v0::Parameter> past_param;
             size_t past_input_idx = 0;
             for (size_t i = 0; i < concat->get_input_size(); ++i) {
-                auto src_node = concat->input_value(i).get_node_shared_ptr();
+                auto src_node = unwrap_converts(concat->input_value(i).get_node_shared_ptr());
                 if (auto p = ov::as_type_ptr<ov::op::v0::Parameter>(src_node)) {
                     const auto pname = p->get_friendly_name();
                     if ((is_key ? ov::npuw::util::isPastKeyValuesKey(pname)
