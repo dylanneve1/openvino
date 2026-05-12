@@ -140,6 +140,17 @@ private:
                                          const ov::AnyMap& generate_config);
 
     bool m_is_eagle = false;
+
+    // Paged Attention path.
+    // m_pa_mode is true when either PREFILL or GENERATE attention hint is PAGED.
+    // m_pa_already_applied tracks whether SDPAToPagedAttention has run on the
+    // kvcache_model — either because GenAI's ContinuousBatchingPipeline ran it
+    // upstream, or because LLMCompiledModel ran it itself.
+    bool m_pa_mode = false;
+    bool m_pa_already_applied = false;
+    uint32_t m_pa_block_size = 32;
+    uint32_t m_pa_num_blocks = 1024;
+    uint32_t m_pa_max_seqs = 16;
 };
 
 }  // namespace npuw

@@ -16,6 +16,7 @@
 #include "logging.hpp"
 #include "moe/moe_subgraph.hpp"
 #include "openvino/core/parallel.hpp"
+#include "openvino/op/paged_attention.hpp"
 #include "openvino/op/util/op_types.hpp"
 #include "openvino/pass/constant_folding.hpp"
 #include "openvino/pass/manager.hpp"
@@ -677,6 +678,24 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
 
         const std::size_t real_id = m_compiled_submodels[id].replaced_by.value_or(id);
         m_compiled_submodels[real_id].devices_to_avoid = device_list_to_set(orderedSubgraphs[real_id]._avoid_list);
+
+        // Auto-route subgraphs containing PagedAttentionExtension to
+        // NPUW_ATTN_DEVICE (default CPU). The PA op has no NPU kernel, so it
+        // must execute on the host via the CPU plugin.
+        const auto attn_device = m_cfg.get<::intel_npu::NPUW_ATTN_DEVICE>();
+        if (!attn_device.empty() && !forced_sub_devices.count(id)) {
+            const auto& submodel_model = m_compiled_submodels[real_id].model;
+            if (submodel_model) {
+                for (const auto& op : submodel_model->get_ordered_ops()) {
+                    if (ov::as_type_ptr<ov::op::PagedAttentionExtension>(op)) {
+                        LOG_INFO("Subgraph[" << id << "] contains PagedAttentionExtension; routing to "
+                                              << attn_device);
+                        forced_sub_devices[id] = attn_device;
+                        break;
+                    }
+                }
+            }
+        }
 
         // Build the filtered device list before passing to compile_for_success.
         // A forced device (if valid) produces a single-element list; otherwise the full
@@ -2422,6 +2441,10 @@ void ov::npuw::CompiledModel::implement_properties() {
                           BIND(npuw::partitioning::dcoff_type, NPUW_DCOFF_TYPE),
                           BIND(npuw::partitioning::dcoff_with_scale, NPUW_DCOFF_SCALE),
                           BIND(npuw::partitioning::attn_hfa_fused, NPUW_ATTN_HFA_FUSED),
+                          BIND(npuw::partitioning::attn_paged_block_size, NPUW_ATTN_PAGED_BLOCK_SIZE),
+                          BIND(npuw::partitioning::attn_paged_num_blocks, NPUW_ATTN_PAGED_NUM_BLOCKS),
+                          BIND(npuw::partitioning::attn_paged_max_seqs, NPUW_ATTN_PAGED_MAX_SEQS),
+                          BIND(npuw::partitioning::attn_device, NPUW_ATTN_DEVICE),
                           BIND(npuw::parallel_compilation, NPUW_PARALLEL_COMPILE),
                           BIND(npuw::ensure_compatibility, NPUW_ENSURE_COMPATIBILITY),
                           BIND(npuw::funcall_async, NPUW_FUNCALL_ASYNC),

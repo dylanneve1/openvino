@@ -16,6 +16,7 @@
 #include "npuw_transformations/decompose_gqa.hpp"
 #include "npuw_transformations/lora_stateful_to_stateless.hpp"
 #include "npuw_transformations/optimize_value_tensors.hpp"
+#include "npuw_transformations/paged_attention_static.hpp"
 #include "npuw_transformations/patch_sliding_window_mask.hpp"
 #include "npuw_transformations/reshape_sliced_head_to_static.hpp"
 #include "npuw_transformations/reshape_to_static.hpp"
@@ -32,6 +33,8 @@
 #include "openvino/pass/pattern/op/optional.hpp"
 #include "openvino/pass/pattern/op/or.hpp"
 #include "openvino/pass/pattern/op/wrap_type.hpp"
+#include "openvino/op/paged_attention.hpp"
+#include "openvino/pass/sdpa_to_paged_attention.hpp"
 #include "openvino/pass/stateful_to_stateless.hpp"
 #include "openvino/pass/validate.hpp"
 #include "openvino/runtime/iasync_infer_request.hpp"
@@ -48,6 +51,30 @@
 namespace opp = ov::pass::pattern;
 
 namespace {
+// True when the model already contains a PagedAttentionExtension op, or has a
+// Parameter named "block_indices" — both indicate that
+// ov::pass::SDPAToPagedAttention has already been applied upstream (e.g. by
+// GenAI's ContinuousBatchingPipeline, which runs the pass before
+// core.compile_model).
+bool model_has_paged_attention(const std::shared_ptr<ov::Model>& m) {
+    for (const auto& op : m->get_ordered_ops()) {
+        if (ov::as_type_ptr<ov::op::PagedAttentionExtension>(op)) {
+            return true;
+        }
+    }
+    for (const auto& p : m->get_parameters()) {
+        for (const auto& n : p->get_output_tensor(0).get_names()) {
+            if (n == "block_indices") {
+                return true;
+            }
+        }
+        if (p->get_friendly_name() == "block_indices") {
+            return true;
+        }
+    }
+    return false;
+}
+
 template <typename T, typename = std::enable_if_t<std::is_integral<T>::value>>
 T align_to(T value, T alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
@@ -610,8 +637,15 @@ std::vector<std::shared_ptr<ov::Model>> ov::npuw::LLMCompiledModel::create_gener
                              << "): reshaping to static");
 
         // Reshape to target size
-        ov::npuw::ReshapeToStatic(max_generation_token_len, kv_size, axes, m_max_lora_rank, whisper_lhs_seq_size)
-            .run_on_model(generate_variant);
+        if (m_pa_mode) {
+            // Skip legacy ReshapeToStatic — the PA op has no contiguous KV
+            // seq dim to reshape. Bake static shapes for paged inputs instead.
+            ov::npuw::BakePagedAttentionStaticShapes(m_pa_num_blocks, m_pa_block_size, m_pa_max_seqs, kv_size)
+                .run_on_model(generate_variant);
+        } else {
+            ov::npuw::ReshapeToStatic(max_generation_token_len, kv_size, axes, m_max_lora_rank, whisper_lhs_seq_size)
+                .run_on_model(generate_variant);
+        }
 
         // Set unique name for this variant
         generate_variant->set_friendly_name(generate_model->get_friendly_name() + "_kv" + std::to_string(kv_size));
@@ -817,6 +851,42 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
 
     ov::npuw::LoraStatefulToStatelessPass().run_on_model(kvcache_model);
 
+    // Paged Attention path: detect upstream application (GenAI's
+    // ContinuousBatchingPipeline runs SDPAToPagedAttention itself before
+    // core.compile_model), and apply the pass here for LLMPipeline / direct
+    // compile_model callers when either hint is PAGED.
+    {
+        const auto pf_attn_hint = m_cfg.get<::intel_npu::NPUW_LLM_PREFILL_ATTENTION_HINT>();
+        const auto gn_attn_hint = m_cfg.get<::intel_npu::NPUW_LLM_GENERATE_ATTENTION_HINT>();
+        m_pa_mode = (pf_attn_hint == ::intel_npu::npuw::llm::AttentionHint::PAGED) ||
+                    (gn_attn_hint == ::intel_npu::npuw::llm::AttentionHint::PAGED);
+        m_pa_already_applied = model_has_paged_attention(kvcache_model);
+
+        if (m_pa_already_applied) {
+            // GenAI already paged the model. Force PAGED mode regardless of
+            // hints — there is no SDPA pattern left to handle any other way.
+            m_pa_mode = true;
+            LOG_DEBUG("Detected upstream SDPAToPagedAttention application; forcing PAGED mode.");
+        } else if (m_pa_mode) {
+            LOG_DEBUG("Applying ov::pass::SDPAToPagedAttention to kvcache model.");
+            ov::pass::SDPAToPagedAttention(/*use_per_layer_block_indices_inputs=*/false,
+                                           /*use_score_outputs=*/false,
+                                           /*allow_score_aggregation=*/false,
+                                           /*allow_cache_rotation=*/false,
+                                           /*allow_xattention=*/false,
+                                           /*allow_adaptive_rkv=*/false,
+                                           /*allow_qq_bias=*/false)
+                .run_on_model(kvcache_model);
+            m_pa_already_applied = true;
+        }
+
+        if (m_pa_mode) {
+            m_pa_block_size = m_cfg.get<::intel_npu::NPUW_ATTN_PAGED_BLOCK_SIZE>();
+            m_pa_num_blocks = m_cfg.get<::intel_npu::NPUW_ATTN_PAGED_NUM_BLOCKS>();
+            m_pa_max_seqs = m_cfg.get<::intel_npu::NPUW_ATTN_PAGED_MAX_SEQS>();
+        }
+    }
+
     LOG_DEBUG("   ...also convert BF16 to FP16");
     // Note: we need to identify original bf16 constants for potential weightless deserialization later
     // And only then do bf16 to f16 transformation
@@ -873,7 +943,17 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
 
     LOG_DEBUG("Make prefill model with static shapes");
     m_max_lora_rank = m_cfg.get<::intel_npu::NPUW_LLM_MAX_LORA_RANK>();
-    if (m_use_chunk_prefill) {
+    if (m_pa_mode) {
+        // ReshapeToStatic targets a contiguous KV-cache seq dim that no longer
+        // exists after SDPAToPagedAttention. The PA op gets its sizes from the
+        // baked Constants (max_context_len) and the static-shape Parameters
+        // installed by BakePagedAttentionStaticShapes.
+        ov::npuw::BakePagedAttentionStaticShapes(m_pa_num_blocks,
+                                                 m_pa_block_size,
+                                                 m_pa_max_seqs,
+                                                 m_kvcache_desc.max_prompt_size)
+            .run_on_model(prefill_model);
+    } else if (m_use_chunk_prefill) {
         ov::npuw::ReshapeToStatic(static_cast<uint32_t>(m_prefill_chunk_size),
                                   m_kvcache_desc.max_prompt_size,
                                   axes,
@@ -906,9 +986,16 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     }
 
     LOG_DEBUG("5.1, decompose GroupQueryAttention OP");
-    ov::npuw::DecomposeGQA(true).run_on_model(prefill_model);
-    for (auto& model_variant : generate_model_variants) {
-        ov::npuw::DecomposeGQA(false).run_on_model(model_variant);
+    if (m_pa_mode) {
+        // PagedAttentionExtension handles GQA internally via num_kv_heads in
+        // its rt_info; DecomposeGQA targets the legacy SDPA pattern and would
+        // not find a match here regardless. Skip explicitly.
+        LOG_DEBUG("Skip DecomposeGQA: paged-attention path.");
+    } else {
+        ov::npuw::DecomposeGQA(true).run_on_model(prefill_model);
+        for (auto& model_variant : generate_model_variants) {
+            ov::npuw::DecomposeGQA(false).run_on_model(model_variant);
+        }
     }
 
     const auto prefill_attn_hint = m_cfg.get<::intel_npu::NPUW_LLM_PREFILL_ATTENTION_HINT>();
@@ -922,8 +1009,13 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     const bool prefill_attn_hfa = prefill_attn_hint == ::intel_npu::npuw::llm::AttentionHint::HFA;
     const bool generate_attn_hfa = generate_attn_hint == ::intel_npu::npuw::llm::AttentionHint::HFA;
 
+    const bool prefill_attn_paged = prefill_attn_hint == ::intel_npu::npuw::llm::AttentionHint::PAGED;
+    const bool generate_attn_paged = generate_attn_hint == ::intel_npu::npuw::llm::AttentionHint::PAGED;
+
     const bool optimize_v_tensors = m_cfg.get<::intel_npu::NPUW_LLM_OPTIMIZE_V_TENSORS>();
-    if (optimize_v_tensors) {
+    if (m_pa_mode) {
+        LOG_DEBUG("Skip OptimizeValueTensors: paged-attention path owns its own KV layout.");
+    } else if (optimize_v_tensors) {
         LOG_DEBUG("Check and apply opt layout");
         LOG_BLOCK();
         // Only optimize V tensors for static attention types
@@ -960,27 +1052,37 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     } else {
         LOG_DEBUG("Check and apply opt layout --- SKIPPED");
     }
-    if (!m_is_embedding) {
-        if (!m_use_chunk_prefill) {
-            LOG_DEBUG("Removing EmptyKVInputs");
-            NPUW_ASSERT(ov::npuw::RemoveEmptyKVInputs().run_on_model(prefill_model));
-        } else {
-            LOG_DEBUG("Don't remove input key/values from prefill model.");
-            LOG_DEBUG("Ask prefill model to output key/values for prefill chunk size tokens.");
-            ov::npuw::RedirectNewKvToOutput().run_on_model(prefill_model);
-        }
+    if (m_pa_mode) {
+        // Paged Attention owns KV cache writes inside the PA op (the
+        // key_cache.N / value_cache.N Parameters are mutated by the op's
+        // executor). There are no SDPA-driven new-KV outputs to redirect and
+        // no plain KV-cache Concat to convert to a different precision — those
+        // are absorbed into the PA op's cache inputs, whose precision is set
+        // by ConvertPagedAttnInputs in Step 3.
+        LOG_DEBUG("Skip RemoveEmptyKVInputs / RedirectNewKvToOutput / ConvertKVCacheToPrecision: paged-attention path.");
+    } else {
+        if (!m_is_embedding) {
+            if (!m_use_chunk_prefill) {
+                LOG_DEBUG("Removing EmptyKVInputs");
+                NPUW_ASSERT(ov::npuw::RemoveEmptyKVInputs().run_on_model(prefill_model));
+            } else {
+                LOG_DEBUG("Don't remove input key/values from prefill model.");
+                LOG_DEBUG("Ask prefill model to output key/values for prefill chunk size tokens.");
+                ov::npuw::RedirectNewKvToOutput().run_on_model(prefill_model);
+            }
 
-        LOG_DEBUG("Optimize generate model to output key/values for new token.");
-        for (size_t i = 0; i < generate_model_variants.size(); ++i) {
-            ov::npuw::RedirectNewKvToOutput().run_on_model(generate_model_variants[i]);
+            LOG_DEBUG("Optimize generate model to output key/values for new token.");
+            for (size_t i = 0; i < generate_model_variants.size(); ++i) {
+                ov::npuw::RedirectNewKvToOutput().run_on_model(generate_model_variants[i]);
+            }
         }
+        LOG_DEBUG("Converting KV-cache in generate model to" << kv_kache_storage_type);
+        for (size_t i = 0; i < generate_model_variants.size(); ++i) {
+            ov::npuw::ConvertKVCacheToPrecision(kv_kache_storage_type).run_on_model(generate_model_variants[i]);
+        }
+        LOG_DEBUG("Converting KV-cache in prefill model to" << kv_kache_storage_type);
+        ov::npuw::ConvertKVCacheToPrecision(kv_kache_storage_type).run_on_model(prefill_model);
     }
-    LOG_DEBUG("Converting KV-cache in generate model to" << kv_kache_storage_type);
-    for (size_t i = 0; i < generate_model_variants.size(); ++i) {
-        ov::npuw::ConvertKVCacheToPrecision(kv_kache_storage_type).run_on_model(generate_model_variants[i]);
-    }
-    LOG_DEBUG("Converting KV-cache in prefill model to" << kv_kache_storage_type);
-    ov::npuw::ConvertKVCacheToPrecision(kv_kache_storage_type).run_on_model(prefill_model);
 
     std::optional<std::string> user_compilation_mode_params = std::nullopt;
     if (const auto it = other_props.find("NPU_COMPILATION_MODE_PARAMS"); it != other_props.end()) {
@@ -1038,12 +1140,12 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         {"NPUW_UNFOLD_IREQS", "NO"},
     };
 
-    if (m_use_chunk_prefill && (prefill_attn_pyramid || prefill_attn_hfa || prefill_attn_dyn)) {
+    if (m_use_chunk_prefill && (prefill_attn_pyramid || prefill_attn_hfa || prefill_attn_dyn || prefill_attn_paged)) {
         prefill_config["NPUW_ATTN"] = ::intel_npu::NPUW_LLM_PREFILL_ATTENTION_HINT::toString(prefill_attn_hint);
         merge_config_with(prefill_config, dyn_attn_opts);
     }
 
-    if (generate_attn_pyramid || generate_attn_hfa || generate_attn_dyn) {
+    if (generate_attn_pyramid || generate_attn_hfa || generate_attn_dyn || generate_attn_paged) {
         generate_config["NPUW_ATTN"] = ::intel_npu::NPUW_LLM_GENERATE_ATTENTION_HINT::toString(generate_attn_hint);
         merge_config_with(generate_config, dyn_attn_opts);
     }
