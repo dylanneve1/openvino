@@ -73,6 +73,7 @@ public:
 private:
     friend class LLMInferBaseRequest;
     friend class LLMInferRequest;
+    friend class PagedLLMInferRequest;
     friend class WhisperInferRequest;
     friend class EmbeddingInferRequest;
 

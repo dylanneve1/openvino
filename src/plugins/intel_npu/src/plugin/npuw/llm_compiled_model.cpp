@@ -9,6 +9,7 @@
 #include "embedding/remove_empty_kv_inputs.hpp"
 #include "llm_compiled_model_utils.hpp"
 #include "llm_infer_request.hpp"
+#include "paged_llm_infer_request.hpp"
 #include "logging.hpp"
 #include "moe_transformations/apply_moe_device_routed_transforms.hpp"
 #include "npuw_transformations/add_position_ids_param.hpp"
@@ -1671,6 +1672,9 @@ std::shared_ptr<ov::ISyncInferRequest> ov::npuw::LLMCompiledModel::create_sync_i
 
 std::shared_ptr<ov::ISyncInferRequest> ov::npuw::LLMCompiledModel::create_llm_infer_request() {
     auto this_sptr = std::static_pointer_cast<ov::npuw::LLMCompiledModel>(shared_from_this());
+    if (m_pa_mode) {
+        return std::make_shared<ov::npuw::PagedLLMInferRequest>(this_sptr);
+    }
     return std::make_shared<ov::npuw::LLMInferRequest>(this_sptr);
 }
 
