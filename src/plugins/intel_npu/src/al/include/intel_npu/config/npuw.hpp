@@ -94,7 +94,7 @@ namespace npuw {
 namespace llm {
 enum class PrefillHint { DYNAMIC, STATIC };
 enum class GenerateHint { FAST_COMPILE, BEST_PERF };
-enum class AttentionHint { DYNAMIC, STATIC, PYRAMID, HFA };
+enum class AttentionHint { DYNAMIC, STATIC, PYRAMID, HFA, PAGED };
 enum class MoEHint { DENSE, HOST_ROUTED, DEVICE_ROUTED };
 }  // namespace llm
 }  // namespace npuw
@@ -219,6 +219,8 @@ struct NPUWStringEnumOptionTraits<::intel_npu::npuw::llm::AttentionHint> {
             return ValueType::PYRAMID;
         } else if (val == "HFA") {
             return ValueType::HFA;
+        } else if (val == "PAGED") {
+            return ValueType::PAGED;
         }
         OPENVINO_THROW("Unsupported attention hint provided: ", val);
     }
@@ -233,6 +235,8 @@ struct NPUWStringEnumOptionTraits<::intel_npu::npuw::llm::AttentionHint> {
             return "PYRAMID";
         case ValueType::HFA:
             return "HFA";
+        case ValueType::PAGED:
+            return "PAGED";
         default:
             OPENVINO_THROW("Can't convert provided attention hint : ", int(val), " to string.");
         }
