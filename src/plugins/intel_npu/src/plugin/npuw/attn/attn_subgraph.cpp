@@ -17,6 +17,7 @@
 #include "../just_sync_infer_request.hpp"
 #include "../logging.hpp"
 #include "../partitioning/partitioning.hpp"
+#include "../partitioning/patterns/paged_attn.hpp"
 #include "../partitioning/patterns/sdpa.hpp"
 #include "../pyramid_attention.hpp"
 #include "../serialization.hpp"
@@ -1278,6 +1279,11 @@ std::vector<ov::npuw::v1::subgraphs::ScopedPatternRegistration> register_pattern
     // (replaces the legacy HNDL_ATTN fallback in snapshot.cpp)
     registrations.emplace_back(registry.on<ov::npuw::patterns::attn::SDPA>().scoped());
     registrations.emplace_back(registry.on<ov::npuw::patterns::attn::SDPADecomposed>().scoped());
+    // Paged Attention matcher: tags ov::op::PagedAttentionExtension with the
+    // shared "attn" isolation tag so the online partitioner pulls the paged-
+    // attention subgraph into its own group. Routed to NPUW_ATTN_DEVICE
+    // (default CPU) via the per-submodel device override.
+    registrations.emplace_back(registry.on<ov::npuw::patterns::attn::PagedAttn>().scoped());
 
     // Behavior registration: fires for any function tagged "attn" (i.e. from any SDPA-family
     // isolation pattern). The at_partition callback checks whether dynamic

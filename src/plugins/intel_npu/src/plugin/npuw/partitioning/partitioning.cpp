@@ -2100,6 +2100,19 @@ void Partitioner::attention(const std::string& func_name) {
         }
         LOG_WARN("No host flash attention found in the ATTN block");
     }
+
+    // Try PAGED (Paged Attention)
+    // Unlike HFA/Pyramid, paged attention does not transform the subgraph
+    // structure — the PagedAttentionExtension op already encapsulates the full
+    // attention computation. The partitioning step only needs to leave the
+    // model unchanged and let the subgraph be routed to NPUW_ATTN_DEVICE
+    // (default CPU) via the per-submodel device override. No Function variant
+    // is populated for now; the matcher tagging in attn_subgraph.cpp does the
+    // isolation work.
+    if (attn_mode == "PAGED") {
+        LOG_VERB("Done - PAGED attention (subgraph isolated, no structural rewrite)");
+        return;
+    }
 }
 
 void Partitioner::optimize(const std::string& func_name) {
