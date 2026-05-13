@@ -76,7 +76,7 @@ std::optional<uint32_t> KVCacheBlockManager::allocate_block() {
 
     // Reset block state
     block.num_tokens = 0;
-    block.is_allocated = true;
+    block.state = Block::State::ALLOCATED;
 
     LOG_VERB("KVCacheBlockManager: Allocated block " << block_id
                                                      << " (free blocks remaining: " << free_block_ids_.size() << ")");
@@ -102,11 +102,10 @@ ov::SoPtr<ov::ITensor> KVCacheBlockManager::get_block_tensor(uint32_t block_id) 
 void KVCacheBlockManager::update_block_tokens(uint32_t block_id, uint32_t num_tokens) {
     validate_block_id(block_id);
 
-    if (!blocks_[block_id].is_allocated) {
-        OPENVINO_THROW("KVCacheBlockManager: Cannot update tokens on free block ",
-                       block_id,
-                       ". Call allocate_block() first.");
-    }
+    OPENVINO_ASSERT(blocks_[block_id].state != Block::State::FREE,
+                    "KVCacheBlockManager: Cannot update tokens on free block ",
+                    block_id,
+                    ". Call allocate_block() first.");
 
     if (num_tokens > block_size_) {
         OPENVINO_THROW("KVCacheBlockManager: Cannot set ",
@@ -121,6 +120,10 @@ void KVCacheBlockManager::update_block_tokens(uint32_t block_id, uint32_t num_to
     auto& block = blocks_[block_id];
     block.num_tokens = num_tokens;
 
+    // Update state: FULL when the block is filled, ALLOCATED otherwise
+    // (num_tokens==0 is valid after a reset).
+    block.state = (num_tokens >= block_size_) ? Block::State::FULL : Block::State::ALLOCATED;
+
     LOG_VERB("KVCacheBlockManager: Updated block " << block_id << " tokens: " << num_tokens << "/" << block_size_);
 }
 
@@ -134,7 +137,7 @@ std::vector<uint32_t> KVCacheBlockManager::get_allocated_blocks() const {
     allocated.reserve(max_blocks_ - free_block_ids_.size());
 
     for (uint32_t i = 0; i < blocks_.size(); ++i) {
-        if (blocks_[i].is_allocated) {
+        if (blocks_[i].state != Block::State::FREE) {
             allocated.push_back(i);
         }
     }
@@ -147,7 +150,7 @@ void KVCacheBlockManager::clear_all() {
 
     for (auto& block : blocks_) {
         block.num_tokens = 0;
-        block.is_allocated = false;
+        block.state = Block::State::FREE;
     }
 
     // Rebuild free stack (push in reverse order so block 0 is on top)
