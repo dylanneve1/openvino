@@ -130,5 +130,64 @@ struct PagedAttention {
 };
 
 }  // namespace function
+
+namespace compiled {
+
+// Compile-time PagedAttention information. Parallels
+// ov::npuw::compiled::HostFlashAttention. Constructed from
+// function::PagedAttention once tile sub-models are compiled, and stashed
+// in a subgraph context by the partition_stage so the runtime dispatch in
+// attn_subgraph.cpp can retrieve it via get_compiled_pa().
+struct PagedAttention {
+    // Compiled tile sub-models (NPU). The function-level _tile_model /
+    // _final_tile_model handles are transient — owned by LLMCompiledModel
+    // and cleared once their compilations land in m_pa_tile_compiled /
+    // m_pa_final_tile_compiled. This struct holds references to those
+    // compiled handles for the runtime to invoke.
+    ov::SoPtr<ov::ICompiledModel> _compiled_tile_model;
+    ov::SoPtr<ov::ICompiledModel> _compiled_final_tile_model;
+
+    // Configuration copied from function::PagedAttention at construction.
+    int64_t _block_size = 0;
+    std::size_t _num_blocks = 0;
+    std::size_t _query_size = 0;
+    std::size_t _head_size = 0;
+    std::size_t _num_q_heads = 0;
+    std::size_t _num_kv_heads = 0;
+    float _scale = 0.0f;
+
+    // PA op parameter-index map on the original (pre-tile-rewrite) model.
+    // Lets the runtime locate block_indices, past_lens, etc. at infer time.
+    std::map<PAInputId, std::size_t> _pa_param_index_map;
+
+    // Tile sub-model parameter / output index maps.
+    std::map<OnlineSoftmaxTileInputId, std::size_t> _tile_param_index_map;
+    std::map<OnlineSoftmaxTileOutputId, std::size_t> _tile_output_index_map;
+
+    PagedAttention() = default;
+
+    // Construct from the function-side struct after tile-model compilation.
+    PagedAttention(const function::PagedAttention& func_pa,
+                   ov::SoPtr<ov::ICompiledModel> tile_compiled,
+                   ov::SoPtr<ov::ICompiledModel> final_tile_compiled)
+        : _compiled_tile_model(std::move(tile_compiled)),
+          _compiled_final_tile_model(std::move(final_tile_compiled)),
+          _block_size(func_pa._block_size),
+          _num_blocks(func_pa._num_blocks),
+          _query_size(func_pa._query_size),
+          _head_size(func_pa._head_size),
+          _num_q_heads(func_pa._num_q_heads),
+          _num_kv_heads(func_pa._num_kv_heads),
+          _scale(func_pa._scale),
+          _pa_param_index_map(func_pa._pa_param_index_map),
+          _tile_param_index_map(func_pa._tile_param_index_map),
+          _tile_output_index_map(func_pa._tile_output_index_map) {}
+
+    bool is_valid() const {
+        return _compiled_tile_model && _compiled_final_tile_model && _block_size > 0;
+    }
+};
+
+}  // namespace compiled
 }  // namespace npuw
 }  // namespace ov
