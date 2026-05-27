@@ -71,8 +71,8 @@ static HFATileInputs create_hfa_tile_inputs(const ov::Shape& q_shape,
 
     HFATileInputs inputs;
 
-    auto set_param_name = [](std::shared_ptr<ov::op::v0::Parameter>& param, HFATileInputId id) {
-        const char* name = hfa_tile_input_id_to_string(id);
+    auto set_param_name = [](std::shared_ptr<ov::op::v0::Parameter>& param, OnlineSoftmaxTileInputId id) {
+        const char* name = online_softmax_tile_input_id_to_string(id);
         param->set_friendly_name(name);
         param->output(0).get_tensor().set_names({name});
     };
@@ -80,37 +80,37 @@ static HFATileInputs create_hfa_tile_inputs(const ov::Shape& q_shape,
     // past_acc: [batch, num_heads, seq_len, head_dim]
     inputs.past_acc =
         std::make_shared<ov::op::v0::Parameter>(input_dtype, ov::Shape{batch, num_heads, seq_len, head_dim});
-    set_param_name(inputs.past_acc, HFATileInputId::PAST_ACC);
+    set_param_name(inputs.past_acc, OnlineSoftmaxTileInputId::PAST_ACC);
 
     // past_max: [batch, num_heads, seq_len, 1]
     inputs.past_max = std::make_shared<ov::op::v0::Parameter>(input_dtype, ov::Shape{batch, num_heads, seq_len, 1});
-    set_param_name(inputs.past_max, HFATileInputId::PAST_MAX);
+    set_param_name(inputs.past_max, OnlineSoftmaxTileInputId::PAST_MAX);
 
     // past_d: [batch, num_heads, seq_len, 1]
     inputs.past_d = std::make_shared<ov::op::v0::Parameter>(input_dtype, ov::Shape{batch, num_heads, seq_len, 1});
-    set_param_name(inputs.past_d, HFATileInputId::PAST_D);
+    set_param_name(inputs.past_d, OnlineSoftmaxTileInputId::PAST_D);
 
     // k_tile: [batch, kv_num_heads, tile_size, head_dim]
     inputs.k_tile = std::make_shared<ov::op::v0::Parameter>(
         input_dtype,
         ov::Shape{batch, kv_num_heads, static_cast<size_t>(tile_size), head_dim});
-    set_param_name(inputs.k_tile, HFATileInputId::K_TILE);
+    set_param_name(inputs.k_tile, OnlineSoftmaxTileInputId::K_TILE);
 
     // v_tile: [batch, kv_num_heads, head_dim, tile_size]
     inputs.v_tile = std::make_shared<ov::op::v0::Parameter>(
         input_dtype,
         ov::Shape{batch, kv_num_heads, head_dim, static_cast<size_t>(tile_size)});
-    set_param_name(inputs.v_tile, HFATileInputId::V_TILE);
+    set_param_name(inputs.v_tile, OnlineSoftmaxTileInputId::V_TILE);
 
     // q: [batch, num_heads, seq_len, head_dim]
     inputs.q = std::make_shared<ov::op::v0::Parameter>(input_dtype, ov::Shape{batch, num_heads, seq_len, head_dim});
-    set_param_name(inputs.q, HFATileInputId::Q);
+    set_param_name(inputs.q, OnlineSoftmaxTileInputId::Q);
 
     // mask_tile: [batch, 1, seq_len, tile_size] - use mask's original dtype
     inputs.mask_tile =
         std::make_shared<ov::op::v0::Parameter>(mask_dtype,
                                                 ov::Shape{batch, 1, seq_len, static_cast<size_t>(tile_size)});
-    set_param_name(inputs.mask_tile, HFATileInputId::MASK_TILE);
+    set_param_name(inputs.mask_tile, OnlineSoftmaxTileInputId::MASK_TILE);
 
     return inputs;
 }
@@ -558,7 +558,7 @@ static ov::ResultVector create_regular_tile_outputs_fused(const FlashAttentionRe
 // Parameters:
 //   is_final_tile: If true, creates final tile with division/transpose/reshape
 //   output_dtype: Output data type (only used when is_final_tile=true)
-std::shared_ptr<ov::Model> create_hfa_tile_model(const ov::Shape& q_shape,
+std::shared_ptr<ov::Model> create_online_softmax_tile_model(const ov::Shape& q_shape,
                                                  const ov::element::Type& input_dtype,
                                                  const ov::element::Type& mask_dtype,
                                                  int64_t tile_size,
@@ -815,20 +815,20 @@ static void build_tile_param_mapping(HostFlashAttention& hfa, const std::shared_
         const std::string& name = *tensor_names.begin();
 
         // Map tensor name to enum ID
-        if (name == hfa_tile_input_id_to_string(HFATileInputId::PAST_ACC)) {
-            hfa._tile_param_index_map[HFATileInputId::PAST_ACC] = i;
-        } else if (name == hfa_tile_input_id_to_string(HFATileInputId::PAST_MAX)) {
-            hfa._tile_param_index_map[HFATileInputId::PAST_MAX] = i;
-        } else if (name == hfa_tile_input_id_to_string(HFATileInputId::PAST_D)) {
-            hfa._tile_param_index_map[HFATileInputId::PAST_D] = i;
-        } else if (name == hfa_tile_input_id_to_string(HFATileInputId::K_TILE)) {
-            hfa._tile_param_index_map[HFATileInputId::K_TILE] = i;
-        } else if (name == hfa_tile_input_id_to_string(HFATileInputId::V_TILE)) {
-            hfa._tile_param_index_map[HFATileInputId::V_TILE] = i;
-        } else if (name == hfa_tile_input_id_to_string(HFATileInputId::Q)) {
-            hfa._tile_param_index_map[HFATileInputId::Q] = i;
-        } else if (name == hfa_tile_input_id_to_string(HFATileInputId::MASK_TILE)) {
-            hfa._tile_param_index_map[HFATileInputId::MASK_TILE] = i;
+        if (name == online_softmax_tile_input_id_to_string(OnlineSoftmaxTileInputId::PAST_ACC)) {
+            hfa._tile_param_index_map[OnlineSoftmaxTileInputId::PAST_ACC] = i;
+        } else if (name == online_softmax_tile_input_id_to_string(OnlineSoftmaxTileInputId::PAST_MAX)) {
+            hfa._tile_param_index_map[OnlineSoftmaxTileInputId::PAST_MAX] = i;
+        } else if (name == online_softmax_tile_input_id_to_string(OnlineSoftmaxTileInputId::PAST_D)) {
+            hfa._tile_param_index_map[OnlineSoftmaxTileInputId::PAST_D] = i;
+        } else if (name == online_softmax_tile_input_id_to_string(OnlineSoftmaxTileInputId::K_TILE)) {
+            hfa._tile_param_index_map[OnlineSoftmaxTileInputId::K_TILE] = i;
+        } else if (name == online_softmax_tile_input_id_to_string(OnlineSoftmaxTileInputId::V_TILE)) {
+            hfa._tile_param_index_map[OnlineSoftmaxTileInputId::V_TILE] = i;
+        } else if (name == online_softmax_tile_input_id_to_string(OnlineSoftmaxTileInputId::Q)) {
+            hfa._tile_param_index_map[OnlineSoftmaxTileInputId::Q] = i;
+        } else if (name == online_softmax_tile_input_id_to_string(OnlineSoftmaxTileInputId::MASK_TILE)) {
+            hfa._tile_param_index_map[OnlineSoftmaxTileInputId::MASK_TILE] = i;
         } else {
             LOG_WARN("Unknown tile model input name: " << name);
         }
@@ -840,7 +840,7 @@ static void build_tile_param_mapping(HostFlashAttention& hfa, const std::shared_
     LOG_DEBUG("Total entries: " << hfa._tile_param_index_map.size());
 
     for (const auto& [input_id, input_idx] : hfa._tile_param_index_map) {
-        LOG_DEBUG("  " << hfa_tile_input_id_to_string(input_id) << " -> input[" << input_idx << "]");
+        LOG_DEBUG("  " << online_softmax_tile_input_id_to_string(input_id) << " -> input[" << input_idx << "]");
     }
     LOG_DEBUG("==================================================");
 }
@@ -865,11 +865,11 @@ static void build_tile_output_mapping(HostFlashAttention& hfa, const std::shared
 
         // Map tensor name to enum ID
         if (name == "acc") {
-            hfa._tile_output_index_map[HFATileOutputId::ACC] = i;
+            hfa._tile_output_index_map[OnlineSoftmaxTileOutputId::ACC] = i;
         } else if (name == "maxx") {
-            hfa._tile_output_index_map[HFATileOutputId::MAXX] = i;
+            hfa._tile_output_index_map[OnlineSoftmaxTileOutputId::MAXX] = i;
         } else if (name == "d") {
-            hfa._tile_output_index_map[HFATileOutputId::D] = i;
+            hfa._tile_output_index_map[OnlineSoftmaxTileOutputId::D] = i;
         } else {
             LOG_WARN("Unknown tile model output name: " << name);
         }
@@ -881,7 +881,7 @@ static void build_tile_output_mapping(HostFlashAttention& hfa, const std::shared
     LOG_DEBUG("Total entries: " << hfa._tile_output_index_map.size());
 
     for (const auto& [output_id, output_idx] : hfa._tile_output_index_map) {
-        LOG_DEBUG("  " << hfa_tile_output_id_to_string(output_id) << " -> output[" << output_idx << "]");
+        LOG_DEBUG("  " << online_softmax_tile_output_id_to_string(output_id) << " -> output[" << output_idx << "]");
     }
     LOG_DEBUG("==================================================");
 }
@@ -1014,7 +1014,7 @@ std::optional<HostFlashAttention> HostFlashAttention::from(const std::shared_ptr
     // Step 5: Create tile models using query_size as tile_size
     // ========================================================================
     LOG_INFO("Creating HFA tile models with tile_size=" << query_size);
-    auto tile_model = create_hfa_tile_model(q_shape_static,
+    auto tile_model = create_online_softmax_tile_model(q_shape_static,
                                             dtype,
                                             mask_dtype,
                                             query_size,
@@ -1026,7 +1026,7 @@ std::optional<HostFlashAttention> HostFlashAttention::from(const std::shared_ptr
         return std::nullopt;
     }
 
-    auto final_tile_model = create_hfa_tile_model(q_shape_static,
+    auto final_tile_model = create_online_softmax_tile_model(q_shape_static,
                                                   dtype,
                                                   mask_dtype,
                                                   query_size,
@@ -1117,7 +1117,7 @@ HostFlashAttention::HostFlashAttention(const function::HostFlashAttention& func_
     _sdpa_attention_info._sdpa_indices.attention_mask = get_sdpa_param_idx(SDPAInputId::ATTENTION_MASK);
 
     // Pre-cache tile input indices
-    auto get_tile_input_idx = [&](HFATileInputId input_id) -> std::size_t {
+    auto get_tile_input_idx = [&](OnlineSoftmaxTileInputId input_id) -> std::size_t {
         auto it = func_hfa._tile_param_index_map.find(input_id);
         if (it == func_hfa._tile_param_index_map.end()) {
             OPENVINO_THROW("HFA: Tile input mapping not found for input ID: ", static_cast<uint8_t>(input_id));
@@ -1125,7 +1125,7 @@ HostFlashAttention::HostFlashAttention(const function::HostFlashAttention& func_
         return it->second;
     };
 
-    auto get_tile_output_idx = [&](HFATileOutputId output_id) -> std::size_t {
+    auto get_tile_output_idx = [&](OnlineSoftmaxTileOutputId output_id) -> std::size_t {
         auto it = func_hfa._tile_output_index_map.find(output_id);
         if (it == func_hfa._tile_output_index_map.end()) {
             OPENVINO_THROW("HFA: Tile output mapping not found for output ID: ", static_cast<uint8_t>(output_id));
@@ -1134,18 +1134,18 @@ HostFlashAttention::HostFlashAttention(const function::HostFlashAttention& func_
     };
 
     // Cache all tile input indices
-    _sdpa_attention_info._tile_input_indices.q = get_tile_input_idx(HFATileInputId::Q);
-    _sdpa_attention_info._tile_input_indices.k = get_tile_input_idx(HFATileInputId::K_TILE);
-    _sdpa_attention_info._tile_input_indices.v = get_tile_input_idx(HFATileInputId::V_TILE);
-    _sdpa_attention_info._tile_input_indices.mask = get_tile_input_idx(HFATileInputId::MASK_TILE);
-    _sdpa_attention_info._tile_input_indices.acc = get_tile_input_idx(HFATileInputId::PAST_ACC);
-    _sdpa_attention_info._tile_input_indices.max = get_tile_input_idx(HFATileInputId::PAST_MAX);
-    _sdpa_attention_info._tile_input_indices.d = get_tile_input_idx(HFATileInputId::PAST_D);
+    _sdpa_attention_info._tile_input_indices.q = get_tile_input_idx(OnlineSoftmaxTileInputId::Q);
+    _sdpa_attention_info._tile_input_indices.k = get_tile_input_idx(OnlineSoftmaxTileInputId::K_TILE);
+    _sdpa_attention_info._tile_input_indices.v = get_tile_input_idx(OnlineSoftmaxTileInputId::V_TILE);
+    _sdpa_attention_info._tile_input_indices.mask = get_tile_input_idx(OnlineSoftmaxTileInputId::MASK_TILE);
+    _sdpa_attention_info._tile_input_indices.acc = get_tile_input_idx(OnlineSoftmaxTileInputId::PAST_ACC);
+    _sdpa_attention_info._tile_input_indices.max = get_tile_input_idx(OnlineSoftmaxTileInputId::PAST_MAX);
+    _sdpa_attention_info._tile_input_indices.d = get_tile_input_idx(OnlineSoftmaxTileInputId::PAST_D);
 
     // Cache all tile output indices
-    _sdpa_attention_info._tile_output_indices.acc = get_tile_output_idx(HFATileOutputId::ACC);
-    _sdpa_attention_info._tile_output_indices.max = get_tile_output_idx(HFATileOutputId::MAXX);
-    _sdpa_attention_info._tile_output_indices.d = get_tile_output_idx(HFATileOutputId::D);
+    _sdpa_attention_info._tile_output_indices.acc = get_tile_output_idx(OnlineSoftmaxTileOutputId::ACC);
+    _sdpa_attention_info._tile_output_indices.max = get_tile_output_idx(OnlineSoftmaxTileOutputId::MAXX);
+    _sdpa_attention_info._tile_output_indices.d = get_tile_output_idx(OnlineSoftmaxTileOutputId::D);
 
     LOG_INFO("Pre-cached SDPA indices: [query="
              << _sdpa_attention_info._sdpa_indices.query

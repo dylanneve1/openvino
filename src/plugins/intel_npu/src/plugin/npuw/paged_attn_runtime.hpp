@@ -9,7 +9,7 @@
 #include <memory>
 #include <optional>
 
-#include "host_flash_attention.hpp"  // for HFATileInputId / HFATileOutputId
+#include "host_flash_attention.hpp"  // for OnlineSoftmaxTileInputId / OnlineSoftmaxTileOutputId
 #include "openvino/core/model.hpp"
 
 namespace ov {
@@ -67,7 +67,7 @@ namespace function {
 //
 //   _tile_model        one iteration of the online-softmax loop, structurally
 //                      identical to HFA's tile model. Inputs / outputs follow
-//                      HFATileInputId / HFATileOutputId for shape compatibility
+//                      OnlineSoftmaxTileInputId / OnlineSoftmaxTileOutputId for shape compatibility
 //                      with the existing tile orchestrator.
 //   _final_tile_model  the last iteration, including the acc/d division and
 //                      any reshape/transpose needed to match the PA op's
@@ -103,10 +103,10 @@ struct PagedAttention {
     std::map<PAInputId, std::size_t> _pa_param_index_map;
 
     // Tile sub-model parameter / output index maps. Tile model I/O shape
-    // matches HFA's so we reuse its enums (HFATileInputId / HFATileOutputId).
+    // matches HFA's so we reuse its enums (OnlineSoftmaxTileInputId / OnlineSoftmaxTileOutputId).
     // Populated by Step 3b alongside tile model construction.
-    std::map<HFATileInputId, std::size_t> _tile_param_index_map;
-    std::map<HFATileOutputId, std::size_t> _tile_output_index_map;
+    std::map<OnlineSoftmaxTileInputId, std::size_t> _tile_param_index_map;
+    std::map<OnlineSoftmaxTileOutputId, std::size_t> _tile_output_index_map;
 
     bool is_valid() const {
         return _tile_model && _final_tile_model && _block_size > 0;

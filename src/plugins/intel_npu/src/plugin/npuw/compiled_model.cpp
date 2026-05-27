@@ -1853,8 +1853,8 @@ bool ov::npuw::CompiledModel::compile_for_success(std::size_t id, const std::vec
                 if (!strided_inputs.empty()) {
                     strided_inputs += ",";
                 }
-                strided_inputs += std::string(hfa_tile_input_id_to_string(HFATileInputId::K_TILE)) + "," +
-                                  std::string(hfa_tile_input_id_to_string(HFATileInputId::V_TILE));
+                strided_inputs += std::string(online_softmax_tile_input_id_to_string(OnlineSoftmaxTileInputId::K_TILE)) + "," +
+                                  std::string(online_softmax_tile_input_id_to_string(OnlineSoftmaxTileInputId::V_TILE));
                 m_meta_devices[device][strides_key] = strided_inputs;
                 supports_strides_for = true;
                 LOG_INFO("Enabled using tensor view for device: " << device << " for inputs: " << strided_inputs);

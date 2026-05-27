@@ -145,8 +145,8 @@ struct PagedAttention {
     std::map<PAInputId, std::size_t> _pa_param_index_map;
 
     // Tile model I/O index map — analogue of HFA's _tile_param_index_map
-    std::map<HFATileInputId,  std::size_t> _tile_param_index_map;
-    std::map<HFATileOutputId, std::size_t> _tile_output_index_map;
+    std::map<OnlineSoftmaxTileInputId,  std::size_t> _tile_param_index_map;
+    std::map<OnlineSoftmaxTileOutputId, std::size_t> _tile_output_index_map;
 
     bool is_valid() const { return _tile_model && _final_tile_model && _block_size > 0; }
 
