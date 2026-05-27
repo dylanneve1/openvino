@@ -124,6 +124,7 @@ void PagedLLMInferRequest::init_tile_loop_state() {
         const auto acc_port = port_of(OnlineSoftmaxTileInputId::PAST_ACC);
         const auto max_port = port_of(OnlineSoftmaxTileInputId::PAST_MAX);
         const auto d_port = port_of(OnlineSoftmaxTileInputId::PAST_D);
+        const auto mask_port = port_of(OnlineSoftmaxTileInputId::MASK_TILE);
 
         m_pa_state_acc =
             ov::SoPtr<ov::ITensor>(ov::make_tensor(acc_port.get_element_type(), acc_port.get_shape()), nullptr);
@@ -131,6 +132,8 @@ void PagedLLMInferRequest::init_tile_loop_state() {
             ov::SoPtr<ov::ITensor>(ov::make_tensor(max_port.get_element_type(), max_port.get_shape()), nullptr);
         m_pa_state_d =
             ov::SoPtr<ov::ITensor>(ov::make_tensor(d_port.get_element_type(), d_port.get_shape()), nullptr);
+        m_pa_mask_tile_buffer =
+            ov::SoPtr<ov::ITensor>(ov::make_tensor(mask_port.get_element_type(), mask_port.get_shape()), nullptr);
     }
 
     // acc = 0, d = 0.
@@ -161,9 +164,99 @@ void PagedLLMInferRequest::init_tile_loop_state() {
     }
 }
 
+namespace {
+// IEEE 754 binary16 most-negative finite value (-65504) bit pattern, used to
+// flood mask tiles with a "very negative" sentinel when the state precision
+// is f16. softmax(qkm − maxx) on these entries underflows to ~0, the
+// intended behaviour for masked-out positions.
+constexpr uint16_t kF16NegInfBits = 0xFBFF;
+}  // namespace
+
+void PagedLLMInferRequest::fill_mask_tile_for_cached_block(uint32_t past_lens, uint32_t block_idx) {
+    if (!m_pa_mask_tile_buffer) {
+        OPENVINO_THROW("PagedLLMInferRequest::fill_mask_tile_for_cached_block: mask buffer not allocated; "
+                       "call init_tile_loop_state() first.");
+    }
+    const auto shape = m_pa_mask_tile_buffer->get_shape();
+    NPUW_ASSERT(shape.size() == 4);
+    const auto query_size = shape[2];
+    const auto block_size = shape[3];
+
+    // Absolute key-position of the first slot in this logical block.
+    const uint64_t k_abs_start = static_cast<uint64_t>(block_idx) * static_cast<uint64_t>(block_size);
+
+    const auto elem_type = m_pa_mask_tile_buffer->get_element_type();
+    if (elem_type == ov::element::f32) {
+        auto* data = m_pa_mask_tile_buffer->data<float>();
+        const float neg_inf = std::numeric_limits<float>::lowest();
+        for (std::size_t q = 0; q < query_size; ++q) {
+            float* row = data + q * block_size;
+            for (std::size_t k = 0; k < block_size; ++k) {
+                const auto k_abs = k_abs_start + k;
+                row[k] = (k_abs < past_lens) ? 0.0f : neg_inf;
+            }
+        }
+    } else if (elem_type == ov::element::f16) {
+        auto* data = reinterpret_cast<uint16_t*>(m_pa_mask_tile_buffer->data());
+        for (std::size_t q = 0; q < query_size; ++q) {
+            uint16_t* row = data + q * block_size;
+            for (std::size_t k = 0; k < block_size; ++k) {
+                const auto k_abs = k_abs_start + k;
+                row[k] = (k_abs < past_lens) ? uint16_t{0x0000} : kF16NegInfBits;
+            }
+        }
+    } else {
+        OPENVINO_THROW("PagedLLMInferRequest::fill_mask_tile_for_cached_block: unsupported mask element type ",
+                       elem_type.get_type_name());
+    }
+}
+
+void PagedLLMInferRequest::fill_mask_tile_for_present(uint32_t new_tokens) {
+    if (!m_pa_mask_tile_buffer) {
+        OPENVINO_THROW("PagedLLMInferRequest::fill_mask_tile_for_present: mask buffer not allocated; "
+                       "call init_tile_loop_state() first.");
+    }
+    const auto shape = m_pa_mask_tile_buffer->get_shape();
+    NPUW_ASSERT(shape.size() == 4);
+    const auto query_size = shape[2];
+    const auto block_size = shape[3];
+
+    // For prefill, query_size matches the number of new tokens; for generate
+    // it is 1. Either way, valid (q, k) pairs in the present-K/V tile are
+    // those with k <= q AND k < new_tokens. q and k are 0-indexed within
+    // the new-token window — their absolute positions are
+    //   q_abs = past_lens + q,  k_abs = past_lens + k
+    // and the relation simplifies to k <= q since past_lens cancels.
+    const auto elem_type = m_pa_mask_tile_buffer->get_element_type();
+    if (elem_type == ov::element::f32) {
+        auto* data = m_pa_mask_tile_buffer->data<float>();
+        const float neg_inf = std::numeric_limits<float>::lowest();
+        for (std::size_t q = 0; q < query_size; ++q) {
+            float* row = data + q * block_size;
+            for (std::size_t k = 0; k < block_size; ++k) {
+                const bool valid = (k <= q) && (k < new_tokens);
+                row[k] = valid ? 0.0f : neg_inf;
+            }
+        }
+    } else if (elem_type == ov::element::f16) {
+        auto* data = reinterpret_cast<uint16_t*>(m_pa_mask_tile_buffer->data());
+        for (std::size_t q = 0; q < query_size; ++q) {
+            uint16_t* row = data + q * block_size;
+            for (std::size_t k = 0; k < block_size; ++k) {
+                const bool valid = (k <= q) && (k < new_tokens);
+                row[k] = valid ? uint16_t{0x0000} : kF16NegInfBits;
+            }
+        }
+    } else {
+        OPENVINO_THROW("PagedLLMInferRequest::fill_mask_tile_for_present: unsupported mask element type ",
+                       elem_type.get_type_name());
+    }
+}
+
 void PagedLLMInferRequest::run_paged_tile_loop_for_layer(std::size_t layer_idx,
                                                           ov::SoPtr<ov::ITensor> q_tile,
-                                                          ov::SoPtr<ov::ITensor> mask_tile,
+                                                          uint32_t past_lens,
+                                                          uint32_t new_tokens,
                                                           const int32_t* block_indices,
                                                           std::size_t num_active_blocks,
                                                           ov::SoPtr<ov::ITensor> present_key,
@@ -173,8 +266,13 @@ void PagedLLMInferRequest::run_paged_tile_loop_for_layer(std::size_t layer_idx,
         OPENVINO_THROW("PagedLLMInferRequest::run_paged_tile_loop_for_layer: PA NPU lowering not available "
                        "(setup_paged_runtime failed or tile sub-models not compiled).");
     }
-    if (!block_indices || num_active_blocks == 0) {
-        OPENVINO_THROW("PagedLLMInferRequest::run_paged_tile_loop_for_layer: block_indices is null or empty");
+    if (!block_indices && num_active_blocks > 0) {
+        OPENVINO_THROW("PagedLLMInferRequest::run_paged_tile_loop_for_layer: num_active_blocks > 0 but "
+                       "block_indices is null");
+    }
+    if (!m_pa_mask_tile_buffer) {
+        OPENVINO_THROW("PagedLLMInferRequest::run_paged_tile_loop_for_layer: mask buffer not allocated; "
+                       "call init_tile_loop_state() first.");
     }
 
     const auto& layer_managers = m_npuw_llm_compiled_model->m_pa_layer_managers;
@@ -197,40 +295,47 @@ void PagedLLMInferRequest::run_paged_tile_loop_for_layer(std::size_t layer_idx,
     const auto& tile_inputs = m_pa_tile_request->get_inputs();
     const auto& tile_outputs = m_pa_tile_request->get_outputs();
 
-    auto bind_input = [&](OnlineSoftmaxTileInputId id, const ov::SoPtr<ov::ITensor>& t) {
+    auto bind_tile_input = [&](OnlineSoftmaxTileInputId id, const ov::SoPtr<ov::ITensor>& t) {
         m_pa_tile_request->set_tensor(tile_inputs.at(static_cast<std::size_t>(id)), t);
     };
-    auto bind_output_to_state = [&](OnlineSoftmaxTileOutputId id, const ov::SoPtr<ov::ITensor>& state) {
+    auto bind_tile_output_to_state = [&](OnlineSoftmaxTileOutputId id, const ov::SoPtr<ov::ITensor>& state) {
         m_pa_tile_request->set_tensor(tile_outputs.at(static_cast<std::size_t>(id)), state);
     };
 
-    bind_input(OnlineSoftmaxTileInputId::Q, q_tile);
-    bind_input(OnlineSoftmaxTileInputId::MASK_TILE, mask_tile);
-    bind_input(OnlineSoftmaxTileInputId::PAST_ACC, m_pa_state_acc);
-    bind_input(OnlineSoftmaxTileInputId::PAST_MAX, m_pa_state_max);
-    bind_input(OnlineSoftmaxTileInputId::PAST_D, m_pa_state_d);
+    bind_tile_input(OnlineSoftmaxTileInputId::Q, q_tile);
+    bind_tile_input(OnlineSoftmaxTileInputId::MASK_TILE, m_pa_mask_tile_buffer);
+    bind_tile_input(OnlineSoftmaxTileInputId::PAST_ACC, m_pa_state_acc);
+    bind_tile_input(OnlineSoftmaxTileInputId::PAST_MAX, m_pa_state_max);
+    bind_tile_input(OnlineSoftmaxTileInputId::PAST_D, m_pa_state_d);
 
     // Bind outputs to the SAME state tensors. This makes the tile sub-model
     // write its updated (acc, max, d) directly into the state buffers, so
     // the next iteration's PAST_* inputs already hold the latest values.
     // Mirrors HFA's tile orchestrator in attn_subgraph.cpp:907-925.
-    bind_output_to_state(OnlineSoftmaxTileOutputId::ACC, m_pa_state_acc);
-    bind_output_to_state(OnlineSoftmaxTileOutputId::MAXX, m_pa_state_max);
-    bind_output_to_state(OnlineSoftmaxTileOutputId::D, m_pa_state_d);
+    bind_tile_output_to_state(OnlineSoftmaxTileOutputId::ACC, m_pa_state_acc);
+    bind_tile_output_to_state(OnlineSoftmaxTileOutputId::MAXX, m_pa_state_max);
+    bind_tile_output_to_state(OnlineSoftmaxTileOutputId::D, m_pa_state_d);
 
-    // Walk active blocks.
+    // Walk active blocks. For each logical block i, refill the mask tile
+    // (validity gate over the cached region) and bind the layer's K/V slice
+    // from the pool by physical id.
     for (std::size_t i = 0; i < num_active_blocks; ++i) {
+        fill_mask_tile_for_cached_block(past_lens, static_cast<uint32_t>(i));
+
         const auto phys_id = static_cast<uint32_t>(block_indices[i]);
         auto k_block = layer.key->get_block_tensor(phys_id);
         auto v_block = layer.value->get_block_tensor(phys_id);
-        bind_input(OnlineSoftmaxTileInputId::K_TILE, k_block);
-        bind_input(OnlineSoftmaxTileInputId::V_TILE, v_block);
+        bind_tile_input(OnlineSoftmaxTileInputId::K_TILE, k_block);
+        bind_tile_input(OnlineSoftmaxTileInputId::V_TILE, v_block);
         m_pa_tile_request->infer();
         // state_* tensors now hold this iter's (acc, max, d) — ready for next.
     }
 
-    // Final tile: present K/V (this token's new contribution) + acc/d
-    // division to produce the layer's attention output.
+    // Final tile: present K/V (this step's new contribution) + acc/d
+    // division to produce the layer's attention output. Mask switches from
+    // "cached-validity" to "causal-within-new-tokens".
+    fill_mask_tile_for_present(new_tokens);
+
     const auto& final_inputs = m_pa_final_tile_request->get_inputs();
     const auto& final_outputs = m_pa_final_tile_request->get_outputs();
     auto bind_final_input = [&](OnlineSoftmaxTileInputId id, const ov::SoPtr<ov::ITensor>& t) {
@@ -238,7 +343,7 @@ void PagedLLMInferRequest::run_paged_tile_loop_for_layer(std::size_t layer_idx,
     };
 
     bind_final_input(OnlineSoftmaxTileInputId::Q, q_tile);
-    bind_final_input(OnlineSoftmaxTileInputId::MASK_TILE, mask_tile);
+    bind_final_input(OnlineSoftmaxTileInputId::MASK_TILE, m_pa_mask_tile_buffer);
     bind_final_input(OnlineSoftmaxTileInputId::PAST_ACC, m_pa_state_acc);
     bind_final_input(OnlineSoftmaxTileInputId::PAST_MAX, m_pa_state_max);
     bind_final_input(OnlineSoftmaxTileInputId::PAST_D, m_pa_state_d);
