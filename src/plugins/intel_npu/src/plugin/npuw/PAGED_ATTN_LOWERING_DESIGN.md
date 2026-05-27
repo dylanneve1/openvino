@@ -251,20 +251,80 @@ The skeleton I committed (`paged_attn_to_hfa_tiles.{hpp,cpp}`) imagined an IR pa
 
 The skeleton should be removed in the next commit on this branch and replaced with the correct architecture's stub.
 
-## Concrete next commits (revised)
+## Implementation status (paged_attn_v3)
 
-1. **Refcount `KVCacheBlockManager`** (`acquire` / `release` / `refcount`). Self-contained.
-2. **Wire `LLMCompiledModel` to own per-layer `KVCacheBlockManager`s** when `m_pa_mode` is true. Pass shared handles to infer requests.
-3. **Add `function::PagedAttention` struct + `from()` factory.** Builds the two tile sub-models. Heavily cribs from `host_flash_attention.cpp`'s tile builder.
-4. **Compile + store tile sub-models** on `LLMCompiledModel` during `m_pa_mode` setup. Add a compile-flag gate `NPUW_LLM_PA_NPU_LOWERING` (default off until validated).
-5. **Replace the PA op execution path** in `PagedLLMInferRequest::infer_generate()` with the tile loop. Same shape as `attn_subgraph.cpp:1044-1085`.
-6. **Refactor mask tile slicing.** PA's mask is `[B_token, B_token]` causal; tiles see `[B_token, block_size]` slices. Reuse HFA's mask cache logic from `HFARuntimeContext`.
-7. **Remove PA-to-CPU auto-route** in `compiled_model.cpp:682-698` when `NPUW_LLM_PA_NPU_LOWERING` is on.
-8. **Refcount-aware `PrefixCacheManager`.** Hand out block IDs, bump refcount on hit, release on evict.
-9. **End-to-end test:** multi-turn, prefix hit reuses blocks, no recompute, NPU peak utilization > host fallback baseline.
-10. **Benchmarks:** TTFT cold, TTFT warm, tokens/sec, peak memory.
+| # | Description | Status | Commit |
+|---|---|---|---|
+| 1 | Refcount on `KVCacheBlockManager` | DONE | `3fda045c41` |
+| 2 | Per-layer pools owned by `LLMCompiledModel` | DONE | `9ac8eb1e48` |
+| 3a | `function::PagedAttention` struct + `from()` | DONE | `c198570999` |
+| 3b | Build tile sub-models via shared kernel | DONE | `0707ba7f9f` |
+| — | Rename `HFA*Tile*` → `OnlineSoftmaxTile*` | DONE | `f23724b308` |
+| — | Move tile builder to `online_softmax_tile.{hpp,cpp}` | DONE | `2a21adcbf8` |
+| 4 | Compile tile sub-models in PA mode | DONE | `f8d0ec94b3` |
+| 5b | `Function::_paged_attention` populated in partitioner | DONE | `4ae196f630` |
+| — | `compiled::PagedAttention` typed scaffold + put/get_compiled_pa | DONE | `c87a75ec2f` |
+| — | partition_stage hooks `f._paged_attention.has_value()` | DONE | this commit |
+| 8 | `KVBlock::PoolBlockRefs` for refcounted prefix cache | DONE | this commit |
+| 5c | **Real `BehaviorKind::Paged` runtime dispatch** | NOT DONE | needs runtime team |
+| 6 | Mask materialization helpers | RESERVED | will land inside 5c |
+| 7 | Remove CPU PA auto-route | NOT DONE | gated on 5c |
+| 9 | End-to-end test | NOT DONE | gated on 5c |
+| 10 | Benchmarks | NOT DONE | gated on 5c |
 
-Steps 1–7 deliver **PA on NPU with dynamic block growth**. Step 8 delivers prefix sharing. Steps 9–10 close out the milestone.
+**Build verification:** Jenkins build #4 (`a7c3628a`) compiled the tree clean
+on Windows in 14 minutes. Subsequent commits up to `c87a75ec2f` and the
+prefix-cache + design-doc additions in this commit await one more build
+to verify, but they only add code paths — none of the existing flow is
+mutated, so regression risk is low.
+
+## Open questions for the NPUW runtime team — Step 5c
+
+The dispatch in `attn/attn_subgraph.cpp` keys on `BehaviorKind` (`Dynamic`,
+`Pyramid`, `HFA`) and threads runtime state via `RuntimeState` /
+`HFARuntimeContext` / `BehaviorIO`. Adding a `BehaviorKind::Paged` case
+needs:
+
+1. **Selector parallel.** HFA uses `state.hfa_selector` to decide tile
+   counts and binding. PA needs an analogous selector that walks the
+   request's `block_indices` runtime input — likely `pa_selector` with
+   `num_active_blocks()` / `block_id(i)` accessors.
+2. **Mask cache.** `HFARuntimeContext::initialize_mask_cache()` slices
+   tiles from a contiguous attention mask. PA's mask is implicit in
+   `past_lens` / `subsequence_begins`; the cache needs a different
+   population path. The mask helpers prototyped on
+   `PagedLLMInferRequest` (and reverted for being misplaced) belong here.
+3. **State buffers.** HFA double-buffers `(acc, max, d)` for pipelining.
+   PA can reuse the existing `HFARuntimeContext` state-buffer machinery —
+   the tile sub-models share the same I/O contract via
+   `OnlineSoftmaxTileInputId`.
+4. **Layer correspondence.** HFA runs one tile loop per call. PA's
+   lowering iterates once **per layer** per call: the dispatch must walk
+   `m_pa_layer_managers` and bind a different K/V pool per layer. This is
+   the most non-trivial delta from HFA.
+5. **K/V write-back.** PA's contract requires the new tokens' K/V to be
+   written into the pool at the tail block before the next call. HFA has
+   no analogous step. The orchestrator must copy `present_key` /
+   `present_value` into the appropriate tail-block slot via
+   `KVCacheBlockManager::get_block_tensor()`.
+
+Each is a clear, scoped piece of integration. Together they're ~300
+lines that benefit from iterative compile-and-run feedback. The
+recommended next move is to pair with the `attn_subgraph.cpp` owner for
+a focused 1-week sprint.
+
+## Original ordered plan (kept for reference)
+
+1. Refcount `KVCacheBlockManager` ✓
+2. Per-layer pools on `LLMCompiledModel` ✓
+3. `function::PagedAttention` struct + `from()` ✓
+4. Compile tile sub-models ✓
+5. Replace PA op execution with tile loop (a-b done; **c pending**)
+6. Mask tile slicing (deferred into 5c)
+7. Remove PA-to-CPU auto-route (gated on 5c)
+8. Refcount-aware `PrefixCacheManager` ✓ (additive scaffold)
+9. End-to-end test
+10. Benchmarks
 
 ## Open questions for the NPUW team
 
