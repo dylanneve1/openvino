@@ -5,6 +5,8 @@
 #pragma once
 
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "compiled_model.hpp"
 #include "npuw_transformations/kv_axes_position.hpp"
@@ -12,6 +14,7 @@
 namespace ov {
 namespace npuw {
 
+class KVCacheBlockManager;
 class LLMInferRequest;
 class WhisperInferRequest;
 class BlockKVCacheExtension;
@@ -154,6 +157,25 @@ private:
     uint32_t m_pa_block_size = 32;
     uint32_t m_pa_num_blocks = 1024;
     uint32_t m_pa_max_seqs = 16;
+
+    // Per-layer K/V block pools for the NPU-resident PagedAttention lowering
+    // (see PAGED_ATTN_LOWERING_DESIGN.md). One entry per transformer layer,
+    // populated by setup_paged_block_managers() when m_pa_mode is true.
+    // Shared with PagedLLMInferRequest via the existing friend declaration.
+    struct PagedLayerManagers {
+        std::shared_ptr<KVCacheBlockManager> key;
+        std::shared_ptr<KVCacheBlockManager> value;
+    };
+    std::vector<PagedLayerManagers> m_pa_layer_managers;
+
+    // Discovers key_cache.N / value_cache.N Parameters on the given model
+    // (left there by SDPAToPagedAttention + BakePagedAttentionStaticShapes)
+    // and constructs one KVCacheBlockManager pair per layer. Safe to call
+    // multiple times — repopulates m_pa_layer_managers. No-op when
+    // m_pa_mode is false.
+    void setup_paged_block_managers(const std::shared_ptr<ov::Model>& shape_source_model,
+                                    const std::shared_ptr<const ov::IPlugin>& plugin,
+                                    const std::string& device);
 };
 
 }  // namespace npuw
