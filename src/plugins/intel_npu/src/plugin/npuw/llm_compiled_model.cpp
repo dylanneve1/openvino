@@ -7,6 +7,7 @@
 #include "embedding/prepare_embedding_model.hpp"
 #include "embedding/redirect_new_kv_to_output.hpp"
 #include "embedding/remove_empty_kv_inputs.hpp"
+#include "kv_cache_block_manager.hpp"
 #include "llm_compiled_model_utils.hpp"
 #include "llm_infer_request.hpp"
 #include "paged_llm_infer_request.hpp"
@@ -955,6 +956,15 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
                                                  m_pa_max_seqs,
                                                  m_kvcache_desc.max_prompt_size)
             .run_on_model(prefill_model);
+
+        // With static-shape key_cache.N / value_cache.N now in the model,
+        // construct one KVCacheBlockManager pair per layer. The managers
+        // own block IDs and (lazily) per-block tensor storage; they will be
+        // consumed by PagedLLMInferRequest once the NPU-side PA lowering
+        // (function::PagedAttention) is in place — see
+        // PAGED_ATTN_LOWERING_DESIGN.md. No memory is allocated here:
+        // allocate_block() is what triggers per-block allocMem.
+        setup_paged_block_managers(prefill_model, plugin, /*device=*/"NPU");
     } else if (m_use_chunk_prefill) {
         ov::npuw::ReshapeToStatic(static_cast<uint32_t>(m_prefill_chunk_size),
                                   m_kvcache_desc.max_prompt_size,
@@ -1740,4 +1750,126 @@ void ov::npuw::LLMCompiledModel::implement_properties() {
                           BIND(npuw::eagle::enabled, NPUW_EAGLE, get),
                           BIND(npuw::text_embed::enabled, NPUW_TEXT_EMBED, get)});
 #undef BIND
+}
+
+namespace {
+// Parse "<prefix>N" → N. Returns std::nullopt if `name` doesn't start with
+// `prefix` or the suffix isn't a non-empty run of decimal digits.
+std::optional<uint32_t> parse_indexed_name(const std::string& name, const std::string& prefix) {
+    if (name.rfind(prefix, 0) != 0) {
+        return std::nullopt;
+    }
+    const auto tail = name.substr(prefix.size());
+    if (tail.empty()) {
+        return std::nullopt;
+    }
+    for (char c : tail) {
+        if (c < '0' || c > '9') {
+            return std::nullopt;
+        }
+    }
+    return static_cast<uint32_t>(std::stoul(tail));
+}
+
+// Walk Parameter friendly + tensor names looking for "<prefix>N". Returns the
+// first numeric index found, or std::nullopt.
+std::optional<uint32_t> match_indexed_param(const std::shared_ptr<ov::op::v0::Parameter>& p,
+                                            const std::string& prefix) {
+    if (auto idx = parse_indexed_name(p->get_friendly_name(), prefix)) {
+        return idx;
+    }
+    for (const auto& n : p->get_output_tensor(0).get_names()) {
+        if (auto idx = parse_indexed_name(n, prefix)) {
+            return idx;
+        }
+    }
+    return std::nullopt;
+}
+}  // namespace
+
+void ov::npuw::LLMCompiledModel::setup_paged_block_managers(
+    const std::shared_ptr<ov::Model>& shape_source_model,
+    const std::shared_ptr<const ov::IPlugin>& plugin,
+    const std::string& device) {
+    m_pa_layer_managers.clear();
+    if (!m_pa_mode) {
+        return;
+    }
+    if (!shape_source_model) {
+        LOG_WARN("setup_paged_block_managers: shape source model is null; skipping.");
+        return;
+    }
+
+    // Collect key_cache.N / value_cache.N Parameters, keyed by N. After
+    // SDPAToPagedAttention + BakePagedAttentionStaticShapes, each PA op's
+    // K/V cache is a Parameter of shape [num_blocks, Hk, block_size, S]
+    // named key_cache.N / value_cache.N where N is the layer index.
+    std::map<uint32_t, std::shared_ptr<ov::op::v0::Parameter>> key_params;
+    std::map<uint32_t, std::shared_ptr<ov::op::v0::Parameter>> value_params;
+
+    for (const auto& p : shape_source_model->get_parameters()) {
+        if (auto idx = match_indexed_param(p, "key_cache.")) {
+            key_params[*idx] = p;
+        } else if (auto idx = match_indexed_param(p, "value_cache.")) {
+            value_params[*idx] = p;
+        }
+    }
+
+    if (key_params.empty() && value_params.empty()) {
+        LOG_WARN("setup_paged_block_managers: no key_cache./value_cache. Parameters found on model '"
+                 << shape_source_model->get_friendly_name() << "'. PA layer managers will be empty.");
+        return;
+    }
+    if (key_params.size() != value_params.size()) {
+        LOG_WARN("setup_paged_block_managers: K/V Parameter count mismatch (K=" << key_params.size()
+                                                                                  << " V=" << value_params.size()
+                                                                                  << "); proceeding with the larger set.");
+    }
+
+    // Per-block shape: take the pool shape [num_blocks, Hk, block_size, S]
+    // and pin the leading dim to 1. KVCacheBlockManager's base_shape contract
+    // is "shape of one block" — see its assertion at construction time.
+    auto per_block_shape = [](const ov::Shape& pool_shape) -> ov::Shape {
+        ov::Shape per_block = pool_shape;
+        if (!per_block.empty()) {
+            per_block[0] = 1;
+        }
+        return per_block;
+    };
+
+    const uint32_t num_layers =
+        static_cast<uint32_t>(std::max(key_params.size(), value_params.size()));
+    m_pa_layer_managers.reserve(num_layers);
+
+    auto build_one = [&](const std::shared_ptr<ov::op::v0::Parameter>& p) -> std::shared_ptr<KVCacheBlockManager> {
+        if (!p) {
+            return nullptr;
+        }
+        if (!p->get_partial_shape().is_static()) {
+            LOG_WARN("setup_paged_block_managers: parameter '" << p->get_friendly_name()
+                                                               << "' has dynamic shape; skipping its layer.");
+            return nullptr;
+        }
+        return std::make_shared<KVCacheBlockManager>(m_pa_block_size,
+                                                     m_pa_num_blocks,
+                                                     per_block_shape(p->get_shape()),
+                                                     p->get_element_type(),
+                                                     device,
+                                                     plugin);
+    };
+
+    for (uint32_t layer = 0; layer < num_layers; ++layer) {
+        PagedLayerManagers mgrs;
+        if (auto kit = key_params.find(layer); kit != key_params.end()) {
+            mgrs.key = build_one(kit->second);
+        }
+        if (auto vit = value_params.find(layer); vit != value_params.end()) {
+            mgrs.value = build_one(vit->second);
+        }
+        m_pa_layer_managers.push_back(std::move(mgrs));
+    }
+
+    LOG_INFO("setup_paged_block_managers: constructed "
+             << m_pa_layer_managers.size() << " layer pool(s); block_size=" << m_pa_block_size
+             << " num_blocks=" << m_pa_num_blocks << " device=" << device);
 }
