@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 
+#include "online_softmax_tile.hpp"  // OnlineSoftmaxTileInputId / OnlineSoftmaxTileOutputId
 #include "openvino/core/except.hpp"
 #include "openvino/openvino.hpp"
 #include "openvino/runtime/isync_infer_request.hpp"
@@ -16,69 +17,6 @@
 
 namespace ov {
 namespace npuw {
-
-// HFA Tile Model input tensor identifiers
-// Represents the input layout for Host Flash Attention tile models
-// Input names: [past_acc, past_max, past_d, k_tile, v_tile, q, mask_tile]
-enum class OnlineSoftmaxTileInputId : uint8_t {
-    PAST_ACC = 0,   // Accumulated attention output from previous tiles
-    PAST_MAX = 1,   // Maximum values from previous tiles (for numerical stability)
-    PAST_D = 2,     // Normalization denominator from previous tiles
-    K_TILE = 3,     // Current K (key) tile slice
-    V_TILE = 4,     // Current V (value) tile slice
-    Q = 5,          // Query tensor (full, not tiled)
-    MASK_TILE = 6,  // Current attention mask tile slice
-
-    // Sentinel value for enum range
-    COUNT
-};
-
-// HFA Regular Tile Model output tensor identifiers
-// Represents the output layout for regular (non-final) tile models
-// Output names: [acc, maxx, d]
-enum class OnlineSoftmaxTileOutputId : uint8_t {
-    ACC = 0,   // Accumulated attention output
-    MAXX = 1,  // Maximum values for numerical stability
-    D = 2,     // Normalization denominator
-
-    // Sentinel value for enum range
-    COUNT
-};
-
-// Helper functions to convert enum values to string representations for logging/debugging
-inline const char* online_softmax_tile_input_id_to_string(OnlineSoftmaxTileInputId id) {
-    switch (id) {
-    case OnlineSoftmaxTileInputId::PAST_ACC:
-        return "PAST_ACC";
-    case OnlineSoftmaxTileInputId::PAST_MAX:
-        return "PAST_MAX";
-    case OnlineSoftmaxTileInputId::PAST_D:
-        return "PAST_D";
-    case OnlineSoftmaxTileInputId::K_TILE:
-        return "K_TILE";
-    case OnlineSoftmaxTileInputId::V_TILE:
-        return "V_TILE";
-    case OnlineSoftmaxTileInputId::Q:
-        return "Q";
-    case OnlineSoftmaxTileInputId::MASK_TILE:
-        return "MASK_TILE";
-    default:
-        return "UNKNOWN";
-    }
-}
-
-inline const char* online_softmax_tile_output_id_to_string(OnlineSoftmaxTileOutputId id) {
-    switch (id) {
-    case OnlineSoftmaxTileOutputId::ACC:
-        return "ACC";
-    case OnlineSoftmaxTileOutputId::MAXX:
-        return "MAXX";
-    case OnlineSoftmaxTileOutputId::D:
-        return "D";
-    default:
-        return "UNKNOWN";
-    }
-}
 
 namespace function {
 
@@ -141,34 +79,6 @@ struct HostFlashAttention {
     static std::optional<HostFlashAttention> from(const std::shared_ptr<ov::Model>& model,
                                                   bool fused_flash_attention = true);
 };
-
-// Build a tile sub-model that performs one iteration of FlashAttention's
-// online-softmax loop. Exposed so it can be reused by the PagedAttention
-// NPU lowering (paged_attn_runtime.cpp) — the tile body is identical
-// between HFA's SDPA path and PA's block-table path; only the runtime
-// orchestrator that feeds it differs.
-//
-// Inputs (declared in this order on the returned model):
-//   0 past_acc   [batch, num_heads, seq_len, head_dim]
-//   1 past_max   [batch, num_heads, seq_len, 1]
-//   2 past_d     [batch, num_heads, seq_len, 1]
-//   3 k_tile     [batch, kv_num_heads, tile_size, head_dim]
-//   4 v_tile     [batch, kv_num_heads, head_dim, tile_size]
-//   5 q          [batch, num_heads, seq_len, head_dim]
-//   6 mask_tile  [batch, 1, seq_len, tile_size]
-//
-// Outputs for is_final_tile=false: {acc, maxx, d}
-// Output  for is_final_tile=true : {output} (acc/d divided, transposed,
-//                                    reshaped to [batch, seq_len, num_heads*head_dim],
-//                                    cast to output_dtype)
-std::shared_ptr<ov::Model> create_online_softmax_tile_model(const ov::Shape& q_shape,
-                                                 const ov::element::Type& input_dtype,
-                                                 const ov::element::Type& mask_dtype,
-                                                 int64_t tile_size,
-                                                 size_t kv_num_heads,
-                                                 bool is_final_tile = false,
-                                                 bool fused_flash_attention = false,
-                                                 const ov::element::Type& output_dtype = ov::element::f16);
 
 }  // namespace function
 

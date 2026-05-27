@@ -9,7 +9,7 @@
 #include <memory>
 #include <optional>
 
-#include "host_flash_attention.hpp"  // for OnlineSoftmaxTileInputId / OnlineSoftmaxTileOutputId
+#include "online_softmax_tile.hpp"  // for OnlineSoftmaxTileInputId / OnlineSoftmaxTileOutputId
 #include "openvino/core/model.hpp"
 
 namespace ov {
