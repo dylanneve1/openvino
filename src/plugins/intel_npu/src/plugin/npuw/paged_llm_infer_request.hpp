@@ -7,8 +7,10 @@
 #include <memory>
 #include <vector>
 
+#include "kv_cache_block_manager.hpp"
 #include "llm_compiled_model.hpp"
 #include "llm_infer_base_request.hpp"
+#include "online_softmax_tile.hpp"
 #include "openvino/core/descriptor/output.hpp"
 
 namespace ov {
@@ -65,6 +67,58 @@ private:
     bool m_first_infer = true;
 
     std::string m_input_ids_name;
+
+    // ------------------------------------------------------------------
+    // PA NPU-resident tile-loop state (Step 5a)
+    //
+    // When the LLM was compiled with m_pa_mode = true AND
+    // LLMCompiledModel::setup_paged_runtime() successfully built + compiled
+    // the tile sub-models, the following members hold the per-iteration
+    // tile infer-requests plus the persistent (acc, max, d) state tensors
+    // threaded between iterations.
+    //
+    // These are NOT yet plumbed into the main infer() path — wiring the
+    // tile loop into prefill/generate execution requires NPUW partitioning
+    // to route the PA op's subgraph away from the CPU fallback into this
+    // runtime path. That is Step 5b/c. For now, the helpers below are
+    // building blocks ready for that integration and exercise paths for
+    // testing.
+    //
+    // pa_tile_loop_available() tells the caller whether the lowering is
+    // ready to take over.
+    bool pa_tile_loop_available() const;
+
+    // Initialise (acc, max, d) state tensors for a fresh tile-loop pass.
+    // acc → 0, max → very-negative, d → 0. State shape matches the tile
+    // sub-model's past_acc / past_max / past_d parameter layout.
+    void init_tile_loop_state();
+
+    // Run the tile loop for one layer's worth of K/V over the active
+    // blocks indicated by block_indices[0..num_active_blocks). Threads
+    // (acc, max, d) state between iterations via the existing state
+    // tensors. layer_idx selects which KVCacheBlockManager pair in
+    // m_compiled_model->m_pa_layer_managers to source K/V from.
+    //
+    // This is the per-layer attention compute the partitioning-level
+    // wiring (Step 5b) will invoke in place of the PA op's CPU execution.
+    void run_paged_tile_loop_for_layer(std::size_t layer_idx,
+                                       ov::SoPtr<ov::ITensor> q_tile,
+                                       ov::SoPtr<ov::ITensor> mask_tile,
+                                       const int32_t* block_indices,
+                                       std::size_t num_active_blocks,
+                                       ov::SoPtr<ov::ITensor> present_key,
+                                       ov::SoPtr<ov::ITensor> present_value,
+                                       ov::SoPtr<ov::ITensor> attention_output);
+
+    std::shared_ptr<ov::IAsyncInferRequest> m_pa_tile_request;
+    std::shared_ptr<ov::IAsyncInferRequest> m_pa_final_tile_request;
+
+    // Per-iteration state tensors. Same shape as the tile sub-model's
+    // past_acc / past_max / past_d inputs. Allocated lazily on first
+    // init_tile_loop_state() call.
+    ov::SoPtr<ov::ITensor> m_pa_state_acc;
+    ov::SoPtr<ov::ITensor> m_pa_state_max;
+    ov::SoPtr<ov::ITensor> m_pa_state_d;
 };
 
 }  // namespace npuw
