@@ -142,6 +142,34 @@ struct HostFlashAttention {
                                                   bool fused_flash_attention = true);
 };
 
+// Build a tile sub-model that performs one iteration of FlashAttention's
+// online-softmax loop. Exposed so it can be reused by the PagedAttention
+// NPU lowering (paged_attn_runtime.cpp) — the tile body is identical
+// between HFA's SDPA path and PA's block-table path; only the runtime
+// orchestrator that feeds it differs.
+//
+// Inputs (declared in this order on the returned model):
+//   0 past_acc   [batch, num_heads, seq_len, head_dim]
+//   1 past_max   [batch, num_heads, seq_len, 1]
+//   2 past_d     [batch, num_heads, seq_len, 1]
+//   3 k_tile     [batch, kv_num_heads, tile_size, head_dim]
+//   4 v_tile     [batch, kv_num_heads, head_dim, tile_size]
+//   5 q          [batch, num_heads, seq_len, head_dim]
+//   6 mask_tile  [batch, 1, seq_len, tile_size]
+//
+// Outputs for is_final_tile=false: {acc, maxx, d}
+// Output  for is_final_tile=true : {output} (acc/d divided, transposed,
+//                                    reshaped to [batch, seq_len, num_heads*head_dim],
+//                                    cast to output_dtype)
+std::shared_ptr<ov::Model> create_hfa_tile_model(const ov::Shape& q_shape,
+                                                 const ov::element::Type& input_dtype,
+                                                 const ov::element::Type& mask_dtype,
+                                                 int64_t tile_size,
+                                                 size_t kv_num_heads,
+                                                 bool is_final_tile = false,
+                                                 bool fused_flash_attention = false,
+                                                 const ov::element::Type& output_dtype = ov::element::f16);
+
 }  // namespace function
 
 namespace compiled {
