@@ -1269,6 +1269,16 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     m_prefill_compiled = m_compiled_model_factory(prefill_model, plugin, prefill_config);
     NPUW_ASSERT(m_prefill_compiled && "Can't create ov::npuw::CompiledModel for passed prefill "
                                       "model and its config, please check passed config.");
+
+    // Build + compile the PA online-softmax tile sub-models for the NPU-resident
+    // lowering. Done after prefill_config is finalized so the tile sub-models
+    // inherit consistent compile settings (precision, ATTN options, etc.).
+    // The tile body is a small flat graph; partitioning hints in prefill_config
+    // are effectively no-ops on it, but the NPUW_DEVICES / NPUW_FUNCALL_FOR_ALL
+    // / precision settings DO apply. Falls back silently when m_pa_mode is
+    // false or tile-model construction declines (e.g., upstream PA already
+    // baked in an unsupported configuration).
+    setup_paged_runtime(prefill_model, plugin, prefill_config);
     if (lm_head_model) {
         auto lm_head_config = get_default_lm_head_config(npudesc);
         merge_config_with(lm_head_config, other_props);
@@ -1862,4 +1872,59 @@ void ov::npuw::LLMCompiledModel::setup_paged_block_managers(
     LOG_INFO("setup_paged_block_managers: constructed "
              << m_pa_layer_managers.size() << " layer pool(s); block_size=" << m_pa_block_size
              << " num_blocks=" << m_pa_num_blocks << " device=" << device);
+}
+
+void ov::npuw::LLMCompiledModel::setup_paged_runtime(const std::shared_ptr<ov::Model>& shape_source_model,
+                                                     const std::shared_ptr<const ov::IPlugin>& plugin,
+                                                     const ov::AnyMap& tile_compile_config) {
+    m_pa_runtime.reset();
+    m_pa_tile_compiled.reset();
+    m_pa_final_tile_compiled.reset();
+
+    if (!m_pa_mode) {
+        return;
+    }
+    if (!shape_source_model) {
+        LOG_WARN("setup_paged_runtime: shape source model is null; skipping.");
+        return;
+    }
+
+    auto pa = ov::npuw::function::PagedAttention::from(shape_source_model);
+    if (!pa) {
+        LOG_DEBUG("setup_paged_runtime: PagedAttention::from() declined — no compatible PA op on '"
+                  << shape_source_model->get_friendly_name() << "'.");
+        return;
+    }
+
+    // Record the extracted config regardless of tile-model validity, so the
+    // infer request can introspect num_blocks / block_size / head dims for
+    // its block-table bookkeeping even when tile lowering is unavailable.
+    m_pa_runtime = std::move(*pa);
+
+    if (!m_pa_runtime->is_valid()) {
+        LOG_INFO("setup_paged_runtime: PA config extracted but tile sub-models not built. "
+                 "CPU PA fallback remains in effect.");
+        return;
+    }
+
+    try {
+        LOG_INFO("setup_paged_runtime: compiling PA online-softmax tile sub-models.");
+        m_pa_tile_compiled =
+            m_compiled_model_factory(m_pa_runtime->_tile_model, plugin, tile_compile_config);
+        m_pa_final_tile_compiled =
+            m_compiled_model_factory(m_pa_runtime->_final_tile_model, plugin, tile_compile_config);
+        if (!m_pa_tile_compiled || !m_pa_final_tile_compiled) {
+            LOG_WARN("setup_paged_runtime: compiled tile handle is null after factory call; "
+                     "falling back to CPU PA execution.");
+            m_pa_tile_compiled.reset();
+            m_pa_final_tile_compiled.reset();
+            return;
+        }
+        LOG_INFO("setup_paged_runtime: PA tile sub-models compiled successfully.");
+    } catch (const std::exception& e) {
+        LOG_WARN("setup_paged_runtime: tile sub-model compilation threw: "
+                 << e.what() << ". Falling back to CPU PA execution.");
+        m_pa_tile_compiled.reset();
+        m_pa_final_tile_compiled.reset();
+    }
 }
