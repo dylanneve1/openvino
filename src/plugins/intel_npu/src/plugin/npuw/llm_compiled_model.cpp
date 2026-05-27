@@ -860,16 +860,17 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     } else {
         LOG_DEBUG("Adding position_ids input in case it doesn't exist in model: LFM-2 case.");
         ov::npuw::AddPositionIdsParam().run_on_model(kvcache_model);
-        LOG_DEBUG("Transform kvcache model from stateful to stateless.");
-        ov::pass::StatefulToStateless().run_on_model(kvcache_model);
     }
-
-    ov::npuw::LoraStatefulToStatelessPass().run_on_model(kvcache_model);
 
     // Paged Attention path: detect upstream application (GenAI's
     // ContinuousBatchingPipeline runs SDPAToPagedAttention itself before
     // core.compile_model), and apply the pass here for LLMPipeline / direct
     // compile_model callers when either hint is PAGED.
+    //
+    // ORDER MATTERS: SDPAToPagedAttention requires the model to still be
+    // stateful (it reads the Variables that represent the KV cache). It
+    // MUST run BEFORE StatefulToStateless. The non-PA path keeps the old
+    // ordering — StatefulToStateless first, then no PA.
     {
         const auto pf_attn_hint = m_cfg.get<::intel_npu::NPUW_LLM_PREFILL_ATTENTION_HINT>();
         const auto gn_attn_hint = m_cfg.get<::intel_npu::NPUW_LLM_GENERATE_ATTENTION_HINT>();
@@ -894,12 +895,19 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
                 .run_on_model(kvcache_model);
             m_pa_already_applied = true;
         }
+    }
 
-        if (m_pa_mode) {
-            m_pa_block_size = m_cfg.get<::intel_npu::NPUW_ATTN_PAGED_BLOCK_SIZE>();
-            m_pa_num_blocks = m_cfg.get<::intel_npu::NPUW_ATTN_PAGED_NUM_BLOCKS>();
-            m_pa_max_seqs = m_cfg.get<::intel_npu::NPUW_ATTN_PAGED_MAX_SEQS>();
-        }
+    if (!m_is_embedding) {
+        LOG_DEBUG("Transform kvcache model from stateful to stateless.");
+        ov::pass::StatefulToStateless().run_on_model(kvcache_model);
+    }
+
+    ov::npuw::LoraStatefulToStatelessPass().run_on_model(kvcache_model);
+
+    if (m_pa_mode) {
+        m_pa_block_size = m_cfg.get<::intel_npu::NPUW_ATTN_PAGED_BLOCK_SIZE>();
+        m_pa_num_blocks = m_cfg.get<::intel_npu::NPUW_ATTN_PAGED_NUM_BLOCKS>();
+        m_pa_max_seqs = m_cfg.get<::intel_npu::NPUW_ATTN_PAGED_MAX_SEQS>();
     }
 
     LOG_DEBUG("   ...also convert BF16 to FP16");
