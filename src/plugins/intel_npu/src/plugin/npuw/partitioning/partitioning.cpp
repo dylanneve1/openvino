@@ -2102,15 +2102,39 @@ void Partitioner::attention(const std::string& func_name) {
     }
 
     // Try PAGED (Paged Attention)
-    // Unlike HFA/Pyramid, paged attention does not transform the subgraph
-    // structure — the PagedAttentionExtension op already encapsulates the full
-    // attention computation. The partitioning step only needs to leave the
-    // model unchanged and let the subgraph be routed to NPUW_ATTN_DEVICE
-    // (default CPU) via the per-submodel device override. No Function variant
-    // is populated for now; the matcher tagging in attn_subgraph.cpp does the
-    // isolation work.
+    // PagedAttention has two execution modes on NPUW:
+    //
+    //   1. CPU fallback (default).  The PagedAttentionExtension op is left
+    //      intact in the subgraph and the per-submodel device override
+    //      routes the subgraph to NPUW_ATTN_DEVICE (default CPU). The
+    //      matcher tagging in attn_subgraph.cpp does the isolation work;
+    //      no Function variant is populated.
+    //
+    //   2. NPU-resident lowering (opt-in via NPUW_ATTN_PAGED_NPU_LOWERING).
+    //      We populate Function::_paged_attention with the extracted PA
+    //      config + compiled online-softmax tile sub-models. The runtime
+    //      orchestrator (paged_llm_infer_request) consumes that to drive
+    //      the per-block tile loop on NPU in place of the CPU op. While
+    //      the runtime hook is incremental, populating _paged_attention is
+    //      side-effect-free — it makes the lowering available without
+    //      altering the CPU-fallback path.
     if (attn_mode == "PAGED") {
-        LOG_VERB("Done - PAGED attention (subgraph isolated, no structural rewrite)");
+        const bool npu_lowering_opt_in = cfg.get<::intel_npu::NPUW_ATTN_PAGED_NPU_LOWERING>();
+        if (npu_lowering_opt_in) {
+            LOG_DEBUG("Attempting PagedAttention NPU lowering based on config");
+            f._paged_attention = ov::npuw::function::PagedAttention::from(f._model);
+            if (f._paged_attention && f._paged_attention->is_valid()) {
+                LOG_VERB("Done - PAGED attention (NPU lowering populated, tile sub-models ready)");
+            } else if (f._paged_attention) {
+                LOG_INFO("PAGED attention: from() returned config but tile sub-models not built; "
+                          "lowering inactive, CPU fallback remains in effect.");
+            } else {
+                LOG_INFO("PAGED attention: from() declined; no compatible PA op on this subgraph. "
+                          "CPU fallback remains in effect.");
+            }
+        } else {
+            LOG_VERB("Done - PAGED attention (subgraph isolated, NPU lowering opt-out, CPU fallback active)");
+        }
         return;
     }
 }
