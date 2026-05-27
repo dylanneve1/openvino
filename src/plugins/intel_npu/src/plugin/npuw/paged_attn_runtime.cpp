@@ -52,6 +52,32 @@ const char* pa_input_id_to_string(PAInputId id) {
 namespace function {
 
 namespace {
+const PagedAttentionPartitionerContext* g_pa_ctx = nullptr;
+}  // namespace
+
+const PagedAttentionPartitionerContext* current_pa_partitioner_context() {
+    return g_pa_ctx;
+}
+
+PagedAttentionPartitionerScope::PagedAttentionPartitionerScope(
+    std::vector<std::shared_ptr<KVCacheBlockManager>> key_managers,
+    std::vector<std::shared_ptr<KVCacheBlockManager>> value_managers,
+    ov::SoPtr<ov::ICompiledModel> compiled_tile_model,
+    ov::SoPtr<ov::ICompiledModel> compiled_final_tile_model) {
+    static thread_local PagedAttentionPartitionerContext storage;
+    storage.key_managers = std::move(key_managers);
+    storage.value_managers = std::move(value_managers);
+    storage.compiled_tile_model = std::move(compiled_tile_model);
+    storage.compiled_final_tile_model = std::move(compiled_final_tile_model);
+    g_pa_ctx = &storage;
+}
+
+PagedAttentionPartitionerScope::~PagedAttentionPartitionerScope() {
+    g_pa_ctx = nullptr;
+}
+
+
+namespace {
 
 // Find the index of `node` in `model->get_parameters()`. Returns nullopt if
 // `node` is not a Parameter or not on the model.
@@ -137,6 +163,46 @@ std::optional<PagedAttention> PagedAttention::from(const std::shared_ptr<ov::Mod
     out._num_kv_heads = key_cache_shape[1];
     out._block_size = static_cast<int64_t>(key_cache_shape[2]);
     out._head_size = key_cache_shape[3];
+
+    // Parse the layer index out of the KEY_CACHE Parameter's friendly name
+    // / tensor names (SDPAToPagedAttention names them "key_cache.N"). The
+    // LLM runtime uses _layer_index to pick the right
+    // KVCacheBlockManager pair from m_pa_layer_managers.
+    const auto key_cache_node = pa->get_input_node_shared_ptr(static_cast<std::size_t>(PAInputId::KEY_CACHE));
+    auto extract_layer_index = [](const std::shared_ptr<ov::Node>& node) -> std::optional<std::size_t> {
+        const std::string prefix = "key_cache.";
+        auto try_parse = [&prefix](const std::string& name) -> std::optional<std::size_t> {
+            if (name.rfind(prefix, 0) != 0) {
+                return std::nullopt;
+            }
+            const auto tail = name.substr(prefix.size());
+            if (tail.empty()) {
+                return std::nullopt;
+            }
+            for (char c : tail) {
+                if (c < '0' || c > '9') {
+                    return std::nullopt;
+                }
+            }
+            return static_cast<std::size_t>(std::stoul(tail));
+        };
+        if (auto idx = try_parse(node->get_friendly_name())) {
+            return idx;
+        }
+        for (const auto& n : node->get_output_tensor(0).get_names()) {
+            if (auto idx = try_parse(n)) {
+                return idx;
+            }
+        }
+        return std::nullopt;
+    };
+    if (auto layer_idx = extract_layer_index(key_cache_node)) {
+        out._layer_index = *layer_idx;
+    } else {
+        LOG_WARN("function::PagedAttention::from: could not parse layer index from KEY_CACHE name '"
+                 << key_cache_node->get_friendly_name()
+                 << "'. _layer_index defaults to 0; multi-layer pool selection will be wrong.");
+    }
 
     // Number of query heads from QUERY: [B_token, H * S].
     const auto& q_pshape = pa->get_input_partial_shape(static_cast<std::size_t>(PAInputId::QUERY));

@@ -1284,22 +1284,43 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         }
     }
 
+    // Build + compile the PA online-softmax tile sub-models for the NPU-resident
+    // lowering BEFORE any prefill / generate compile. Both compile paths trigger
+    // the partitioner; the attn_subgraph partition_stage hook reads the compiled
+    // tile handles off Function::_paged_attention to populate the runtime
+    // dispatch's compiled::PagedAttention scaffold. If we ran the tile compile
+    // afterwards, those handles would be null at the moment the hook fires,
+    // breaking the runtime path. The tile sub-models are tiny flat graphs and
+    // share the prefill_config's NPUW_DEVICES / precision settings.
+    //
+    // We also set up a process-wide PagedAttentionPartitionerScope here so the
+    // partition_stage hook can populate compiled::PagedAttention's per-layer
+    // KV manager vectors from this LLMCompiledModel's m_pa_layer_managers.
+    // RAII scope is held across BOTH the generate and prefill compiles.
+    setup_paged_runtime(prefill_model, plugin, prefill_config);
+
+    std::optional<ov::npuw::function::PagedAttentionPartitionerScope> pa_partitioner_scope;
+    if (m_pa_mode && !m_pa_layer_managers.empty() && m_pa_tile_compiled && m_pa_final_tile_compiled) {
+        std::vector<std::shared_ptr<ov::npuw::KVCacheBlockManager>> key_mgrs;
+        std::vector<std::shared_ptr<ov::npuw::KVCacheBlockManager>> value_mgrs;
+        key_mgrs.reserve(m_pa_layer_managers.size());
+        value_mgrs.reserve(m_pa_layer_managers.size());
+        for (const auto& layer : m_pa_layer_managers) {
+            key_mgrs.push_back(layer.key);
+            value_mgrs.push_back(layer.value);
+        }
+        pa_partitioner_scope.emplace(std::move(key_mgrs),
+                                     std::move(value_mgrs),
+                                     ov::SoPtr<ov::ICompiledModel>(m_pa_tile_compiled, nullptr),
+                                     ov::SoPtr<ov::ICompiledModel>(m_pa_final_tile_compiled, nullptr));
+    }
+
     // Compile multiple generate model variants with different sizes
     compile_generate_model_variants(generate_model_variants, plugin, generate_config);
 
     m_prefill_compiled = m_compiled_model_factory(prefill_model, plugin, prefill_config);
     NPUW_ASSERT(m_prefill_compiled && "Can't create ov::npuw::CompiledModel for passed prefill "
                                       "model and its config, please check passed config.");
-
-    // Build + compile the PA online-softmax tile sub-models for the NPU-resident
-    // lowering. Done after prefill_config is finalized so the tile sub-models
-    // inherit consistent compile settings (precision, ATTN options, etc.).
-    // The tile body is a small flat graph; partitioning hints in prefill_config
-    // are effectively no-ops on it, but the NPUW_DEVICES / NPUW_FUNCALL_FOR_ALL
-    // / precision settings DO apply. Falls back silently when m_pa_mode is
-    // false or tile-model construction declines (e.g., upstream PA already
-    // baked in an unsupported configuration).
-    setup_paged_runtime(prefill_model, plugin, prefill_config);
     if (lm_head_model) {
         auto lm_head_config = get_default_lm_head_config(npudesc);
         merge_config_with(lm_head_config, other_props);

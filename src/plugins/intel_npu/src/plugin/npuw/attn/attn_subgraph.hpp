@@ -26,12 +26,7 @@ struct SubmodelDeserializeCtx;
 }  // namespace s11n
 namespace attn {
 
-// PA does NOT yet have its own BehaviorKind value — the runtime dispatch
-// path (Step 5c) is not yet implemented. compiled::PagedAttention exists
-// as a typed scaffold (see paged_attn_runtime.hpp) and can be stashed in
-// the subgraph context via put_compiled_pa for the future dispatch to
-// retrieve, but no switch case keys on it today.
-enum class BehaviorKind { Dynamic, Pyramid, HFA };
+enum class BehaviorKind { Dynamic, Pyramid, HFA, Paged };
 
 using CompiledDynamicState = std::shared_ptr<ov::npuw::compiled::Attention>;
 using CompiledPyramidState = std::shared_ptr<ov::npuw::compiled::PyramidAttention>;

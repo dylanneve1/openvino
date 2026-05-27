@@ -9,6 +9,7 @@
 #include <memory>
 #include <optional>
 
+#include "kv_cache_block_manager.hpp"
 #include "online_softmax_tile.hpp"  // for OnlineSoftmaxTileInputId / OnlineSoftmaxTileOutputId
 #include "openvino/core/model.hpp"
 
@@ -98,6 +99,14 @@ struct PagedAttention {
     std::size_t _num_kv_heads = 0; // Hk — number of K/V heads (GQA → < H)
     float _scale = 0.0f;           // attention scale, usually 1/sqrt(head_size)
 
+    // Layer index parsed from the KEY_CACHE Parameter's name suffix
+    // (e.g. "key_cache.7" → 7). Selects which entry of
+    // LLMCompiledModel::m_pa_layer_managers this PA op binds against.
+    // SDPAToPagedAttention emits one PA op per attention layer; the
+    // partitioner isolates each PA op into its own subgraph, so the
+    // layer index uniquely identifies the layer pool to consume.
+    std::size_t _layer_index = 0;
+
     // Parameter index of each PA input in the source model's parameter list.
     // Populated by from() for downstream binding by the runtime orchestrator.
     std::map<PAInputId, std::size_t> _pa_param_index_map;
@@ -121,12 +130,52 @@ struct PagedAttention {
 
     // Walks `model` looking for a PagedAttentionExtension op. Returns the
     // extracted config on success. Returns std::nullopt when:
-    //   - no PA op is found (model is not in PA mode), or
+    //   - no PA op is found (the subgraph is not a PA layer), or
     //   - the PA op's static shapes haven't been resolved (call
     //     BakePagedAttentionStaticShapes first), or
-    //   - multiple PA ops are found (per-layer PA setup — not the LLM
-    //     LLMPipeline shape this lowering currently targets).
+    //   - multiple PA ops appear in the same subgraph (NPUW partitioning
+    //     should isolate each PA op into its own subgraph; if it doesn't,
+    //     bail and fall back to the CPU PA executor).
+    //
+    // SDPAToPagedAttention emits one PA op per attention layer, naming the
+    // KEY_CACHE/VALUE_CACHE parameters "key_cache.N"/"value_cache.N" with
+    // N as the layer index. from() parses N out of the KEY_CACHE name into
+    // _layer_index so the runtime knows which pool slot in
+    // LLMCompiledModel::m_pa_layer_managers this lowering binds against.
     static std::optional<PagedAttention> from(const std::shared_ptr<ov::Model>& model);
+};
+
+// Process-wide context for handing PA layer managers from LLMCompiledModel
+// (which owns m_pa_layer_managers) down to the partitioner's
+// attempt_attention() / attn_subgraph partition_stage hook (which has no
+// back-reference to LLMCompiledModel). The LLM compile path sets this
+// before invoking the partitioner and clears it on scope exit; the hook
+// reads the current value to populate compiled::PagedAttention's layer
+// manager vectors. Single-threaded compile assumption — the same one
+// LLMCompiledModel already relies on. If the assumption ever changes,
+// promote this to a per-LLMCompiledModel context handle.
+struct PagedAttentionPartitionerContext {
+    std::vector<std::shared_ptr<KVCacheBlockManager>> key_managers;
+    std::vector<std::shared_ptr<KVCacheBlockManager>> value_managers;
+    ov::SoPtr<ov::ICompiledModel> compiled_tile_model;
+    ov::SoPtr<ov::ICompiledModel> compiled_final_tile_model;
+};
+
+// Returns a pointer to the currently active context, or nullptr if no
+// LLMCompiledModel is in the middle of compiling a PA-mode model.
+const PagedAttentionPartitionerContext* current_pa_partitioner_context();
+
+// RAII guard. Construct in LLMCompiledModel right before compile starts;
+// destruction clears the context.
+class PagedAttentionPartitionerScope {
+public:
+    PagedAttentionPartitionerScope(std::vector<std::shared_ptr<KVCacheBlockManager>> key_managers,
+                                    std::vector<std::shared_ptr<KVCacheBlockManager>> value_managers,
+                                    ov::SoPtr<ov::ICompiledModel> compiled_tile_model,
+                                    ov::SoPtr<ov::ICompiledModel> compiled_final_tile_model);
+    ~PagedAttentionPartitionerScope();
+    PagedAttentionPartitionerScope(const PagedAttentionPartitionerScope&) = delete;
+    PagedAttentionPartitionerScope& operator=(const PagedAttentionPartitionerScope&) = delete;
 };
 
 }  // namespace function
@@ -147,6 +196,16 @@ struct PagedAttention {
     ov::SoPtr<ov::ICompiledModel> _compiled_tile_model;
     ov::SoPtr<ov::ICompiledModel> _compiled_final_tile_model;
 
+    // Per-layer K/V block pools — one entry per transformer layer. The
+    // runtime dispatch (run() switch case BehaviorKind::Paged) indexes
+    // this with _layer_index to reach the K/V manager pair for THIS PA
+    // op's layer. shared_ptr instances are owned by LLMCompiledModel via
+    // m_pa_layer_managers; we hold copies here so the dispatch doesn't
+    // need a back-pointer to LLMCompiledModel. Empty until populated by
+    // the partition-stage hook.
+    std::vector<std::shared_ptr<KVCacheBlockManager>> _layer_key_managers;
+    std::vector<std::shared_ptr<KVCacheBlockManager>> _layer_value_managers;
+
     // Configuration copied from function::PagedAttention at construction.
     int64_t _block_size = 0;
     std::size_t _num_blocks = 0;
@@ -155,6 +214,7 @@ struct PagedAttention {
     std::size_t _num_q_heads = 0;
     std::size_t _num_kv_heads = 0;
     float _scale = 0.0f;
+    std::size_t _layer_index = 0;
 
     // PA op parameter-index map on the original (pre-tile-rewrite) model.
     // Lets the runtime locate block_indices, past_lens, etc. at infer time.
@@ -169,9 +229,13 @@ struct PagedAttention {
     // Construct from the function-side struct after tile-model compilation.
     PagedAttention(const function::PagedAttention& func_pa,
                    ov::SoPtr<ov::ICompiledModel> tile_compiled,
-                   ov::SoPtr<ov::ICompiledModel> final_tile_compiled)
+                   ov::SoPtr<ov::ICompiledModel> final_tile_compiled,
+                   std::vector<std::shared_ptr<KVCacheBlockManager>> layer_key_managers = {},
+                   std::vector<std::shared_ptr<KVCacheBlockManager>> layer_value_managers = {})
         : _compiled_tile_model(std::move(tile_compiled)),
           _compiled_final_tile_model(std::move(final_tile_compiled)),
+          _layer_key_managers(std::move(layer_key_managers)),
+          _layer_value_managers(std::move(layer_value_managers)),
           _block_size(func_pa._block_size),
           _num_blocks(func_pa._num_blocks),
           _query_size(func_pa._query_size),
@@ -179,6 +243,7 @@ struct PagedAttention {
           _num_q_heads(func_pa._num_q_heads),
           _num_kv_heads(func_pa._num_kv_heads),
           _scale(func_pa._scale),
+          _layer_index(func_pa._layer_index),
           _pa_param_index_map(func_pa._pa_param_index_map),
           _tile_param_index_map(func_pa._tile_param_index_map),
           _tile_output_index_map(func_pa._tile_output_index_map) {}
