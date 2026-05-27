@@ -31,6 +31,14 @@ INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_ATTN_HFA_FUSED, bool, false, ov::intel_npu::npuw:
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_ATTN_PAGED_BLOCK_SIZE, uint32_t, 32, ov::intel_npu::npuw::partitioning, attn_paged_block_size, "NPUW_ATTN_PAGED_BLOCK_SIZE", ROOT, EXPOSED, CACHED, ALL)
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_ATTN_PAGED_NUM_BLOCKS, uint32_t, 1024, ov::intel_npu::npuw::partitioning, attn_paged_num_blocks, "NPUW_ATTN_PAGED_NUM_BLOCKS", ROOT, EXPOSED, CACHED, ALL)
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_ATTN_PAGED_MAX_SEQS, uint32_t, 16, ov::intel_npu::npuw::partitioning, attn_paged_max_seqs, "NPUW_ATTN_PAGED_MAX_SEQS", ROOT, EXPOSED, CACHED, ALL)
+// Opt-in: enable the experimental NPU-resident PagedAttention lowering
+// (online-softmax tile loop sharing the same kernel as HFA). When false
+// (default), the PagedAttentionExtension op is auto-routed to NPUW_ATTN_DEVICE
+// (CPU). When true, the partitioner populates Function::_paged_attention and
+// the runtime tile-loop orchestrator takes over for the subgraph. The runtime
+// hook is incremental — until it is complete, setting this to true logs the
+// lowering availability but execution continues to fall back to CPU.
+INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_ATTN_PAGED_NPU_LOWERING, bool, false, ov::intel_npu::npuw::partitioning, attn_paged_npu_lowering, "NPUW_ATTN_PAGED_NPU_LOWERING", ROOT, EXPOSED, CACHED, ALL)
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_ATTN_DEVICE, std::string, "CPU", ov::intel_npu::npuw::partitioning, attn_device, "NPUW_ATTN_DEVICE", ROOT, EXPOSED, CACHED, ALL)
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_DCOFF_TYPE, std::string, "", ov::intel_npu::npuw::partitioning, dcoff_type, "NPUW_DCOFF_TYPE", ROOT, EXPOSED, CACHED, ALL)
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_DCOFF_SCALE, bool, false, ov::intel_npu::npuw::partitioning, dcoff_with_scale, "NPUW_DCOFF_SCALE", ROOT, EXPOSED, CACHED, ALL)

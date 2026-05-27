@@ -14,6 +14,7 @@
 #include "../host_flash_attention.hpp"
 #include "../lazy_tensor.hpp"
 #include "../moe_transformations/moe_transformation.hpp"
+#include "../paged_attn_runtime.hpp"
 #include "../pyramid_attention.hpp"
 #include "../spatial.hpp"
 #include "../v1/subgraph_pipeline.hpp"
@@ -111,6 +112,12 @@ struct Function {
     std::optional<ov::npuw::function::PyramidAttention> _pyramid_attention;
     // Host Flash Attention
     std::optional<ov::npuw::function::HostFlashAttention> _host_flash_attention;
+    // PagedAttention NPU lowering (opt-in via NPUW_ATTN_PAGED_NPU_LOWERING).
+    // Populated by attempt_attention() when the PA op is present and the
+    // option is enabled. Carries the extracted PA config and the compiled
+    // online-softmax tile sub-models that the runtime orchestrator invokes
+    // in place of CPU PA execution.
+    std::optional<ov::npuw::function::PagedAttention> _paged_attention;
     // MoE expert information - single expert model
     std::optional<ov::npuw::function::MoEExperts> _moe_experts;
     std::optional<ov::npuw::function::MoEDownstream> _moe_experts_downstream;
