@@ -20,7 +20,7 @@ namespace npuw {
 // HFA Tile Model input tensor identifiers
 // Represents the input layout for Host Flash Attention tile models
 // Input names: [past_acc, past_max, past_d, k_tile, v_tile, q, mask_tile]
-enum class HFATileInputId : uint8_t {
+enum class OnlineSoftmaxTileInputId : uint8_t {
     PAST_ACC = 0,   // Accumulated attention output from previous tiles
     PAST_MAX = 1,   // Maximum values from previous tiles (for numerical stability)
     PAST_D = 2,     // Normalization denominator from previous tiles
@@ -36,7 +36,7 @@ enum class HFATileInputId : uint8_t {
 // HFA Regular Tile Model output tensor identifiers
 // Represents the output layout for regular (non-final) tile models
 // Output names: [acc, maxx, d]
-enum class HFATileOutputId : uint8_t {
+enum class OnlineSoftmaxTileOutputId : uint8_t {
     ACC = 0,   // Accumulated attention output
     MAXX = 1,  // Maximum values for numerical stability
     D = 2,     // Normalization denominator
@@ -46,34 +46,34 @@ enum class HFATileOutputId : uint8_t {
 };
 
 // Helper functions to convert enum values to string representations for logging/debugging
-inline const char* hfa_tile_input_id_to_string(HFATileInputId id) {
+inline const char* online_softmax_tile_input_id_to_string(OnlineSoftmaxTileInputId id) {
     switch (id) {
-    case HFATileInputId::PAST_ACC:
+    case OnlineSoftmaxTileInputId::PAST_ACC:
         return "PAST_ACC";
-    case HFATileInputId::PAST_MAX:
+    case OnlineSoftmaxTileInputId::PAST_MAX:
         return "PAST_MAX";
-    case HFATileInputId::PAST_D:
+    case OnlineSoftmaxTileInputId::PAST_D:
         return "PAST_D";
-    case HFATileInputId::K_TILE:
+    case OnlineSoftmaxTileInputId::K_TILE:
         return "K_TILE";
-    case HFATileInputId::V_TILE:
+    case OnlineSoftmaxTileInputId::V_TILE:
         return "V_TILE";
-    case HFATileInputId::Q:
+    case OnlineSoftmaxTileInputId::Q:
         return "Q";
-    case HFATileInputId::MASK_TILE:
+    case OnlineSoftmaxTileInputId::MASK_TILE:
         return "MASK_TILE";
     default:
         return "UNKNOWN";
     }
 }
 
-inline const char* hfa_tile_output_id_to_string(HFATileOutputId id) {
+inline const char* online_softmax_tile_output_id_to_string(OnlineSoftmaxTileOutputId id) {
     switch (id) {
-    case HFATileOutputId::ACC:
+    case OnlineSoftmaxTileOutputId::ACC:
         return "ACC";
-    case HFATileOutputId::MAXX:
+    case OnlineSoftmaxTileOutputId::MAXX:
         return "MAXX";
-    case HFATileOutputId::D:
+    case OnlineSoftmaxTileOutputId::D:
         return "D";
     default:
         return "UNKNOWN";
@@ -124,13 +124,13 @@ struct HostFlashAttention {
     // Tile model I/O: Inputs[past_acc, past_max, past_d, k_tile, v_tile, q, mask_tile]
     //                 Outputs[acc, max, d] for regular tiles or [output] for final tile
     // This is created after tile model generation in from() method
-    std::map<HFATileInputId, std::size_t> _tile_param_index_map;
+    std::map<OnlineSoftmaxTileInputId, std::size_t> _tile_param_index_map;
 
     // Tile model output index mapping
     // Maps tile output IDs (UPDATED_ACC, UPDATED_MAX, UPDATED_D) to actual output indices
     // Only applicable to regular tile model (final tile has single output at index 0)
     // This is created after tile model generation in from() method
-    std::map<HFATileOutputId, std::size_t> _tile_output_index_map;
+    std::map<OnlineSoftmaxTileOutputId, std::size_t> _tile_output_index_map;
 
     // Validation helpers
     bool is_valid() const {
@@ -161,7 +161,7 @@ struct HostFlashAttention {
 // Output  for is_final_tile=true : {output} (acc/d divided, transposed,
 //                                    reshaped to [batch, seq_len, num_heads*head_dim],
 //                                    cast to output_dtype)
-std::shared_ptr<ov::Model> create_hfa_tile_model(const ov::Shape& q_shape,
+std::shared_ptr<ov::Model> create_online_softmax_tile_model(const ov::Shape& q_shape,
                                                  const ov::element::Type& input_dtype,
                                                  const ov::element::Type& mask_dtype,
                                                  int64_t tile_size,
