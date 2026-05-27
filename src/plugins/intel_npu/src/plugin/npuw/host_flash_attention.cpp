@@ -558,14 +558,14 @@ static ov::ResultVector create_regular_tile_outputs_fused(const FlashAttentionRe
 // Parameters:
 //   is_final_tile: If true, creates final tile with division/transpose/reshape
 //   output_dtype: Output data type (only used when is_final_tile=true)
-static std::shared_ptr<ov::Model> create_hfa_tile_model(const ov::Shape& q_shape,
-                                                        const ov::element::Type& input_dtype,
-                                                        const ov::element::Type& mask_dtype,
-                                                        int64_t tile_size,
-                                                        size_t kv_num_heads,
-                                                        bool is_final_tile = false,
-                                                        bool fused_flash_attention = false,
-                                                        const ov::element::Type& output_dtype = ov::element::f16) {
+std::shared_ptr<ov::Model> create_hfa_tile_model(const ov::Shape& q_shape,
+                                                 const ov::element::Type& input_dtype,
+                                                 const ov::element::Type& mask_dtype,
+                                                 int64_t tile_size,
+                                                 size_t kv_num_heads,
+                                                 bool is_final_tile,
+                                                 bool fused_flash_attention,
+                                                 const ov::element::Type& output_dtype) {
     LOG_DEBUG("Creating HFA " << (is_final_tile ? "FINAL " : "") << "tile model with tile_size=" << tile_size
                               << ", kv_num_heads=" << kv_num_heads << ", mask_dtype=" << mask_dtype
                               << (is_final_tile ? ", output_dtype=" + output_dtype.get_type_name() : "")
