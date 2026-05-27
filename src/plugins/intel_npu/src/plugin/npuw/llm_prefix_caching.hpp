@@ -4,11 +4,14 @@
 
 #pragma once
 
+#include <cstdint>
+#include <functional>
 #include <list>
 #include <memory>
 #include <mutex>
 #include <regex>
 #include <unordered_map>
+#include <vector>
 
 #include "openvino/runtime/icompiled_model.hpp"
 #include "openvino/runtime/itensor.hpp"
@@ -16,6 +19,8 @@
 
 namespace ov {
 namespace npuw {
+
+class KVCacheBlockManager;
 
 /**
  * @brief KV cache data container for storing tensor pairs per layer
@@ -82,6 +87,61 @@ public:
     void unlink_blocks(std::shared_ptr<KVBlock> prev_block);
     void print_block_info(bool verbose) const;
 
+    /**
+     * @brief Refcounted block-pool reference (for the PA NPU lowering path)
+     *
+     * In the SDPA-based prefix-cache path the block stores per-layer KV
+     * tensor data via add_block()/get_block_kv_data(). For the PA NPU
+     * lowering, the same logical block is materialized as one physical
+     * id per layer in the per-layer KVCacheBlockManagers; the cache holds
+     * acquire()d refs on those ids and releases them when the entry is
+     * evicted. This struct captures the {layer_idx -> block_id} mapping
+     * for K and V so the live infer request can repoint its block table
+     * at cached entries on a hit.
+     *
+     * Both representations may coexist on a KVBlock (one path populates
+     * one of them; readers check the relevant accessor). The path that
+     * stores tensor copies leaves the pool refs empty; the path that
+     * stores pool refs leaves m_kv_data empty.
+     */
+    struct PoolBlockRefs {
+        // One physical block id per layer for K and V respectively. The
+        // layer index of an entry is its index in the vector.
+        std::vector<uint32_t> key_block_ids;
+        std::vector<uint32_t> value_block_ids;
+    };
+
+    /**
+     * @brief Add a block recorded as refcounted pool block ids (PA path)
+     *
+     * Bumps acquire() on each id in `refs` against the matching layer
+     * managers and stores them on the block. Token hashes are recorded
+     * the same way as add_block(). On eviction (handle_evict_pool_refs),
+     * each id is released() exactly once, restoring it to the free pool
+     * if no other holder remains.
+     */
+    bool add_pool_block(const std::vector<uint64_t>& token_hashes,
+                        PoolBlockRefs refs,
+                        const std::vector<std::shared_ptr<KVCacheBlockManager>>& key_managers,
+                        const std::vector<std::shared_ptr<KVCacheBlockManager>>& value_managers);
+
+    /**
+     * @brief Read-only accessor for the pool refs path. Empty when the
+     * block was added via add_block() (tensor-copy path).
+     */
+    const PoolBlockRefs& get_pool_block_refs() const {
+        return m_pool_refs;
+    }
+
+    /**
+     * @brief Release any pool refs held by this block
+     *
+     * Called by PrefixCacheManager when this block is evicted. No-op when
+     * the block was added via add_block() (tensor-copy path).
+     */
+    void release_pool_block_refs(const std::vector<std::shared_ptr<KVCacheBlockManager>>& key_managers,
+                                 const std::vector<std::shared_ptr<KVCacheBlockManager>>& value_managers);
+
 private:
     /**
      * @brief Compute the block's hash value
@@ -103,7 +163,10 @@ private:
     std::unordered_set<uint64_t> m_child_block_hashes;
     // One block only has single parent block
     uint64_t m_parent_block_hash;
+    // Tensor-copy path (SDPA prefix cache). Empty when m_pool_refs is set.
     KVData m_kv_data;
+    // Refcounted-pool path (PA NPU lowering). Empty when m_kv_data is set.
+    PoolBlockRefs m_pool_refs;
 };
 
 class PrefixCacheManager {

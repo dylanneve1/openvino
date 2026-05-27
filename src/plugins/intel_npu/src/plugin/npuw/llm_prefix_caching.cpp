@@ -5,6 +5,7 @@
 #include "llm_prefix_caching.hpp"
 
 #include "infer_request_utils.hpp"
+#include "kv_cache_block_manager.hpp"
 #include "llm_infer_request.hpp"
 #include "logging.hpp"
 #include "openvino/core/parallel.hpp"
@@ -33,6 +34,60 @@ bool KVBlock::add_block(const std::vector<uint64_t>& token_hashes, const KVData&
     m_block_hash = compute_block_hash(token_hashes);
 
     return true;
+}
+
+bool KVBlock::add_pool_block(const std::vector<uint64_t>& token_hashes,
+                              PoolBlockRefs refs,
+                              const std::vector<std::shared_ptr<KVCacheBlockManager>>& key_managers,
+                              const std::vector<std::shared_ptr<KVCacheBlockManager>>& value_managers) {
+    if (token_hashes.empty() || token_hashes.size() > m_block_size) {
+        return false;
+    }
+    if (refs.key_block_ids.size() != key_managers.size() ||
+        refs.value_block_ids.size() != value_managers.size()) {
+        LOG_WARN("KVBlock::add_pool_block: layer-count mismatch — "
+                 "key_block_ids=" << refs.key_block_ids.size() << " key_managers=" << key_managers.size()
+                                  << " value_block_ids=" << refs.value_block_ids.size()
+                                  << " value_managers=" << value_managers.size());
+        return false;
+    }
+
+    // Bump refcount on every cached id so the live infer request can
+    // release its own ref without freeing the block while the cache still
+    // holds it. release_pool_block_refs() (called on eviction) drops these.
+    for (size_t i = 0; i < refs.key_block_ids.size(); ++i) {
+        if (key_managers[i]) {
+            key_managers[i]->acquire(refs.key_block_ids[i]);
+        }
+    }
+    for (size_t i = 0; i < refs.value_block_ids.size(); ++i) {
+        if (value_managers[i]) {
+            value_managers[i]->acquire(refs.value_block_ids[i]);
+        }
+    }
+
+    m_token_hashes = token_hashes;
+    m_pool_refs = std::move(refs);
+    m_kv_data.clear();  // pool-refs path is mutually exclusive with kv-data path
+    m_is_full = (token_hashes.size() == m_block_size);
+    m_block_hash = compute_block_hash(token_hashes);
+    return true;
+}
+
+void KVBlock::release_pool_block_refs(const std::vector<std::shared_ptr<KVCacheBlockManager>>& key_managers,
+                                       const std::vector<std::shared_ptr<KVCacheBlockManager>>& value_managers) {
+    for (size_t i = 0; i < m_pool_refs.key_block_ids.size(); ++i) {
+        if (i < key_managers.size() && key_managers[i]) {
+            key_managers[i]->release(m_pool_refs.key_block_ids[i]);
+        }
+    }
+    for (size_t i = 0; i < m_pool_refs.value_block_ids.size(); ++i) {
+        if (i < value_managers.size() && value_managers[i]) {
+            value_managers[i]->release(m_pool_refs.value_block_ids[i]);
+        }
+    }
+    m_pool_refs.key_block_ids.clear();
+    m_pool_refs.value_block_ids.clear();
 }
 
 void KVBlock::link_blocks(std::shared_ptr<KVBlock> prev_block) {
