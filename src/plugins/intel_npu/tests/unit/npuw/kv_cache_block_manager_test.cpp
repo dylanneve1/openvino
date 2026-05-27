@@ -263,4 +263,113 @@ TEST_F(KVCacheBlockManagerTest, GetTensorAfterClear) {
     EXPECT_NE(tensor2, nullptr) << "Tensor should still be valid after clear + re-allocate";
 }
 
+// Test 12: allocate_block returns block with refcount 1
+TEST_F(KVCacheBlockManagerTest, AllocateInitialRefcount) {
+    auto block_id = manager->allocate_block();
+    ASSERT_TRUE(block_id.has_value());
+    EXPECT_EQ(manager->refcount(block_id.value()), 1u) << "Newly-allocated block should have refcount 1";
+}
+
+// Test 13: acquire bumps refcount without affecting allocation status
+TEST_F(KVCacheBlockManagerTest, AcquireIncrementsRefcount) {
+    auto block_id = manager->allocate_block();
+    ASSERT_TRUE(block_id.has_value());
+
+    const auto allocated_before = manager->get_allocated_blocks().size();
+    manager->acquire(block_id.value());
+    EXPECT_EQ(manager->refcount(block_id.value()), 2u) << "acquire should bump refcount to 2";
+
+    manager->acquire(block_id.value());
+    EXPECT_EQ(manager->refcount(block_id.value()), 3u);
+
+    // Set of allocated blocks does not change.
+    EXPECT_EQ(manager->get_allocated_blocks().size(), allocated_before);
+}
+
+// Test 14: release decrements refcount; only the last release frees the block
+TEST_F(KVCacheBlockManagerTest, ReleaseFreesAtZero) {
+    auto block_id = manager->allocate_block();
+    ASSERT_TRUE(block_id.has_value());
+    manager->acquire(block_id.value());
+    manager->acquire(block_id.value());
+    EXPECT_EQ(manager->refcount(block_id.value()), 3u);
+
+    manager->release(block_id.value());
+    EXPECT_EQ(manager->refcount(block_id.value()), 2u);
+    EXPECT_EQ(manager->get_allocated_blocks().size(), 1u) << "Block still allocated when refcount > 0";
+
+    manager->release(block_id.value());
+    EXPECT_EQ(manager->refcount(block_id.value()), 1u);
+    EXPECT_EQ(manager->get_allocated_blocks().size(), 1u);
+
+    manager->release(block_id.value());
+    EXPECT_EQ(manager->refcount(block_id.value()), 0u) << "Last release should drop refcount to 0";
+    EXPECT_TRUE(manager->get_allocated_blocks().empty()) << "Block should return to free pool at refcount 0";
+}
+
+// Test 15: free pool reuses memory after release (mirrors the clear_all reuse test)
+TEST_F(KVCacheBlockManagerTest, MemoryReuseAfterRelease) {
+    auto block_id = manager->allocate_block();
+    ASSERT_TRUE(block_id.has_value());
+    auto tensor_before = manager->get_block_tensor(block_id.value());
+    ASSERT_NE(tensor_before, nullptr);
+    void* ptr_before = tensor_before->data();
+
+    manager->release(block_id.value());
+    EXPECT_EQ(manager->refcount(block_id.value()), 0u);
+
+    auto block_id2 = manager->allocate_block();
+    ASSERT_TRUE(block_id2.has_value());
+    EXPECT_EQ(block_id2.value(), block_id.value()) << "LIFO free stack should return the just-released id";
+    auto tensor_after = manager->get_block_tensor(block_id2.value());
+    EXPECT_EQ(tensor_after->data(), ptr_before) << "Tensor memory should be reused after release+re-allocate";
+}
+
+// Test 16: acquire on a free block throws
+TEST_F(KVCacheBlockManagerTest, AcquireFreeBlockThrows) {
+    // Block 0 is free at construction time.
+    EXPECT_EQ(manager->refcount(0), 0u);
+    EXPECT_THROW(manager->acquire(0), ov::Exception) << "Acquiring a free block must throw";
+
+    // Allocate then release: now free again.
+    auto block_id = manager->allocate_block();
+    ASSERT_TRUE(block_id.has_value());
+    manager->release(block_id.value());
+    EXPECT_THROW(manager->acquire(block_id.value()), ov::Exception)
+        << "Acquiring a block after final release must throw";
+}
+
+// Test 17: double release throws
+TEST_F(KVCacheBlockManagerTest, DoubleReleaseThrows) {
+    auto block_id = manager->allocate_block();
+    ASSERT_TRUE(block_id.has_value());
+    manager->release(block_id.value());  // refcount 1 -> 0
+    EXPECT_THROW(manager->release(block_id.value()), ov::Exception) << "Releasing a free block must throw";
+}
+
+// Test 18: invalid block ID throws for refcount / acquire / release
+TEST_F(KVCacheBlockManagerTest, RefcountApisValidateId) {
+    EXPECT_THROW(manager->acquire(max_blocks), ov::Exception);
+    EXPECT_THROW(manager->release(max_blocks + 1), ov::Exception);
+    EXPECT_THROW(manager->refcount(max_blocks + 2), ov::Exception);
+}
+
+// Test 19: clear_all forcibly resets outstanding refs
+TEST_F(KVCacheBlockManagerTest, ClearAllForcesRefcountReset) {
+    auto block_id = manager->allocate_block();
+    ASSERT_TRUE(block_id.has_value());
+    manager->acquire(block_id.value());
+    manager->acquire(block_id.value());
+    EXPECT_EQ(manager->refcount(block_id.value()), 3u);
+
+    manager->clear_all();
+    EXPECT_EQ(manager->refcount(block_id.value()), 0u) << "clear_all should drop refcount unconditionally";
+    EXPECT_TRUE(manager->get_allocated_blocks().empty());
+
+    // Pool is usable again.
+    auto fresh = manager->allocate_block();
+    ASSERT_TRUE(fresh.has_value());
+    EXPECT_EQ(manager->refcount(fresh.value()), 1u);
+}
+
 }  // namespace

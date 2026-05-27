@@ -74,14 +74,57 @@ std::optional<uint32_t> KVCacheBlockManager::allocate_block() {
                                                                      << ", device=" << device_ << ")");
     }
 
-    // Reset block state
+    // Reset block state; caller owns one reference.
     block.num_tokens = 0;
-    block.is_allocated = true;
+    block.refcount = 1;
 
     LOG_VERB("KVCacheBlockManager: Allocated block " << block_id
                                                      << " (free blocks remaining: " << free_block_ids_.size() << ")");
 
     return block_id;
+}
+
+void KVCacheBlockManager::acquire(uint32_t block_id) {
+    validate_block_id(block_id);
+
+    auto& block = blocks_[block_id];
+    if (block.refcount == 0) {
+        OPENVINO_THROW("KVCacheBlockManager: Cannot acquire free block ",
+                       block_id,
+                       ". Call allocate_block() first.");
+    }
+
+    ++block.refcount;
+    LOG_VERB("KVCacheBlockManager: Acquired block " << block_id << " (refcount=" << block.refcount << ")");
+}
+
+void KVCacheBlockManager::release(uint32_t block_id) {
+    validate_block_id(block_id);
+
+    auto& block = blocks_[block_id];
+    if (block.refcount == 0) {
+        OPENVINO_THROW("KVCacheBlockManager: Cannot release free block ",
+                       block_id,
+                       ". Double-release or release of never-allocated block.");
+    }
+
+    --block.refcount;
+    if (block.refcount == 0) {
+        // Last reference dropped — return the block to the free pool.
+        // Tensor memory is retained for reuse on the next allocate of this id.
+        block.num_tokens = 0;
+        free_block_ids_.push(block_id);
+        LOG_VERB("KVCacheBlockManager: Released block " << block_id
+                                                        << " back to free pool (free blocks: " << free_block_ids_.size()
+                                                        << ")");
+    } else {
+        LOG_VERB("KVCacheBlockManager: Released block " << block_id << " (refcount=" << block.refcount << ")");
+    }
+}
+
+uint32_t KVCacheBlockManager::refcount(uint32_t block_id) const {
+    validate_block_id(block_id);
+    return blocks_[block_id].refcount;
 }
 
 ov::SoPtr<ov::ITensor> KVCacheBlockManager::get_block_tensor(uint32_t block_id) const {
@@ -102,7 +145,7 @@ ov::SoPtr<ov::ITensor> KVCacheBlockManager::get_block_tensor(uint32_t block_id) 
 void KVCacheBlockManager::update_block_tokens(uint32_t block_id, uint32_t num_tokens) {
     validate_block_id(block_id);
 
-    if (!blocks_[block_id].is_allocated) {
+    if (blocks_[block_id].refcount == 0) {
         OPENVINO_THROW("KVCacheBlockManager: Cannot update tokens on free block ",
                        block_id,
                        ". Call allocate_block() first.");
@@ -134,7 +177,7 @@ std::vector<uint32_t> KVCacheBlockManager::get_allocated_blocks() const {
     allocated.reserve(max_blocks_ - free_block_ids_.size());
 
     for (uint32_t i = 0; i < blocks_.size(); ++i) {
-        if (blocks_[i].is_allocated) {
+        if (blocks_[i].refcount > 0) {
             allocated.push_back(i);
         }
     }
@@ -145,9 +188,24 @@ std::vector<uint32_t> KVCacheBlockManager::get_allocated_blocks() const {
 void KVCacheBlockManager::clear_all() {
     LOG_DEBUG("KVCacheBlockManager: Clearing all blocks");
 
+    // Count outstanding refs for diagnostics. clear_all() is a force-reset:
+    // outstanding refs are likely a caller bug (missing release()), but the
+    // contract is to wipe the pool unconditionally.
+    uint32_t outstanding = 0;
+    for (const auto& block : blocks_) {
+        if (block.refcount > 0) {
+            ++outstanding;
+        }
+    }
+    if (outstanding > 0) {
+        LOG_WARN("KVCacheBlockManager: clear_all() invoked with "
+                 << outstanding << " block(s) still holding references. "
+                 << "Forcing reset; ensure callers release blocks before clear_all().");
+    }
+
     for (auto& block : blocks_) {
         block.num_tokens = 0;
-        block.is_allocated = false;
+        block.refcount = 0;
     }
 
     // Rebuild free stack (push in reverse order so block 0 is on top)
