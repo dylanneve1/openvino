@@ -1303,11 +1303,11 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                     // Uses the per-layer pool selected by pa_desc->_layer_index
                     // (one PA op per attention layer). The layer managers + the
                     // compiled tile sub-models are sourced from the
-                    // compiled::PagedAttention scaffold — the partitioner-side
-                    // compiled-handle propagation hook (TBD with the NPUW
-                    // runtime team) populates these before run() reaches here.
-                    auto* pa_desc = ov::npuw::attn::get_compiled_pa(
-                        get_subgraph_pipeline(ctx, ctx.real_subgraph_idx).context);
+                    // compiled::PagedAttention scaffold populated by the
+                    // partition_stage hook from the LLMCompiledModel scope.
+                    auto& state = get_runtime_state(ctx);
+                    const auto& pipeline = get_subgraph_pipeline(ctx, ctx.real_subgraph_idx);
+                    auto* pa_desc = ov::npuw::attn::get_compiled_pa(pipeline.context);
                     if (pa_desc == nullptr || !pa_desc->is_valid() ||
                         pa_desc->_layer_key_managers.empty() || pa_desc->_layer_value_managers.empty()) {
                         OPENVINO_THROW("PagedAttention dispatch: compiled state incomplete (compiled tile "
