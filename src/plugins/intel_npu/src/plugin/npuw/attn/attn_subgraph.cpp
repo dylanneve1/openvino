@@ -1305,6 +1305,20 @@ std::vector<ov::npuw::v1::subgraphs::ScopedPatternRegistration> register_pattern
             put_compiled_hfa(ctx,
                              std::make_shared<ov::npuw::compiled::HostFlashAttention>(f._host_flash_attention.value()));
             ctx.put<BehaviorKind>(BehaviorKind::HFA);
+            return;
+        }
+        if (f._paged_attention.has_value() && f._paged_attention->is_valid()) {
+            // PagedAttention NPU lowering: the partitioner attached the
+            // function-side struct (with built tile sub-models). The
+            // CompiledPipeline compile_stage will receive those models and,
+            // when the runtime dispatch (Step 5c) is in place, populate the
+            // compiled::PagedAttention scaffold via put_compiled_pa(). For
+            // now we don't push a BehaviorKind::Paged value yet — the run()
+            // switch has no case for it, and the existing CPU auto-route
+            // continues to provide execution. Logging here documents that
+            // the lowering reached this stage.
+            LOG_INFO("PagedAttention NPU lowering: function::PagedAttention populated for subgraph; "
+                     "runtime dispatch hook (Step 5c) is next.");
         }
     };
     attn_behavior.compile_stage = [](ov::npuw::v1::subgraphs::CompiledPipeline& compiled_pipeline,
