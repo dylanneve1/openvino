@@ -5,11 +5,13 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "compiled_model.hpp"
 #include "npuw_transformations/kv_axes_position.hpp"
+#include "paged_attn_runtime.hpp"
 
 namespace ov {
 namespace npuw {
@@ -176,6 +178,26 @@ private:
     void setup_paged_block_managers(const std::shared_ptr<ov::Model>& shape_source_model,
                                     const std::shared_ptr<const ov::IPlugin>& plugin,
                                     const std::string& device);
+
+    // PA NPU-resident lowering. Populated when m_pa_mode is true and the
+    // tile sub-models build + compile successfully. Consumed by
+    // PagedLLMInferRequest's tile-loop orchestrator (Step 5).
+    // When m_pa_runtime is set but compiled handles are null, the lowering
+    // bailed during compilation and the caller should fall back to the
+    // existing CPU PA execution path.
+    std::optional<function::PagedAttention> m_pa_runtime;
+    std::shared_ptr<ov::npuw::ICompiledModel_v0> m_pa_tile_compiled;
+    std::shared_ptr<ov::npuw::ICompiledModel_v0> m_pa_final_tile_compiled;
+
+    // Builds the function::PagedAttention runtime extension from
+    // `shape_source_model` (the post-Bake prefill model in practice) and
+    // compiles both tile sub-models on `plugin` with `tile_compile_config`.
+    // No-op when m_pa_mode is false. On any failure (no PA op detected,
+    // tile-model construction failure, or compile error) the partial state
+    // is rolled back and the existing CPU PA fallback remains in effect.
+    void setup_paged_runtime(const std::shared_ptr<ov::Model>& shape_source_model,
+                             const std::shared_ptr<const ov::IPlugin>& plugin,
+                             const ov::AnyMap& tile_compile_config);
 };
 
 }  // namespace npuw
