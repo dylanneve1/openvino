@@ -897,7 +897,14 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         }
     }
 
-    if (!m_is_embedding) {
+    // SDPAToPagedAttention has already consumed the model's stateful Variables
+    // (rewriting them into the PA op's key_cache.N / value_cache.N inputs +
+    // past_lens / block_indices). What's left is a paged but non-stateful
+    // graph — running StatefulToStateless on it would fail with
+    //   "Stateful models without `beam_idx` input are not supported"
+    // because the conversion already removed beam_idx along with the rest of
+    // the stateful machinery. Skip it on the PA path.
+    if (!m_is_embedding && !m_pa_already_applied) {
         LOG_DEBUG("Transform kvcache model from stateful to stateless.");
         ov::pass::StatefulToStateless().run_on_model(kvcache_model);
     }
