@@ -680,20 +680,43 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
         const std::size_t real_id = m_compiled_submodels[id].replaced_by.value_or(id);
         m_compiled_submodels[real_id].devices_to_avoid = device_list_to_set(orderedSubgraphs[real_id]._avoid_list);
 
-        // Auto-route subgraphs containing PagedAttentionExtension to
-        // NPUW_ATTN_DEVICE (default CPU). The PA op has no NPU kernel, so it
-        // must execute on the host via the CPU plugin.
+        // Subgraphs containing PagedAttentionExtension have two execution paths:
+        //
+        //   1. NPU lowering (preferred, opt-in via NPUW_ATTN_PAGED_NPU_LOWERING).
+        //      When the partitioner populated Function::_paged_attention with
+        //      valid tile sub-models, the runtime orchestrator drives a per-block
+        //      online-softmax tile loop on NPU. We do NOT auto-route the
+        //      subgraph to CPU in this case — the PA op stays in the IR but its
+        //      execution is intercepted by the orchestrator.
+        //
+        //   2. CPU fallback (default until the lowering is fully wired).
+        //      Routes the subgraph to NPUW_ATTN_DEVICE so the CPU plugin
+        //      executes the op via its built-in PA executor. This path is
+        //      legacy and is expected to be removed once the NPU lowering's
+        //      runtime hook (Step 5c) is validated end-to-end.
         const auto attn_device = m_cfg.get<::intel_npu::NPUW_ATTN_DEVICE>();
         if (!attn_device.empty() && !forced_sub_devices.count(id)) {
             const auto& submodel_model = m_compiled_submodels[real_id].model;
             if (submodel_model) {
                 for (const auto& op : submodel_model->get_ordered_ops()) {
-                    if (ov::as_type_ptr<ov::op::PagedAttentionExtension>(op)) {
-                        LOG_INFO("Subgraph[" << id << "] contains PagedAttentionExtension; routing to "
-                                              << attn_device);
-                        forced_sub_devices[id] = attn_device;
-                        break;
+                    if (!ov::as_type_ptr<ov::op::PagedAttentionExtension>(op)) {
+                        continue;
                     }
+                    // PA op detected. Decide: NPU lowering or CPU fallback?
+                    const auto& funcall = orderedSubgraphs[id]._funcall;
+                    const bool npu_lowering_ready =
+                        !funcall.empty() && partitioning.functions.count(funcall) &&
+                        partitioning.functions.at(funcall)._paged_attention &&
+                        partitioning.functions.at(funcall)._paged_attention->is_valid();
+                    if (npu_lowering_ready) {
+                        LOG_INFO("Subgraph[" << id << "] contains PagedAttentionExtension; NPU lowering active, "
+                                              << "skipping CPU auto-route.");
+                    } else {
+                        LOG_INFO("Subgraph[" << id << "] contains PagedAttentionExtension; routing to "
+                                              << attn_device << " (NPU lowering not available).");
+                        forced_sub_devices[id] = attn_device;
+                    }
+                    break;
                 }
             }
         }
