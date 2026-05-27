@@ -183,7 +183,7 @@ std::optional<PagedAttention> PagedAttention::from(const std::shared_ptr<ov::Mod
 
     // Build the two tile sub-models. The body is the SAME online softmax HFA
     // already runs on NPU (host_flash_attention.cpp:264-297); we reuse
-    // create_hfa_tile_model so PA and SDPA share the kernel, with PA's block
+    // create_online_softmax_tile_model so PA and SDPA share the kernel, with PA's block
     // size as the tile size. The runtime orchestrator (Step 5) feeds these
     // with K/V slices fetched via the block table instead of from an
     // SDPA-Concat input.
@@ -205,7 +205,7 @@ std::optional<PagedAttention> PagedAttention::from(const std::shared_ptr<ov::Mod
     const ov::element::Type output_dtype = pa->get_output_element_type(0);
 
     try {
-        out._tile_model = create_hfa_tile_model(q_shape,
+        out._tile_model = create_online_softmax_tile_model(q_shape,
                                                 input_dtype,
                                                 mask_dtype,
                                                 /*tile_size=*/out._block_size,
@@ -214,7 +214,7 @@ std::optional<PagedAttention> PagedAttention::from(const std::shared_ptr<ov::Mod
                                                 /*fused_flash_attention=*/false,
                                                 /*output_dtype=*/output_dtype);
 
-        out._final_tile_model = create_hfa_tile_model(q_shape,
+        out._final_tile_model = create_online_softmax_tile_model(q_shape,
                                                       input_dtype,
                                                       mask_dtype,
                                                       /*tile_size=*/out._block_size,
@@ -229,22 +229,22 @@ std::optional<PagedAttention> PagedAttention::from(const std::shared_ptr<ov::Mod
         return out;
     }
 
-    // create_hfa_tile_model produces a model with Parameters in this order
+    // create_online_softmax_tile_model produces a model with Parameters in this order
     // (see host_flash_attention.cpp:685-686):
     //   0 past_acc, 1 past_max, 2 past_d, 3 k_tile, 4 v_tile, 5 q, 6 mask_tile
-    out._tile_param_index_map[HFATileInputId::PAST_ACC] = 0;
-    out._tile_param_index_map[HFATileInputId::PAST_MAX] = 1;
-    out._tile_param_index_map[HFATileInputId::PAST_D] = 2;
-    out._tile_param_index_map[HFATileInputId::K_TILE] = 3;
-    out._tile_param_index_map[HFATileInputId::V_TILE] = 4;
-    out._tile_param_index_map[HFATileInputId::Q] = 5;
-    out._tile_param_index_map[HFATileInputId::MASK_TILE] = 6;
+    out._tile_param_index_map[OnlineSoftmaxTileInputId::PAST_ACC] = 0;
+    out._tile_param_index_map[OnlineSoftmaxTileInputId::PAST_MAX] = 1;
+    out._tile_param_index_map[OnlineSoftmaxTileInputId::PAST_D] = 2;
+    out._tile_param_index_map[OnlineSoftmaxTileInputId::K_TILE] = 3;
+    out._tile_param_index_map[OnlineSoftmaxTileInputId::V_TILE] = 4;
+    out._tile_param_index_map[OnlineSoftmaxTileInputId::Q] = 5;
+    out._tile_param_index_map[OnlineSoftmaxTileInputId::MASK_TILE] = 6;
 
     // Regular tile Results: {acc, maxx, d} — see create_regular_tile_outputs
     // (host_flash_attention.cpp:491-517).
-    out._tile_output_index_map[HFATileOutputId::ACC] = 0;
-    out._tile_output_index_map[HFATileOutputId::MAXX] = 1;
-    out._tile_output_index_map[HFATileOutputId::D] = 2;
+    out._tile_output_index_map[OnlineSoftmaxTileOutputId::ACC] = 0;
+    out._tile_output_index_map[OnlineSoftmaxTileOutputId::MAXX] = 1;
+    out._tile_output_index_map[OnlineSoftmaxTileOutputId::D] = 2;
 
     LOG_INFO("function::PagedAttention::from: built tile sub-models. tile_model="
              << out._tile_model->get_friendly_name() << " final_tile_model="
