@@ -1140,6 +1140,18 @@ const ov::npuw::compiled::HostFlashAttention* get_compiled_hfa(const v1::subgrap
     return get_compiled_state<ov::npuw::compiled::HostFlashAttention>(context);
 }
 
+void put_compiled_pa(v1::subgraphs::Context& context, CompiledPagedState state) {
+    context.put<CompiledPagedState>(std::move(state));
+}
+
+ov::npuw::compiled::PagedAttention* get_compiled_pa(v1::subgraphs::Context& context) {
+    return get_compiled_state<ov::npuw::compiled::PagedAttention>(context);
+}
+
+const ov::npuw::compiled::PagedAttention* get_compiled_pa(const v1::subgraphs::Context& context) {
+    return get_compiled_state<ov::npuw::compiled::PagedAttention>(context);
+}
+
 bool has_compiled_state(const v1::subgraphs::CompiledPipeline& pipeline) {
     return get_compiled_dynamic(pipeline.context) != nullptr || get_compiled_pyramid(pipeline.context) != nullptr ||
            get_compiled_hfa(pipeline.context) != nullptr;
