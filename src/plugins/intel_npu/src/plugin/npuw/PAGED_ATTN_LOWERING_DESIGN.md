@@ -30,7 +30,7 @@ Required feature: **dynamic block growth** — the number of blocks per request 
 
 ### HFA already implements online softmax on NPU
 
-`host_flash_attention.cpp:264-297` is FlashAttention's online softmax built from primitives the NPU compiler already supports (MatMul, Add, Subtract, Exp, ReduceMax, ReduceSum, Multiply):
+`online_softmax_tile.cpp (online-softmax body)` is FlashAttention's online softmax built from primitives the NPU compiler already supports (MatMul, Add, Subtract, Exp, ReduceMax, ReduceSum, Multiply):
 
 ```cpp
 maxx  = Maximum(qkm_max, past_max)         // m_new
@@ -117,12 +117,16 @@ For NPUW LLMPipeline (single-sequence), `B_seq = 1`, so `subsequence_begins = [0
 
 ```
 src/plugins/intel_npu/src/plugin/npuw/
-├── host_flash_attention.{hpp,cpp}    ← existing, unchanged
-├── paged_attn_runtime.{hpp,cpp}      ← NEW
+├── online_softmax_tile.{hpp,cpp}     ← NEW: shared FlashAttention tile kernel
+│                                       (extracted from host_flash_attention.cpp)
+├── host_flash_attention.{hpp,cpp}    ← SDPA-side consumer of the tile kernel
+├── paged_attn_runtime.{hpp,cpp}      ← NEW: PA-side consumer + runtime extension
 └── attn/attn_subgraph.cpp            ← extended: detect & route PA tile loop
 ```
 
 We do **not** add a new IR pass. The skeleton `paged_attn_to_hfa_tiles.{hpp,cpp}` was a misread of the architecture and is removed in favour of this design.
+
+The tile builder was moved from `host_flash_attention.{hpp,cpp}` into its own `online_softmax_tile.{hpp,cpp}` module: the kernel is just one iteration of FlashAttention's online-softmax loop and is independent of any particular caller. Both HFA's SDPA path and PA's lowering now compose this shared kernel into their own runtime orchestrators.
 
 ### The `PagedAttention` struct (in `paged_attn_runtime.hpp`)
 
