@@ -15,10 +15,13 @@
 #include "../host_flash_attention.hpp"
 #include "../infer_request_utils.hpp"
 #include "../just_sync_infer_request.hpp"
+#include "../kv_cache_block_manager.hpp"
 #include "../logging.hpp"
+#include "../paged_attn_runtime.hpp"
 #include "../partitioning/partitioning.hpp"
 #include "../partitioning/patterns/paged_attn.hpp"
 #include "../partitioning/patterns/sdpa.hpp"
+#include "openvino/runtime/make_tensor.hpp"
 #include "../pyramid_attention.hpp"
 #include "../serialization.hpp"
 
@@ -51,6 +54,21 @@ struct HFARequestSet {
     std::array<ov::SoPtr<ov::IAsyncInferRequest>, COUNT> pipeline_requests{};
 };
 
+// Per-subgraph runtime state for the PagedAttention NPU lowering. One
+// instance lives in RuntimeState alongside the HFA equivalents. Allocated
+// lazily on the first prepare_paged() call.
+struct PagedRuntimeState {
+    ov::SoPtr<ov::IAsyncInferRequest> tile_request;
+    ov::SoPtr<ov::IAsyncInferRequest> final_tile_request;
+    // Persistent (acc, max, d) state threaded across tile-loop iterations.
+    ov::SoPtr<ov::ITensor> state_acc;
+    ov::SoPtr<ov::ITensor> state_max;
+    ov::SoPtr<ov::ITensor> state_d;
+    // Mask tile buffer, refilled in place per iteration.
+    ov::SoPtr<ov::ITensor> mask_tile_buffer;
+    bool initialized = false;
+};
+
 struct RuntimeState {
     std::unordered_map<std::size_t, BehaviorIO> call_io;
     runtime::attention::Selector::Ptr attention_selector;
@@ -60,6 +78,7 @@ struct RuntimeState {
     std::optional<runtime::host_flash_attention::HFARuntimeContext> hfa_runtime_ctx;
     PyramidRequestSet pyramid_requests;
     HFARequestSet hfa_requests;
+    PagedRuntimeState pa_state;
     ov::SoPtr<ov::IAsyncInferRequest> base_request;
     ov::SoPtr<ov::IAsyncInferRequest> base_pipeline_request;
 };
@@ -425,6 +444,159 @@ void prepare_hfa(ov::npuw::v1::subgraphs::InferContext& ctx) {
     }
 }
 
+// Fill the persistent (acc, max, d) state tensors for a fresh tile-loop
+// pass. acc=0, d=0, max=most-negative-finite. Mirrors the math in
+// runtime::host_flash_attention::HFARuntimeContext::initialize_state_tensors
+// but operates on the PA state buffers, which carry the same dtype/shape
+// contract via OnlineSoftmaxTileInputId::PAST_*.
+void initialize_pa_state(PagedRuntimeState& pa_state) {
+    if (pa_state.state_acc) {
+        ov::npuw::util::fill_tensor_bytes(pa_state.state_acc, 0u);
+    }
+    if (pa_state.state_d) {
+        ov::npuw::util::fill_tensor_bytes(pa_state.state_d, 0u);
+    }
+    if (!pa_state.state_max) {
+        return;
+    }
+    const auto et = pa_state.state_max->get_element_type();
+    const auto n = pa_state.state_max->get_size();
+    if (et == ov::element::f32) {
+        auto* p = pa_state.state_max->data<float>();
+        const float v = std::numeric_limits<float>::lowest();
+        for (std::size_t i = 0; i < n; ++i) p[i] = v;
+    } else if (et == ov::element::f16) {
+        // -65504 (most-negative finite f16), bit pattern 0xFBFF
+        auto* p = reinterpret_cast<uint16_t*>(pa_state.state_max->data());
+        for (std::size_t i = 0; i < n; ++i) p[i] = 0xFBFF;
+    } else {
+        OPENVINO_THROW("PA tile loop: unsupported PAST_MAX element type ", et.get_type_name());
+    }
+}
+
+// Materialize the mask tile [batch, 1, query_size, block_size] for one
+// iteration of the cached-block loop. Slot k in logical block block_idx
+// is valid (mask=0) iff its absolute key position (block_idx*block_size+k)
+// is < past_lens (cache fill). Otherwise -inf. No per-query variation —
+// every query in this step is, by construction, newer than any cached
+// position, so the mask is purely a validity gate.
+void fill_pa_mask_for_cached_block(const ov::SoPtr<ov::ITensor>& mask_tile,
+                                   uint32_t past_lens,
+                                   uint32_t block_idx) {
+    const auto shape = mask_tile->get_shape();
+    NPUW_ASSERT(shape.size() == 4);
+    const auto query_size = shape[2];
+    const auto block_size = shape[3];
+    const uint64_t k_abs_start = static_cast<uint64_t>(block_idx) * static_cast<uint64_t>(block_size);
+    const auto et = mask_tile->get_element_type();
+    if (et == ov::element::f32) {
+        auto* data = mask_tile->data<float>();
+        const float neg = std::numeric_limits<float>::lowest();
+        for (std::size_t q = 0; q < query_size; ++q) {
+            for (std::size_t k = 0; k < block_size; ++k) {
+                data[q * block_size + k] = ((k_abs_start + k) < past_lens) ? 0.0f : neg;
+            }
+        }
+    } else if (et == ov::element::f16) {
+        auto* data = reinterpret_cast<uint16_t*>(mask_tile->data());
+        for (std::size_t q = 0; q < query_size; ++q) {
+            for (std::size_t k = 0; k < block_size; ++k) {
+                data[q * block_size + k] = ((k_abs_start + k) < past_lens) ? uint16_t{0x0000} : uint16_t{0xFBFF};
+            }
+        }
+    } else {
+        OPENVINO_THROW("PA tile loop: unsupported MASK_TILE element type ", et.get_type_name());
+    }
+}
+
+// Materialize the mask tile for the FINAL iteration that attends over the
+// new tokens' K/V. Strictly causal within the new-token window:
+//   mask[q, k] = 0     iff k <= q && k < new_tokens
+//   mask[q, k] = -inf  otherwise
+void fill_pa_mask_for_present(const ov::SoPtr<ov::ITensor>& mask_tile, uint32_t new_tokens) {
+    const auto shape = mask_tile->get_shape();
+    NPUW_ASSERT(shape.size() == 4);
+    const auto query_size = shape[2];
+    const auto block_size = shape[3];
+    const auto et = mask_tile->get_element_type();
+    if (et == ov::element::f32) {
+        auto* data = mask_tile->data<float>();
+        const float neg = std::numeric_limits<float>::lowest();
+        for (std::size_t q = 0; q < query_size; ++q) {
+            for (std::size_t k = 0; k < block_size; ++k) {
+                const bool ok = (k <= q) && (k < new_tokens);
+                data[q * block_size + k] = ok ? 0.0f : neg;
+            }
+        }
+    } else if (et == ov::element::f16) {
+        auto* data = reinterpret_cast<uint16_t*>(mask_tile->data());
+        for (std::size_t q = 0; q < query_size; ++q) {
+            for (std::size_t k = 0; k < block_size; ++k) {
+                const bool ok = (k <= q) && (k < new_tokens);
+                data[q * block_size + k] = ok ? uint16_t{0x0000} : uint16_t{0xFBFF};
+            }
+        }
+    } else {
+        OPENVINO_THROW("PA tile loop: unsupported MASK_TILE element type ", et.get_type_name());
+    }
+}
+
+void ensure_paged_requests(ov::npuw::v1::subgraphs::InferContext& ctx, RuntimeState& state) {
+    if (state.pa_state.initialized) {
+        return;
+    }
+
+    const auto& pipeline = get_subgraph_pipeline(ctx, ctx.real_subgraph_idx);
+    auto* pa = ov::npuw::attn::get_compiled_pa(pipeline.context);
+    OPENVINO_ASSERT(pa != nullptr,
+                    "ensure_paged_requests: missing compiled PA state in subgraph context");
+
+    // The partition_stage hook constructs compiled::PagedAttention without
+    // tile-model handles (the partitioner has no back-reference to
+    // LLMCompiledModel where setup_paged_runtime() stored the compiled
+    // tile sub-models). Real handle resolution is left as a follow-up to
+    // be done together with the NPUW runtime team — see open question #6
+    // in PAGED_ATTN_LOWERING_DESIGN.md ("compiled-handle propagation").
+    OPENVINO_ASSERT(pa->is_valid(),
+                    "ensure_paged_requests: PagedAttention compiled tile handles are NULL. "
+                    "The partitioner -> attn_subgraph compiled-handle bridge is not yet wired; "
+                    "set NPUW_ATTN_PAGED_NPU_LOWERING=NO (default) to use the CPU PA fallback.");
+
+    state.pa_state.tile_request = pa->_compiled_tile_model->create_infer_request();
+    state.pa_state.final_tile_request = pa->_compiled_final_tile_model->create_infer_request();
+
+    const auto port_of = [&](OnlineSoftmaxTileInputId id) {
+        return state.pa_state.tile_request->get_compiled_model()->inputs().at(static_cast<std::size_t>(id));
+    };
+    const auto acc_port = port_of(OnlineSoftmaxTileInputId::PAST_ACC);
+    const auto max_port = port_of(OnlineSoftmaxTileInputId::PAST_MAX);
+    const auto d_port = port_of(OnlineSoftmaxTileInputId::PAST_D);
+    const auto mask_port = port_of(OnlineSoftmaxTileInputId::MASK_TILE);
+
+    state.pa_state.state_acc =
+        ov::SoPtr<ov::ITensor>(ov::make_tensor(acc_port.get_element_type(), acc_port.get_shape()), nullptr);
+    state.pa_state.state_max =
+        ov::SoPtr<ov::ITensor>(ov::make_tensor(max_port.get_element_type(), max_port.get_shape()), nullptr);
+    state.pa_state.state_d =
+        ov::SoPtr<ov::ITensor>(ov::make_tensor(d_port.get_element_type(), d_port.get_shape()), nullptr);
+    state.pa_state.mask_tile_buffer =
+        ov::SoPtr<ov::ITensor>(ov::make_tensor(mask_port.get_element_type(), mask_port.get_shape()), nullptr);
+
+    state.pa_state.initialized = true;
+}
+
+void prepare_paged(ov::npuw::v1::subgraphs::InferContext& ctx) {
+    auto& request = get_request(ctx);
+    auto& state = get_runtime_state(ctx);
+    ensure_base_requests(ctx, state);
+    ensure_paged_requests(ctx, state);
+    state.cached_attention_mask = {};
+    request.set_active_subrequest(ctx.real_subgraph_idx, state.base_request);
+    if (request.is_subrequest_pipelined(ctx.real_subgraph_idx)) {
+        request.set_pipeline_subrequest(ctx.real_subgraph_idx, state.base_pipeline_request);
+    }
+}
+
 void extract_and_copy_tile(const ov::SoPtr<ov::ITensor>& source_tensor,
                            const ov::SoPtr<ov::ITensor>& dest_tensor,
                            uint32_t sequence_dim,
@@ -500,6 +672,9 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                     return;
                 case BehaviorKind::HFA:
                     prepare_hfa(ctx);
+                    return;
+                case BehaviorKind::Paged:
+                    prepare_paged(ctx);
                     return;
                 }
                 OPENVINO_THROW("Unsupported attention behavior kind");
@@ -656,7 +831,7 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                                                     ov::npuw::util::view(tensor, dim, 0, model_past_len));
                                             } else {
                                                 const auto& dst = ctx.target_request->get_tensor(iport);
-                                                ov::npuw::util::copy_tensor_by_dim(view,
+                                                ov::npuw::copy_tensor_by_dim(view,
                                                                                    dst,
                                                                                    static_cast<uint32_t>(dim),
                                                                                    static_cast<uint32_t>(dim));
@@ -704,6 +879,18 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                         // HFA stores all inputs including block KV tensors
                         // (past_key_blocks / past_value_blocks vectors handled transparently
                         //  since every input_idx is stored and looked up by index in run())
+                        io.inputs.at(input_idx) = tensor;
+                        return true;
+                    }
+                    return false;
+                case BehaviorKind::Paged:
+                    if (const auto* pa = ov::npuw::attn::get_compiled_pa(pipeline.context)) {
+                        // Mirrors HFA: cache every PA input by index. run() looks
+                        // them up via _pa_param_index_map[PAInputId::*].
+                        auto& io = get_behavior_io(state,
+                                                   ctx.subgraph_idx,
+                                                   get_param_base(ctx, ctx.real_subgraph_idx),
+                                                   pa->_compiled_final_tile_model->outputs().size());
                         io.inputs.at(input_idx) = tensor;
                         return true;
                     }
@@ -813,7 +1000,7 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                             }
                             const auto& dst_view = ov::npuw::util::view(dst, ATTN_KV_DIM, dst_offset, length);
                             const auto& src_view = ov::npuw::util::view(graph_mask, ATTN_KV_DIM, src_offset, length);
-                            ov::npuw::util::copy_tensor_by_dim(src_view, dst_view, ATTN_KV_DIM, ATTN_KV_DIM);
+                            ov::npuw::copy_tensor_by_dim(src_view, dst_view, ATTN_KV_DIM, ATTN_KV_DIM);
                         };
 
                         if (state.pyramid_selector->length() == -1) {
@@ -855,6 +1042,12 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                     }
                     return;
                 case BehaviorKind::HFA:
+                    return;
+                case BehaviorKind::Paged:
+                    // PA prologue is a no-op: the per-iteration mask is materialized
+                    // inside run() (no caller-supplied mask to slice from), and
+                    // initialize_pa_state() runs there too because state buffers must
+                    // be reset on every call.
                     return;
                 }
                 OPENVINO_THROW("Unsupported attention behavior kind");
@@ -1098,6 +1291,184 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                         return;
                     }
                     return;
+                case BehaviorKind::Paged: {
+                    // PagedAttention NPU lowering. One tile loop per call:
+                    //   walk active blocks (block_indices[0..num_active_blocks)),
+                    //   bind each layer-pool block as K/V tile,
+                    //   thread (acc, max, d) state across iterations,
+                    //   final tile attends over the present (new tokens) K/V,
+                    //   write the new K/V into the tail block of the pool so
+                    //   the next call sees them as cached.
+                    //
+                    // Uses the per-layer pool selected by pa_desc->_layer_index
+                    // (one PA op per attention layer). The layer managers + the
+                    // compiled tile sub-models are sourced from the
+                    // compiled::PagedAttention scaffold — the partitioner-side
+                    // compiled-handle propagation hook (TBD with the NPUW
+                    // runtime team) populates these before run() reaches here.
+                    auto* pa_desc = ov::npuw::attn::get_compiled_pa(
+                        get_subgraph_pipeline(ctx, ctx.real_subgraph_idx).context);
+                    if (pa_desc == nullptr || !pa_desc->is_valid() ||
+                        pa_desc->_layer_key_managers.empty() || pa_desc->_layer_value_managers.empty()) {
+                        OPENVINO_THROW("PagedAttention dispatch: compiled state incomplete (compiled tile "
+                                       "models or layer managers missing). The partitioner -> dispatch "
+                                       "compiled-handle bridge is not yet wired.");
+                    }
+                    if (pa_desc->_layer_index >= pa_desc->_layer_key_managers.size()) {
+                        OPENVINO_THROW("PagedAttention dispatch: layer ",
+                                       pa_desc->_layer_index,
+                                       " out of range (have ",
+                                       pa_desc->_layer_key_managers.size(),
+                                       " pools)");
+                    }
+                    const auto& layer_key = pa_desc->_layer_key_managers[pa_desc->_layer_index];
+                    const auto& layer_value = pa_desc->_layer_value_managers[pa_desc->_layer_index];
+                    OPENVINO_ASSERT(layer_key && layer_value,
+                                    "PagedAttention dispatch: layer ",
+                                    pa_desc->_layer_index,
+                                    " has no K/V pool");
+
+                    auto& io = get_behavior_io(state,
+                                               ctx.subgraph_idx,
+                                               get_param_base(ctx, ctx.real_subgraph_idx),
+                                               pa_desc->_compiled_final_tile_model->outputs().size());
+                    const auto& base = pa_desc->_pa_param_index_map;
+                    auto pa_input = [&](PAInputId id) -> ov::SoPtr<ov::ITensor> {
+                        const auto it = base.find(id);
+                        if (it == base.end()) {
+                            return {};
+                        }
+                        return io.inputs.at(it->second);
+                    };
+
+                    auto block_indices_tensor = pa_input(PAInputId::BLOCK_INDICES);
+                    auto past_lens_tensor = pa_input(PAInputId::PAST_LENS);
+                    auto subseq_begins_tensor = pa_input(PAInputId::SUBSEQUENCE_BEGINS);
+                    auto block_indices_begins_tensor = pa_input(PAInputId::BLOCK_INDICES_BEGINS);
+                    auto query_tensor = pa_input(PAInputId::QUERY);
+                    auto present_key_tensor = pa_input(PAInputId::KEY);
+                    auto present_value_tensor = pa_input(PAInputId::VALUE);
+
+                    OPENVINO_ASSERT(block_indices_tensor && past_lens_tensor && subseq_begins_tensor &&
+                                        block_indices_begins_tensor && query_tensor && present_key_tensor &&
+                                        present_value_tensor,
+                                    "PagedAttention dispatch: required input tensor missing");
+
+                    // Single-sequence path: one row of past_lens / subseq_begins /
+                    // block_indices_begins is enough. Multi-sequence batching
+                    // (ContinuousBatchingPipeline) is out of scope for v1.
+                    const auto* past_lens_data = past_lens_tensor->data<int32_t>();
+                    const auto* block_indices_begins_data = block_indices_begins_tensor->data<int32_t>();
+                    const auto* subseq_begins_data = subseq_begins_tensor->data<int32_t>();
+                    const auto* block_indices_data = block_indices_tensor->data<int32_t>();
+                    const uint32_t past_lens = static_cast<uint32_t>(past_lens_data[0]);
+                    const uint32_t bib_start = static_cast<uint32_t>(block_indices_begins_data[0]);
+                    const uint32_t bib_end = static_cast<uint32_t>(block_indices_begins_data[1]);
+                    const uint32_t num_active_blocks = bib_end - bib_start;
+                    const uint32_t new_tokens =
+                        static_cast<uint32_t>(subseq_begins_data[1] - subseq_begins_data[0]);
+
+                    initialize_pa_state(state.pa_state);
+
+                    auto& tile_req = state.pa_state.tile_request;
+                    auto& final_req = state.pa_state.final_tile_request;
+                    const auto& tile_inputs = tile_req->get_compiled_model()->inputs();
+                    const auto& tile_outputs = tile_req->get_compiled_model()->outputs();
+                    const auto& final_inputs = final_req->get_compiled_model()->inputs();
+                    const auto& final_outputs = final_req->get_compiled_model()->outputs();
+                    auto bind_tile_in = [&](OnlineSoftmaxTileInputId id, const ov::SoPtr<ov::ITensor>& t) {
+                        tile_req->set_tensor(tile_inputs.at(static_cast<std::size_t>(id)), t);
+                    };
+                    auto bind_tile_out = [&](OnlineSoftmaxTileOutputId id, const ov::SoPtr<ov::ITensor>& t) {
+                        tile_req->set_tensor(tile_outputs.at(static_cast<std::size_t>(id)), t);
+                    };
+                    auto bind_final_in = [&](OnlineSoftmaxTileInputId id, const ov::SoPtr<ov::ITensor>& t) {
+                        final_req->set_tensor(final_inputs.at(static_cast<std::size_t>(id)), t);
+                    };
+
+                    bind_tile_in(OnlineSoftmaxTileInputId::Q, query_tensor);
+                    bind_tile_in(OnlineSoftmaxTileInputId::MASK_TILE, state.pa_state.mask_tile_buffer);
+                    bind_tile_in(OnlineSoftmaxTileInputId::PAST_ACC, state.pa_state.state_acc);
+                    bind_tile_in(OnlineSoftmaxTileInputId::PAST_MAX, state.pa_state.state_max);
+                    bind_tile_in(OnlineSoftmaxTileInputId::PAST_D, state.pa_state.state_d);
+                    bind_tile_out(OnlineSoftmaxTileOutputId::ACC, state.pa_state.state_acc);
+                    bind_tile_out(OnlineSoftmaxTileOutputId::MAXX, state.pa_state.state_max);
+                    bind_tile_out(OnlineSoftmaxTileOutputId::D, state.pa_state.state_d);
+
+                    // The cached-block tile loop. The "tail" block (the one being
+                    // filled by the new tokens) is excluded — it is consumed by
+                    // the final tile via the present K/V tensors instead. So we
+                    // iterate up to (num_active_blocks - 1).
+                    const uint32_t cached_block_count = num_active_blocks > 0 ? num_active_blocks - 1 : 0;
+                    for (uint32_t i = 0; i < cached_block_count; ++i) {
+                        fill_pa_mask_for_cached_block(state.pa_state.mask_tile_buffer, past_lens, i);
+                        const auto phys_id = static_cast<uint32_t>(block_indices_data[bib_start + i]);
+                        auto k_block = layer_key->get_block_tensor(phys_id);
+                        auto v_block = layer_value->get_block_tensor(phys_id);
+                        bind_tile_in(OnlineSoftmaxTileInputId::K_TILE, k_block);
+                        bind_tile_in(OnlineSoftmaxTileInputId::V_TILE, v_block);
+                        tile_req->infer();
+                    }
+
+                    // Final tile: present K/V from this step. Mask switches to
+                    // causal-within-new-tokens. Output is the layer's attention
+                    // result, written into io.outputs[0] for downstream consumers.
+                    fill_pa_mask_for_present(state.pa_state.mask_tile_buffer, new_tokens);
+                    bind_final_in(OnlineSoftmaxTileInputId::Q, query_tensor);
+                    bind_final_in(OnlineSoftmaxTileInputId::MASK_TILE, state.pa_state.mask_tile_buffer);
+                    bind_final_in(OnlineSoftmaxTileInputId::PAST_ACC, state.pa_state.state_acc);
+                    bind_final_in(OnlineSoftmaxTileInputId::PAST_MAX, state.pa_state.state_max);
+                    bind_final_in(OnlineSoftmaxTileInputId::PAST_D, state.pa_state.state_d);
+                    bind_final_in(OnlineSoftmaxTileInputId::K_TILE, present_key_tensor);
+                    bind_final_in(OnlineSoftmaxTileInputId::V_TILE, present_value_tensor);
+                    if (!io.outputs.empty() && io.outputs.at(0)) {
+                        final_req->set_tensor(final_outputs.at(0), io.outputs.at(0));
+                    }
+                    final_req->infer();
+
+                    // Write the new K/V into the tail block of the pool so the
+                    // next call sees them as cached. SDPAToPagedAttention's PA
+                    // op does this implicitly inside its CPU executor; we have
+                    // to do it explicitly because the lowering replaces the
+                    // executor.
+                    if (num_active_blocks > 0) {
+                        const auto tail_phys_id =
+                            static_cast<uint32_t>(block_indices_data[bib_start + num_active_blocks - 1]);
+                        auto tail_k = layer_key->get_block_tensor(tail_phys_id);
+                        auto tail_v = layer_value->get_block_tensor(tail_phys_id);
+                        const uint32_t tail_offset = past_lens % static_cast<uint32_t>(pa_desc->_block_size);
+                        // Mirrors KVCacheBlockManager's expected layout: copy into
+                        // the [tail_offset .. tail_offset+new_tokens) slot of the
+                        // sequence dimension. We bail with an assert if the slot
+                        // would overflow — the partitioner is supposed to grow a
+                        // new tail block before that happens.
+                        OPENVINO_ASSERT(tail_offset + new_tokens <= static_cast<uint32_t>(pa_desc->_block_size),
+                                        "PagedAttention dispatch: tail-block overflow at layer ",
+                                        pa_desc->_layer_index,
+                                        " (tail_offset=",
+                                        tail_offset,
+                                        " new_tokens=",
+                                        new_tokens,
+                                        " block_size=",
+                                        pa_desc->_block_size,
+                                        "). Block-table growth must precede this call.");
+                        // Sequence dimension differs between K and V (axis 2 for K,
+                        // axis 3 for V — see online_softmax_tile.cpp:create_tile_params).
+                        ov::npuw::copy_tensor_by_dim(
+                            ov::npuw::util::view(present_key_tensor, /*seq_dim=*/2, 0, new_tokens),
+                            ov::npuw::util::view(tail_k, /*seq_dim=*/2, tail_offset, new_tokens),
+                            /*src_dim=*/2,
+                            /*dst_dim=*/2);
+                        ov::npuw::copy_tensor_by_dim(
+                            ov::npuw::util::view(present_value_tensor, /*seq_dim=*/3, 0, new_tokens),
+                            ov::npuw::util::view(tail_v, /*seq_dim=*/3, tail_offset, new_tokens),
+                            /*src_dim=*/3,
+                            /*dst_dim=*/3);
+                        layer_key->update_block_tokens(tail_phys_id, tail_offset + new_tokens);
+                        layer_value->update_block_tokens(tail_phys_id, tail_offset + new_tokens);
+                    }
+                    return;
+                }
                 }
                 OPENVINO_THROW("Unsupported attention behavior kind");
             }
@@ -1321,17 +1692,30 @@ std::vector<ov::npuw::v1::subgraphs::ScopedPatternRegistration> register_pattern
             return;
         }
         if (f._paged_attention.has_value() && f._paged_attention->is_valid()) {
-            // PagedAttention NPU lowering: the partitioner attached the
-            // function-side struct (with built tile sub-models). The
-            // CompiledPipeline compile_stage will receive those models and,
-            // when the runtime dispatch (Step 5c) is in place, populate the
-            // compiled::PagedAttention scaffold via put_compiled_pa(). For
-            // now we don't push a BehaviorKind::Paged value yet — the run()
-            // switch has no case for it, and the existing CPU auto-route
-            // continues to provide execution. Logging here documents that
-            // the lowering reached this stage.
-            LOG_INFO("PagedAttention NPU lowering: function::PagedAttention populated for subgraph; "
-                     "runtime dispatch hook (Step 5c) is next.");
+            // PagedAttention NPU lowering. Both the compiled tile sub-models
+            // and the per-layer KV pool managers are sourced from the
+            // PagedAttentionPartitionerScope thread-local set up by the LLM
+            // compile path before invoking the partitioner. The partitioner
+            // has no back-reference to LLMCompiledModel, so this thread-local
+            // is the handoff. Without a context, we don't push BehaviorKind::Paged
+            // and the legacy CPU PA auto-route handles execution.
+            const auto& fpa = f._paged_attention.value();
+            const auto* pa_ctx = ov::npuw::function::current_pa_partitioner_context();
+            if (pa_ctx == nullptr || !pa_ctx->compiled_tile_model || !pa_ctx->compiled_final_tile_model) {
+                LOG_WARN("PagedAttention NPU lowering: no partitioner context for compiled handles; "
+                         "falling back to CPU PA auto-route for layer "
+                         << fpa._layer_index);
+            } else {
+                put_compiled_pa(ctx,
+                                std::make_shared<ov::npuw::compiled::PagedAttention>(fpa,
+                                                                                     pa_ctx->compiled_tile_model,
+                                                                                     pa_ctx->compiled_final_tile_model,
+                                                                                     pa_ctx->key_managers,
+                                                                                     pa_ctx->value_managers));
+                ctx.put<BehaviorKind>(BehaviorKind::Paged);
+                LOG_INFO("PagedAttention NPU lowering: pushed BehaviorKind::Paged for layer "
+                         << fpa._layer_index);
+            }
         }
     };
     attn_behavior.compile_stage = [](ov::npuw::v1::subgraphs::CompiledPipeline& compiled_pipeline,
@@ -1340,6 +1724,11 @@ std::vector<ov::npuw::v1::subgraphs::ScopedPatternRegistration> register_pattern
         if (kind == nullptr) {
             return;
         }
+        // For PA: at partition_stage we pushed BehaviorKind::Paged but the
+        // compiled::PagedAttention handle in the context still points at
+        // the un-narrowed compiled-model handles set by setup_paged_runtime
+        // — those are valid across the lifetime of the LLMCompiledModel.
+        // Nothing extra to do at compile_stage beyond attach_runtime_behavior.
         attach_runtime_behavior(compiled_pipeline, compiled_context, *kind);
     };
     registrations.emplace_back(registry.add(std::move(attn_behavior)));
