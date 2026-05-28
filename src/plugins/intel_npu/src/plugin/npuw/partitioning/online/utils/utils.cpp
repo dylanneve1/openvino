@@ -15,11 +15,38 @@ std::string ov::npuw::online::util::getMetaDesc(const std::shared_ptr<ov::Node>&
     std::stringstream ss;
     ss << ov_node->description() << ' ';
 
+    // PagedAttentionExtension declares 3 outputs but the latter two (scores,
+    // adaptive-rkv diversity) carry intrinsically-dynamic ranks driven by
+    // runtime values (past_lens, evictable_sizes). Falling back to the
+    // PartialShape print preserves the metadesc stability that get_shape()
+    // would otherwise crash on.
+    auto shape_str = [](const ov::Output<ov::Node>& port) {
+        const auto& ps = port.get_partial_shape();
+        if (ps.is_static()) {
+            std::stringstream s;
+            s << ps.get_shape();
+            return s.str();
+        }
+        std::stringstream s;
+        s << ps;
+        return s.str();
+    };
+    auto shape_str_in = [](const ov::Input<ov::Node>& port) {
+        const auto& ps = port.get_partial_shape();
+        if (ps.is_static()) {
+            std::stringstream s;
+            s << ps.get_shape();
+            return s.str();
+        }
+        std::stringstream s;
+        s << ps;
+        return s.str();
+    };
     for (const auto& input : ov_node->inputs()) {
-        ss << input.get_element_type() << ' ' << input.get_shape() << ' ';
+        ss << input.get_element_type() << ' ' << shape_str_in(input) << ' ';
     }
     for (const auto& output : ov_node->outputs()) {
-        ss << output.get_element_type() << ' ' << output.get_shape() << ' ';
+        ss << output.get_element_type() << ' ' << shape_str(output) << ' ';
     }
 
     ReadAttributes visitor_node;

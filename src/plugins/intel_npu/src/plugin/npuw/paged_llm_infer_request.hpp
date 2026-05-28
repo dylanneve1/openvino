@@ -34,7 +34,7 @@ private:
     void infer_generate(ov::SoPtr<ov::ITensor> input_ids,
                         ov::SoPtr<ov::ITensor> attention_mask,
                         ov::SoPtr<ov::ITensor> position_ids);
-    void update_block_table();
+    void update_block_table(uint32_t tokens_this_step);
 
     std::shared_ptr<ov::IAsyncInferRequest> m_prefill_request;
     std::shared_ptr<ov::IAsyncInferRequest> m_generate_request;
@@ -46,7 +46,9 @@ private:
 
     // This model is optional, so can be null.
     std::shared_ptr<ov::IAsyncInferRequest> m_lm_head_request;
+    ov::Output<const ov::Node> m_lm_head_input_port;
     ov::Output<const ov::Node> m_lm_head_logits_port;
+    ov::SoPtr<ov::ITensor> m_lm_head_input_tensor;
 
     ov::SoPtr<ov::ITensor> m_logits;
 
@@ -63,6 +65,11 @@ private:
     std::vector<ov::SoPtr<ov::ITensor>> m_value_cache_tensors;
 
     bool m_first_infer = true;
+
+    // Real prompt length last seen at prefill, before padding to max_prompt_size.
+    // The shared LM head reads the embedding at position [seq_len - 1] of the
+    // prefill output to produce logits for the first generated token.
+    uint32_t m_last_prefill_seq_len = 0;
 
     std::string m_input_ids_name;
 };

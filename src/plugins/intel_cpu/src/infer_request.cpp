@@ -377,7 +377,14 @@ void SyncInferRequest::set_tensor(const ov::Output<const ov::Node>& in_port, con
             OPENVINO_THROW("ParameterMismatch: Failed to set tensor for input with precision: ",
                            tensor->get_element_type(),
                            ", since the model input tensor precision is: ",
-                           netInPrc);
+                           netInPrc,
+                           " (port name='",
+                           port.get_any_name(),
+                           "', shape=",
+                           port.get_partial_shape(),
+                           ", tensor shape=",
+                           tensor->get_shape(),
+                           ")");
         }
 
         const auto& shape = port.get_partial_shape();
