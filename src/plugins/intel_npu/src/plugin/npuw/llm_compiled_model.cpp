@@ -1246,16 +1246,25 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     // BakePagedAttentionStaticShapes already baked on the NPUW side and
     // produces a precision mismatch at set_tensor time.
     if (m_pa_mode) {
-        // Keep K/V cache exactly f16 (matches the [num_blocks, H, block_size,
-        // head_dim] shape baked by BakePagedAttentionStaticShapes). Pin
-        // inferencePrecision = f32 so format_cache_precision keeps the cache
-        // type unchanged (it only promotes f16→bf16 when infer is bf16) AND
-        // the math keeps full precision — running PA at f16 caused NaN
-        // accumulation on long-ish prompts.
         prefill_config[ov::hint::kv_cache_precision.name()] = ov::element::f16;
         generate_config[ov::hint::kv_cache_precision.name()] = ov::element::f16;
-        prefill_config[ov::hint::inference_precision.name()] = ov::element::f32;
-        generate_config[ov::hint::inference_precision.name()] = ov::element::f32;
+
+        // Inference precision: only the CPU PA executor needs f32 — running
+        // its softmax+matmul at f16 caused NaN accumulation on long-ish
+        // prompts. The NPU plugin only accepts f16/i8, so keep the default
+        // there. The CPU plugin's format_cache_precision leaves f16 cache
+        // unchanged when infer is f32 (it only promotes f16→bf16 for bf16
+        // infer), so KV-cache precision stays consistent.
+        auto pa_devices = [&](const ov::AnyMap& cfg) {
+            auto it = cfg.find("NPUW_DEVICES");
+            return it == cfg.end() ? std::string("NPU") : it->second.as<std::string>();
+        };
+        if (pa_devices(prefill_config).find("CPU") != std::string::npos) {
+            prefill_config[ov::hint::inference_precision.name()] = ov::element::f32;
+        }
+        if (pa_devices(generate_config).find("CPU") != std::string::npos) {
+            generate_config[ov::hint::inference_precision.name()] = ov::element::f32;
+        }
     }
 
     // Note: with dynamic attention in EITHER STAGE, we have to
