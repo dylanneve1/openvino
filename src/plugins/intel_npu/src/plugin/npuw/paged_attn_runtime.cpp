@@ -9,8 +9,15 @@
 #include <vector>
 
 #include "logging.hpp"
+#include "openvino/op/add.hpp"
+#include "openvino/op/concat.hpp"
 #include "openvino/op/constant.hpp"
+#include "openvino/op/convert.hpp"
+#include "openvino/op/multiply.hpp"
 #include "openvino/op/paged_attention.hpp"
+#include "openvino/op/reshape.hpp"
+#include "openvino/op/transpose.hpp"
+#include "openvino/op/unsqueeze.hpp"
 
 namespace ov {
 namespace npuw {
@@ -95,10 +102,39 @@ std::optional<std::size_t> param_index_of(const std::shared_ptr<ov::Model>& mode
     return std::nullopt;
 }
 
-// Record the parameter index for each of the PA op's inputs that is itself
-// a Parameter on the model. Inputs that come from Constants (e.g. SCALE,
-// MAX_CONTEXT_LEN once baked) are skipped — those values are read directly
-// from the constant during tile-model construction (Step 3b).
+// Walk back through "glue" ops (Reshape, Transpose, Convert, Multiply, Add,
+// Concat, Unsqueeze) from a node until we find a Parameter on `model`.
+// Returns nullopt if the chain hits a non-glue, non-Parameter node.
+std::optional<std::size_t> find_upstream_param_index(const std::shared_ptr<ov::Model>& model,
+                                                     const std::shared_ptr<ov::Node>& node) {
+    if (!node) {
+        return std::nullopt;
+    }
+    if (auto idx = param_index_of(model, node)) {
+        return idx;
+    }
+    // Walk only single-source glue ops, otherwise stop.
+    if (node->get_input_size() == 0) {
+        return std::nullopt;
+    }
+    auto is_glue = [](const std::shared_ptr<ov::Node>& n) {
+        return ov::is_type<ov::op::v1::Reshape>(n) || ov::is_type<ov::op::v1::Transpose>(n) ||
+               ov::is_type<ov::op::v0::Convert>(n) || ov::is_type<ov::op::v1::Multiply>(n) ||
+               ov::is_type<ov::op::v1::Add>(n) || ov::is_type<ov::op::v0::Concat>(n) ||
+               ov::is_type<ov::op::v0::Unsqueeze>(n);
+    };
+    if (!is_glue(node)) {
+        return std::nullopt;
+    }
+    return find_upstream_param_index(model, node->get_input_node_shared_ptr(0));
+}
+
+// Record the parameter index for each of the PA op's inputs. Direct
+// Parameters are picked up immediately; Q/K/V come through a glue chain
+// (Reshape / Transpose / Convert / ...) introduced by SDPAToPagedAttention,
+// so we walk that chain to find the upstream Parameter the function-call
+// machinery binds at runtime. Constants (e.g. SCALE, MAX_CONTEXT_LEN once
+// baked) are skipped — those values are read at tile-model construction.
 void record_param_indices(const std::shared_ptr<ov::Model>& model,
                           const std::shared_ptr<ov::op::PagedAttentionExtension>& pa,
                           std::map<PAInputId, std::size_t>& out) {
@@ -108,7 +144,7 @@ void record_param_indices(const std::shared_ptr<ov::Model>& model,
 
     for (std::size_t i = 0; i < count; ++i) {
         const auto src = pa->get_input_node_shared_ptr(i);
-        if (auto idx = param_index_of(model, src)) {
+        if (auto idx = find_upstream_param_index(model, src)) {
             out.emplace(static_cast<PAInputId>(i), *idx);
         }
     }
