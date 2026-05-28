@@ -21,13 +21,15 @@ PagedLLMInferRequest::PagedLLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
 
     m_block_size = compiled_model->m_pa_block_size;
     m_max_seqs = compiled_model->m_pa_max_seqs;
-    // The NPU-resident tile-loop dispatch only fires when both the per-layer
-    // KV pools and the compiled tile sub-models were successfully built — see
-    // setup_paged_block_managers / setup_paged_runtime. If either is missing,
-    // attn_subgraph leaves the PA op in place and execution falls through to
-    // the CPU PA executor, which expects different q_len semantics.
-    m_npu_lowering = compiled_model->m_pa_npu_lowering && !compiled_model->m_pa_layer_managers.empty() &&
-                     compiled_model->m_pa_tile_compiled && compiled_model->m_pa_final_tile_compiled;
+    // The NPU-resident tile-loop dispatch path is currently inactive on the
+    // LLMPipeline path (see PAGED_ATTN_LOWERING_DESIGN.md). The CPU PA
+    // executor handles every PA op compile, and it requires q_len = B_token
+    // (padded length) to keep concat_pastkv's slot_mapping initialised.
+    // Flip this to true once the NPU dispatch path is wired end-to-end:
+    // tile sub-models compiled, partition_stage attn isolation enabled,
+    // and Q layout reshape from [B_token, H*S] to [1, H, B_token, S]
+    // landed in attn_subgraph::PA dispatch.
+    m_npu_lowering = false;
 
     // Inner models may use either input_ids or inputs_embeds (VLM path).
     m_input_ids_name =

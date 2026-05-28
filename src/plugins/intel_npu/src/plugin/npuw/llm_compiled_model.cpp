@@ -1382,7 +1382,7 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     setup_paged_runtime(prefill_model, plugin, prefill_config);
 
     std::optional<ov::npuw::function::PagedAttentionPartitionerScope> pa_partitioner_scope;
-    if (m_pa_mode && !m_pa_layer_managers.empty() && m_pa_tile_compiled && m_pa_final_tile_compiled) {
+    if (m_pa_mode && !m_pa_layer_managers.empty() && m_pa_tile_compiled_ext && m_pa_final_tile_compiled_ext) {
         std::vector<std::shared_ptr<ov::npuw::KVCacheBlockManager>> key_mgrs;
         std::vector<std::shared_ptr<ov::npuw::KVCacheBlockManager>> value_mgrs;
         key_mgrs.reserve(m_pa_layer_managers.size());
@@ -1393,8 +1393,8 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         }
         pa_partitioner_scope.emplace(std::move(key_mgrs),
                                      std::move(value_mgrs),
-                                     ov::SoPtr<ov::ICompiledModel>(m_pa_tile_compiled, nullptr),
-                                     ov::SoPtr<ov::ICompiledModel>(m_pa_final_tile_compiled, nullptr));
+                                     m_pa_tile_compiled_ext,
+                                     m_pa_final_tile_compiled_ext);
     }
 
     // Compile multiple generate model variants with different sizes
@@ -2003,8 +2003,8 @@ void ov::npuw::LLMCompiledModel::setup_paged_runtime(const std::shared_ptr<ov::M
                                                      const std::shared_ptr<const ov::IPlugin>& plugin,
                                                      const ov::AnyMap& tile_compile_config) {
     m_pa_runtime.reset();
-    m_pa_tile_compiled.reset();
-    m_pa_final_tile_compiled.reset();
+    m_pa_tile_compiled_ext = {};
+    m_pa_final_tile_compiled_ext = {};
 
     if (!m_pa_mode) {
         return;
@@ -2039,24 +2039,45 @@ void ov::npuw::LLMCompiledModel::setup_paged_runtime(const std::shared_ptr<ov::M
         return;
     }
 
+    // Tile sub-models are tiny flat graphs that mirror the HFA tile model — go
+    // through ov::Core directly rather than the NPUW factory. Routing them
+    // through ov::npuw::CompiledModel::create() runs the entire NPUW pipeline
+    // (partitioning, weights bank, PA-aware passes) on a model that is already
+    // a leaf, and the inner pipeline trips an "unregistered_parameters" check
+    // when it walks parameters owned by inner state nodes the partitioner
+    // doesn't know about.
+    auto core = plugin->get_core();
+    if (!core) {
+        LOG_WARN("setup_paged_runtime: plugin has no Core; skipping tile compile.");
+        return;
+    }
+    auto pick_device = [&](const ov::AnyMap& cfg) {
+        auto it = cfg.find("NPUW_DEVICES");
+        if (it == cfg.end()) {
+            return std::string("NPU");
+        }
+        const auto devs = it->second.as<std::string>();
+        const auto comma = devs.find(',');
+        return comma == std::string::npos ? devs : devs.substr(0, comma);
+    };
+    const std::string device = pick_device(tile_compile_config);
+
     try {
-        LOG_INFO("setup_paged_runtime: compiling PA online-softmax tile sub-models.");
-        m_pa_tile_compiled =
-            m_compiled_model_factory(m_pa_runtime->_tile_model, plugin, tile_compile_config);
-        m_pa_final_tile_compiled =
-            m_compiled_model_factory(m_pa_runtime->_final_tile_model, plugin, tile_compile_config);
-        if (!m_pa_tile_compiled || !m_pa_final_tile_compiled) {
-            LOG_WARN("setup_paged_runtime: compiled tile handle is null after factory call; "
+        LOG_INFO("setup_paged_runtime: compiling PA online-softmax tile sub-models on " << device << ".");
+        auto tile_cm = core->compile_model(m_pa_runtime->_tile_model, device, ov::AnyMap{});
+        auto final_tile_cm = core->compile_model(m_pa_runtime->_final_tile_model, device, ov::AnyMap{});
+        if (!tile_cm || !final_tile_cm) {
+            LOG_WARN("setup_paged_runtime: compiled tile handle is null after compile_model; "
                      "falling back to CPU PA execution.");
-            m_pa_tile_compiled.reset();
-            m_pa_final_tile_compiled.reset();
             return;
         }
+        m_pa_tile_compiled_ext = tile_cm;
+        m_pa_final_tile_compiled_ext = final_tile_cm;
         LOG_INFO("setup_paged_runtime: PA tile sub-models compiled successfully.");
     } catch (const std::exception& e) {
         LOG_WARN("setup_paged_runtime: tile sub-model compilation threw: "
                  << e.what() << ". Falling back to CPU PA execution.");
-        m_pa_tile_compiled.reset();
-        m_pa_final_tile_compiled.reset();
+        m_pa_tile_compiled_ext = {};
+        m_pa_final_tile_compiled_ext = {};
     }
 }
