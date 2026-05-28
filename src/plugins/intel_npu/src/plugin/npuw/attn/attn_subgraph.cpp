@@ -1426,46 +1426,60 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                     }
                     final_req->infer();
 
-                    // Write the new K/V into the tail block of the pool so the
-                    // next call sees them as cached. SDPAToPagedAttention's PA
-                    // op does this implicitly inside its CPU executor; we have
-                    // to do it explicitly because the lowering replaces the
-                    // executor.
-                    if (num_active_blocks > 0) {
-                        const auto tail_phys_id =
-                            static_cast<uint32_t>(block_indices_data[bib_start + num_active_blocks - 1]);
-                        auto tail_k = layer_key->get_block_tensor(tail_phys_id);
-                        auto tail_v = layer_value->get_block_tensor(tail_phys_id);
-                        const uint32_t tail_offset = past_lens % static_cast<uint32_t>(pa_desc->_block_size);
-                        // Mirrors KVCacheBlockManager's expected layout: copy into
-                        // the [tail_offset .. tail_offset+new_tokens) slot of the
-                        // sequence dimension. We bail with an assert if the slot
-                        // would overflow — the partitioner is supposed to grow a
-                        // new tail block before that happens.
-                        OPENVINO_ASSERT(tail_offset + new_tokens <= static_cast<uint32_t>(pa_desc->_block_size),
-                                        "PagedAttention dispatch: tail-block overflow at layer ",
-                                        pa_desc->_layer_index,
-                                        " (tail_offset=",
-                                        tail_offset,
-                                        " new_tokens=",
-                                        new_tokens,
-                                        " block_size=",
-                                        pa_desc->_block_size,
-                                        "). Block-table growth must precede this call.");
-                        // Sequence dimension differs between K and V (axis 2 for K,
-                        // axis 3 for V — see online_softmax_tile.cpp:create_tile_params).
-                        ov::npuw::copy_tensor_by_dim(
-                            ov::npuw::util::view(present_key_tensor, /*seq_dim=*/2, 0, new_tokens),
-                            ov::npuw::util::view(tail_k, /*seq_dim=*/2, tail_offset, new_tokens),
-                            /*src_dim=*/2,
-                            /*dst_dim=*/2);
-                        ov::npuw::copy_tensor_by_dim(
-                            ov::npuw::util::view(present_value_tensor, /*seq_dim=*/3, 0, new_tokens),
-                            ov::npuw::util::view(tail_v, /*seq_dim=*/3, tail_offset, new_tokens),
-                            /*src_dim=*/3,
-                            /*dst_dim=*/3);
-                        layer_key->update_block_tokens(tail_phys_id, tail_offset + new_tokens);
-                        layer_value->update_block_tokens(tail_phys_id, tail_offset + new_tokens);
+                    // Write the new K/V into the pool blocks so the next call
+                    // sees them as cached. SDPAToPagedAttention's PA op does this
+                    // implicitly inside its CPU executor; we have to do it
+                    // explicitly because the lowering replaces the executor.
+                    //
+                    // Generate steps land within a single block (new_tokens=1)
+                    // but a prefill call delivers seq_len tokens at once and may
+                    // span multiple blocks. Walk the contiguous block range
+                    // [bib_start, bib_end) starting from the block that holds
+                    // (past_lens % block_size) and copy block_size-sized chunks
+                    // until all new_tokens are placed.
+                    if (num_active_blocks > 0 && new_tokens > 0) {
+                        const uint32_t block_size = static_cast<uint32_t>(pa_desc->_block_size);
+                        uint32_t remaining = new_tokens;
+                        uint32_t src_offset = 0;
+                        const uint32_t first_block_idx = past_lens / block_size;
+                        uint32_t cur_block = first_block_idx;
+                        uint32_t cur_offset = past_lens % block_size;
+                        while (remaining > 0) {
+                            OPENVINO_ASSERT(cur_block < num_active_blocks,
+                                            "PagedAttention dispatch: block-table too short to absorb "
+                                            "new K/V at layer ",
+                                            pa_desc->_layer_index,
+                                            " (need=",
+                                            new_tokens,
+                                            " active_blocks=",
+                                            num_active_blocks,
+                                            " block_size=",
+                                            block_size,
+                                            "). Block-table growth must precede this call.");
+                            const uint32_t fits = std::min(block_size - cur_offset, remaining);
+                            const auto phys_id =
+                                static_cast<uint32_t>(block_indices_data[bib_start + cur_block]);
+                            auto blk_k = layer_key->get_block_tensor(phys_id);
+                            auto blk_v = layer_value->get_block_tensor(phys_id);
+                            // Sequence dim differs between K and V (axis 2 for K,
+                            // axis 3 for V — see online_softmax_tile.cpp:create_tile_params).
+                            ov::npuw::copy_tensor_by_dim(
+                                ov::npuw::util::view(present_key_tensor, /*seq_dim=*/2, src_offset, fits),
+                                ov::npuw::util::view(blk_k, /*seq_dim=*/2, cur_offset, fits),
+                                /*src_dim=*/2,
+                                /*dst_dim=*/2);
+                            ov::npuw::copy_tensor_by_dim(
+                                ov::npuw::util::view(present_value_tensor, /*seq_dim=*/3, src_offset, fits),
+                                ov::npuw::util::view(blk_v, /*seq_dim=*/3, cur_offset, fits),
+                                /*src_dim=*/3,
+                                /*dst_dim=*/3);
+                            layer_key->update_block_tokens(phys_id, cur_offset + fits);
+                            layer_value->update_block_tokens(phys_id, cur_offset + fits);
+                            src_offset += fits;
+                            remaining -= fits;
+                            ++cur_block;
+                            cur_offset = 0;
+                        }
                     }
                     return;
                 }

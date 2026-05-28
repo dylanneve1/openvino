@@ -946,6 +946,7 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         m_pa_block_size = m_cfg.get<::intel_npu::NPUW_ATTN_PAGED_BLOCK_SIZE>();
         m_pa_num_blocks = m_cfg.get<::intel_npu::NPUW_ATTN_PAGED_NUM_BLOCKS>();
         m_pa_max_seqs = m_cfg.get<::intel_npu::NPUW_ATTN_PAGED_MAX_SEQS>();
+        m_pa_npu_lowering = m_cfg.get<::intel_npu::NPUW_ATTN_PAGED_NPU_LOWERING>();
     }
 
     LOG_DEBUG("   ...also convert BF16 to FP16");

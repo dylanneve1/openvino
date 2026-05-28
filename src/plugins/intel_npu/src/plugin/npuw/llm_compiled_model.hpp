@@ -151,7 +151,10 @@ private:
     // m_pa_mode is true when either PREFILL or GENERATE attention hint is PAGED,
     // or when SDPAToPagedAttention has already been applied upstream by GenAI's
     // ContinuousBatchingPipeline before core.compile_model().
+    // m_pa_npu_lowering mirrors NPUW_ATTN_PAGED_NPU_LOWERING — affects how
+    // PagedLLMInferRequest pads its prefill metadata.
     bool m_pa_mode = false;
+    bool m_pa_npu_lowering = false;
     uint32_t m_pa_block_size = 32;
     uint32_t m_pa_num_blocks = 1024;
     uint32_t m_pa_max_seqs = 16;
