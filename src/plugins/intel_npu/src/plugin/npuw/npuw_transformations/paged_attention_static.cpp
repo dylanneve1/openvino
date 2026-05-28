@@ -251,4 +251,108 @@ bool BakePagedAttentionStaticShapes::run_on_model(const std::shared_ptr<ov::Mode
     return true;
 }
 
+namespace {
+// Parse the layer index out of a PA op's key_cache.N input name. Returns -1
+// when the input isn't a Parameter or doesn't match the expected naming.
+int parse_layer_index(const std::shared_ptr<ov::op::PagedAttentionExtension>& pa) {
+    constexpr std::size_t KEY_CACHE_INPUT = 3u;
+    if (pa->get_input_size() <= KEY_CACHE_INPUT) {
+        return -1;
+    }
+    auto key_cache_node = pa->get_input_node_shared_ptr(KEY_CACHE_INPUT);
+    auto key_param = std::dynamic_pointer_cast<ov::op::v0::Parameter>(key_cache_node);
+    if (!key_param) {
+        return -1;
+    }
+    const std::string prefix = "key_cache.";
+    auto try_parse = [&](const std::string& name) -> int {
+        if (name.rfind(prefix, 0) != 0) {
+            return -1;
+        }
+        const auto tail = name.substr(prefix.size());
+        if (tail.empty()) {
+            return -1;
+        }
+        for (char c : tail) {
+            if (c < '0' || c > '9') {
+                return -1;
+            }
+        }
+        return std::stoi(tail);
+    };
+    if (auto idx = try_parse(key_param->get_friendly_name()); idx != -1) {
+        return idx;
+    }
+    for (const auto& n : key_param->get_output_tensor(0).get_names()) {
+        if (auto idx = try_parse(n); idx != -1) {
+            return idx;
+        }
+    }
+    return -1;
+}
+}  // namespace
+
+bool SplitAtPagedAttention::run_on_model(const std::shared_ptr<ov::Model>& m) {
+    LOG_DEBUG("SplitAtPagedAttention: scanning model '" << m->get_friendly_name() << "' for PA ops.");
+
+    std::vector<std::shared_ptr<ov::op::PagedAttentionExtension>> pa_ops;
+    for (const auto& op : m->get_ordered_ops()) {
+        if (auto pa = ov::as_type_ptr<ov::op::PagedAttentionExtension>(op)) {
+            pa_ops.push_back(pa);
+        }
+    }
+    if (pa_ops.empty()) {
+        LOG_DEBUG("SplitAtPagedAttention: no PA ops on model; nothing to do.");
+        return false;
+    }
+
+    bool changed = false;
+    for (const auto& pa : pa_ops) {
+        const int layer_idx = parse_layer_index(pa);
+        const std::string layer_tag =
+            (layer_idx >= 0) ? std::to_string(layer_idx) : pa->get_friendly_name();
+
+        // Tap Q/K/V (PA inputs 0/1/2) as Results so the host orchestrator
+        // can read them after running the model.
+        const std::array<std::pair<std::size_t, const char*>, 3> qkv = {
+            {{0u, "q"}, {1u, "k"}, {2u, "v"}}};
+        for (const auto& [in_idx, label] : qkv) {
+            if (pa->get_input_size() <= in_idx) {
+                continue;
+            }
+            auto src_output = pa->input_value(in_idx);
+            auto result = std::make_shared<ov::op::v0::Result>(src_output);
+            const std::string name = "pa." + layer_tag + "." + label;
+            result->set_friendly_name(name);
+            result->output(0).get_tensor().set_names({name});
+            m->add_results({result});
+        }
+
+        // Replace PA op's first output with a fresh Parameter that the host
+        // orchestrator will populate from the tile-loop attention result.
+        auto pa_output = pa->output(0);
+        auto new_param = std::make_shared<ov::op::v0::Parameter>(pa_output.get_element_type(),
+                                                                 pa_output.get_partial_shape());
+        const std::string param_name = "pa." + layer_tag + ".out";
+        new_param->set_friendly_name(param_name);
+        new_param->output(0).get_tensor().set_names({param_name});
+        m->add_parameters({new_param});
+
+        // Reroute PA op's downstream consumers to the new Parameter.
+        for (auto& target : pa_output.get_target_inputs()) {
+            target.replace_source_output(new_param->output(0));
+        }
+        changed = true;
+        LOG_DEBUG("SplitAtPagedAttention: rewired layer '" << layer_tag << "' (PA op '"
+                                                            << pa->get_friendly_name() << "') with "
+                                                            << "tap Results pa." << layer_tag << ".{q,k,v} and "
+                                                            << "input Parameter " << param_name << ".");
+    }
+
+    if (changed) {
+        m->validate_nodes_and_infer_types();
+    }
+    return changed;
+}
+
 }  // namespace ov::npuw
