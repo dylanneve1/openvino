@@ -1379,42 +1379,60 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     }
 
     // Build + compile the PA online-softmax tile sub-models for the NPU-resident
-    // lowering BEFORE any prefill / generate compile. Both compile paths trigger
-    // the partitioner; the attn_subgraph partition_stage hook reads the compiled
-    // tile handles off Function::_paged_attention to populate the runtime
-    // dispatch's compiled::PagedAttention scaffold. If we ran the tile compile
-    // afterwards, those handles would be null at the moment the hook fires,
-    // breaking the runtime path. The tile sub-models are tiny flat graphs and
-    // share the prefill_config's NPUW_DEVICES / precision settings.
-    //
-    // We also set up a process-wide PagedAttentionPartitionerScope here so the
-    // partition_stage hook can populate compiled::PagedAttention's per-layer
-    // KV manager vectors from this LLMCompiledModel's m_pa_layer_managers.
-    // RAII scope is held across BOTH the generate and prefill compiles.
-    setup_paged_runtime(prefill_model, plugin, prefill_config);
+    // lowering BEFORE the corresponding prefill / generate compile. Each compile
+    // path triggers the partitioner; the attn_subgraph partition_stage hook
+    // reads the compiled tile handles off Function::_paged_attention via the
+    // active PagedAttentionPartitionerScope to populate compiled::PagedAttention.
+    // Prefill and generate models have different q_size, so they need separate
+    // tile sub-models — we set up + scope each before its corresponding compile.
 
-    std::optional<ov::npuw::function::PagedAttentionPartitionerScope> pa_partitioner_scope;
-    if (m_pa_mode && !m_pa_layer_managers.empty() && m_pa_tile_compiled_ext && m_pa_final_tile_compiled_ext) {
-        std::vector<std::shared_ptr<ov::npuw::KVCacheBlockManager>> key_mgrs;
-        std::vector<std::shared_ptr<ov::npuw::KVCacheBlockManager>> value_mgrs;
-        key_mgrs.reserve(m_pa_layer_managers.size());
-        value_mgrs.reserve(m_pa_layer_managers.size());
+    auto build_kv_mgr_views = [&]() {
+        std::pair<std::vector<std::shared_ptr<ov::npuw::KVCacheBlockManager>>,
+                  std::vector<std::shared_ptr<ov::npuw::KVCacheBlockManager>>>
+            mgrs;
+        mgrs.first.reserve(m_pa_layer_managers.size());
+        mgrs.second.reserve(m_pa_layer_managers.size());
         for (const auto& layer : m_pa_layer_managers) {
-            key_mgrs.push_back(layer.key);
-            value_mgrs.push_back(layer.value);
+            mgrs.first.push_back(layer.key);
+            mgrs.second.push_back(layer.value);
         }
-        pa_partitioner_scope.emplace(std::move(key_mgrs),
-                                     std::move(value_mgrs),
-                                     m_pa_tile_compiled_ext,
-                                     m_pa_final_tile_compiled_ext);
+        return mgrs;
+    };
+
+    // -- Generate compile ------------------------------------------------
+    {
+        const auto& gen_shape_source =
+            generate_model_variants.empty() ? std::shared_ptr<ov::Model>{} : generate_model_variants.front();
+        setup_paged_runtime(PagedRuntimeKind::Generate, gen_shape_source, plugin, generate_config);
+
+        std::optional<ov::npuw::function::PagedAttentionPartitionerScope> scope;
+        if (m_pa_mode && !m_pa_layer_managers.empty() && m_pa_tile_compiled_ext_generate &&
+            m_pa_final_tile_compiled_ext_generate) {
+            auto [k_mgrs, v_mgrs] = build_kv_mgr_views();
+            scope.emplace(std::move(k_mgrs),
+                          std::move(v_mgrs),
+                          m_pa_tile_compiled_ext_generate,
+                          m_pa_final_tile_compiled_ext_generate);
+        }
+        compile_generate_model_variants(generate_model_variants, plugin, generate_config);
     }
 
-    // Compile multiple generate model variants with different sizes
-    compile_generate_model_variants(generate_model_variants, plugin, generate_config);
+    // -- Prefill compile -------------------------------------------------
+    {
+        setup_paged_runtime(PagedRuntimeKind::Prefill, prefill_model, plugin, prefill_config);
 
-    m_prefill_compiled = m_compiled_model_factory(prefill_model, plugin, prefill_config);
-    NPUW_ASSERT(m_prefill_compiled && "Can't create ov::npuw::CompiledModel for passed prefill "
-                                      "model and its config, please check passed config.");
+        std::optional<ov::npuw::function::PagedAttentionPartitionerScope> scope;
+        if (m_pa_mode && !m_pa_layer_managers.empty() && m_pa_tile_compiled_ext && m_pa_final_tile_compiled_ext) {
+            auto [k_mgrs, v_mgrs] = build_kv_mgr_views();
+            scope.emplace(std::move(k_mgrs),
+                          std::move(v_mgrs),
+                          m_pa_tile_compiled_ext,
+                          m_pa_final_tile_compiled_ext);
+        }
+        m_prefill_compiled = m_compiled_model_factory(prefill_model, plugin, prefill_config);
+        NPUW_ASSERT(m_prefill_compiled && "Can't create ov::npuw::CompiledModel for passed prefill "
+                                          "model and its config, please check passed config.");
+    }
     if (lm_head_model) {
         auto lm_head_config = get_default_lm_head_config(npudesc);
         merge_config_with(lm_head_config, other_props);
@@ -2011,18 +2029,25 @@ void ov::npuw::LLMCompiledModel::setup_paged_block_managers(
              << " num_blocks=" << m_pa_num_blocks << " device=" << device);
 }
 
-void ov::npuw::LLMCompiledModel::setup_paged_runtime(const std::shared_ptr<ov::Model>& shape_source_model,
+void ov::npuw::LLMCompiledModel::setup_paged_runtime(PagedRuntimeKind kind,
+                                                     const std::shared_ptr<ov::Model>& shape_source_model,
                                                      const std::shared_ptr<const ov::IPlugin>& plugin,
                                                      const ov::AnyMap& tile_compile_config) {
-    m_pa_runtime.reset();
-    m_pa_tile_compiled_ext = {};
-    m_pa_final_tile_compiled_ext = {};
+    auto& runtime_slot = (kind == PagedRuntimeKind::Prefill) ? m_pa_runtime : m_pa_runtime_generate;
+    auto& tile_slot =
+        (kind == PagedRuntimeKind::Prefill) ? m_pa_tile_compiled_ext : m_pa_tile_compiled_ext_generate;
+    auto& final_slot = (kind == PagedRuntimeKind::Prefill) ? m_pa_final_tile_compiled_ext
+                                                           : m_pa_final_tile_compiled_ext_generate;
+    const char* tag = (kind == PagedRuntimeKind::Prefill) ? "prefill" : "generate";
+    runtime_slot.reset();
+    tile_slot = {};
+    final_slot = {};
 
     if (!m_pa_mode) {
         return;
     }
     if (!shape_source_model) {
-        LOG_WARN("setup_paged_runtime: shape source model is null; skipping.");
+        LOG_WARN("setup_paged_runtime[" << tag << "]: shape source model is null; skipping.");
         return;
     }
 
@@ -2030,24 +2055,25 @@ void ov::npuw::LLMCompiledModel::setup_paged_runtime(const std::shared_ptr<ov::M
     try {
         pa = ov::npuw::function::PagedAttention::from(shape_source_model);
     } catch (const std::exception& e) {
-        LOG_WARN("setup_paged_runtime: PagedAttention::from() threw: " << e.what()
-                 << ". CPU PA fallback remains in effect.");
+        LOG_WARN("setup_paged_runtime[" << tag << "]: PagedAttention::from() threw: " << e.what()
+                                         << ". CPU PA fallback remains in effect.");
         return;
     }
     if (!pa) {
-        LOG_DEBUG("setup_paged_runtime: PagedAttention::from() declined — no compatible PA op on '"
-                  << shape_source_model->get_friendly_name() << "'.");
+        LOG_DEBUG("setup_paged_runtime[" << tag << "]: PagedAttention::from() declined — no compatible PA op on '"
+                                          << shape_source_model->get_friendly_name() << "'.");
         return;
     }
 
     // Record the extracted config regardless of tile-model validity, so the
     // infer request can introspect num_blocks / block_size / head dims for
     // its block-table bookkeeping even when tile lowering is unavailable.
-    m_pa_runtime = std::move(*pa);
+    runtime_slot = std::move(*pa);
 
-    if (!m_pa_runtime->is_valid()) {
-        LOG_INFO("setup_paged_runtime: PA config extracted but tile sub-models not built. "
-                 "CPU PA fallback remains in effect.");
+    if (!runtime_slot->is_valid()) {
+        LOG_INFO("setup_paged_runtime[" << tag
+                                         << "]: PA config extracted but tile sub-models not built. "
+                                            "CPU PA fallback remains in effect.");
         return;
     }
 
@@ -2060,7 +2086,7 @@ void ov::npuw::LLMCompiledModel::setup_paged_runtime(const std::shared_ptr<ov::M
     // doesn't know about.
     auto core = plugin->get_core();
     if (!core) {
-        LOG_WARN("setup_paged_runtime: plugin has no Core; skipping tile compile.");
+        LOG_WARN("setup_paged_runtime[" << tag << "]: plugin has no Core; skipping tile compile.");
         return;
     }
     auto pick_device = [&](const ov::AnyMap& cfg) {
@@ -2075,21 +2101,36 @@ void ov::npuw::LLMCompiledModel::setup_paged_runtime(const std::shared_ptr<ov::M
     const std::string device = pick_device(tile_compile_config);
 
     try {
-        LOG_INFO("setup_paged_runtime: compiling PA online-softmax tile sub-models on " << device << ".");
-        auto tile_cm = core->compile_model(m_pa_runtime->_tile_model, device, ov::AnyMap{});
-        auto final_tile_cm = core->compile_model(m_pa_runtime->_final_tile_model, device, ov::AnyMap{});
+        LOG_INFO("setup_paged_runtime[" << tag << "]: compiling PA online-softmax tile sub-models on " << device
+                                          << ".");
+
+        // Dump tile sub-models alongside the rest of NPUW's subgraph dumps, if
+        // the user opted in. Helps verify the lowering visually.
+        const auto dump_dir = m_cfg.getString<::intel_npu::NPUW_DUMP_SUBS_DIR>();
+        const auto dump_subs = m_cfg.getString<::intel_npu::NPUW_DUMP_SUBS>();
+        if (!dump_dir.empty() && dump_subs != "NO") {
+            const auto base = dump_dir + "/pa_online_softmax_" + tag + "_tile";
+            ov::serialize(runtime_slot->_tile_model, base + ".xml", base + ".bin");
+            const auto fbase = dump_dir + "/pa_online_softmax_" + tag + "_final_tile";
+            ov::serialize(runtime_slot->_final_tile_model, fbase + ".xml", fbase + ".bin");
+            LOG_INFO("setup_paged_runtime[" << tag << "]: dumped PA tile sub-models to " << dump_dir);
+        }
+
+        auto tile_cm = core->compile_model(runtime_slot->_tile_model, device, ov::AnyMap{});
+        auto final_tile_cm = core->compile_model(runtime_slot->_final_tile_model, device, ov::AnyMap{});
         if (!tile_cm || !final_tile_cm) {
-            LOG_WARN("setup_paged_runtime: compiled tile handle is null after compile_model; "
-                     "falling back to CPU PA execution.");
+            LOG_WARN("setup_paged_runtime[" << tag
+                                             << "]: compiled tile handle is null after compile_model; "
+                                                "falling back to CPU PA execution.");
             return;
         }
-        m_pa_tile_compiled_ext = tile_cm;
-        m_pa_final_tile_compiled_ext = final_tile_cm;
-        LOG_INFO("setup_paged_runtime: PA tile sub-models compiled successfully.");
+        tile_slot = tile_cm;
+        final_slot = final_tile_cm;
+        LOG_INFO("setup_paged_runtime[" << tag << "]: PA tile sub-models compiled successfully.");
     } catch (const std::exception& e) {
-        LOG_WARN("setup_paged_runtime: tile sub-model compilation threw: "
-                 << e.what() << ". Falling back to CPU PA execution.");
-        m_pa_tile_compiled_ext = {};
-        m_pa_final_tile_compiled_ext = {};
+        LOG_WARN("setup_paged_runtime[" << tag << "]: tile sub-model compilation threw: " << e.what()
+                                         << ". Falling back to CPU PA execution.");
+        tile_slot = {};
+        final_slot = {};
     }
 }

@@ -680,5 +680,156 @@ std::shared_ptr<ov::Model> create_online_softmax_tile_model(const ov::Shape& q_s
     return std::make_shared<ov::Model>(model_results, model_params, model_name);
 }
 
+// ============================================================================
+// PA-flavoured tile model. See the contract in online_softmax_tile.hpp.
+//
+// External I/O shapes match the layouts produced by SDPAToPagedAttention +
+// ConvertPagedAttnInputs + the KV-cache pool (KVCacheBlockManager). Internal
+// nodes reshape/transpose those into the kernel's [batch=1, H, q, S] body
+// before delegating to the standard helpers.
+// ============================================================================
+std::shared_ptr<ov::Model> create_pa_online_softmax_tile_model(size_t num_q_heads,
+                                                               size_t num_kv_heads,
+                                                               size_t q_size,
+                                                               size_t head_dim,
+                                                               int64_t block_size,
+                                                               const ov::element::Type& input_dtype,
+                                                               const ov::element::Type& mask_dtype,
+                                                               bool is_final_tile,
+                                                               const ov::element::Type& output_dtype) {
+    LOG_DEBUG("Creating PA online-softmax " << (is_final_tile ? "FINAL " : "") << "tile model with q_size=" << q_size
+                                              << ", block_size=" << block_size << ", H=" << num_q_heads
+                                              << ", Hk=" << num_kv_heads << ", S=" << head_dim);
+
+    NPUW_ASSERT(num_q_heads % num_kv_heads == 0 && "Q heads must be divisible by KV heads");
+    const size_t batch = 1u;
+    const auto compute_dtype = ov::element::f32;
+    const auto tile_size = static_cast<size_t>(block_size);
+
+    auto set_param_name = [](std::shared_ptr<ov::op::v0::Parameter>& param, OnlineSoftmaxTileInputId id) {
+        const char* name = online_softmax_tile_input_id_to_string(id);
+        param->set_friendly_name(name);
+        param->output(0).get_tensor().set_names({name});
+    };
+
+    // ------------------------------------------------------------------
+    // External Parameters — PA-native shapes.
+    // ------------------------------------------------------------------
+    auto past_acc = std::make_shared<ov::op::v0::Parameter>(input_dtype,
+                                                            ov::Shape{batch, num_q_heads, q_size, head_dim});
+    set_param_name(past_acc, OnlineSoftmaxTileInputId::PAST_ACC);
+
+    auto past_max = std::make_shared<ov::op::v0::Parameter>(input_dtype, ov::Shape{batch, num_q_heads, q_size, 1});
+    set_param_name(past_max, OnlineSoftmaxTileInputId::PAST_MAX);
+
+    auto past_d = std::make_shared<ov::op::v0::Parameter>(input_dtype, ov::Shape{batch, num_q_heads, q_size, 1});
+    set_param_name(past_d, OnlineSoftmaxTileInputId::PAST_D);
+
+    // K_TILE: matches KVCacheBlockManager's per-block layout exactly.
+    auto k_tile = std::make_shared<ov::op::v0::Parameter>(input_dtype,
+                                                          ov::Shape{batch, num_kv_heads, tile_size, head_dim});
+    set_param_name(k_tile, OnlineSoftmaxTileInputId::K_TILE);
+
+    // V_TILE: stored as [1, Hk, block_size, S] in the pool; the body wants
+    // [1, Hk, S, block_size]. Transpose dims 2↔3 internally.
+    auto v_tile = std::make_shared<ov::op::v0::Parameter>(input_dtype,
+                                                          ov::Shape{batch, num_kv_heads, tile_size, head_dim});
+    set_param_name(v_tile, OnlineSoftmaxTileInputId::V_TILE);
+
+    // Q: PA emits [q_size, H*S]; reshape to [q_size, H, S] then transpose
+    // [1, 0, 2] then unsqueeze axis 0 to land at [1, H, q_size, S].
+    auto q = std::make_shared<ov::op::v0::Parameter>(input_dtype,
+                                                     ov::Shape{q_size, num_q_heads * head_dim});
+    set_param_name(q, OnlineSoftmaxTileInputId::Q);
+
+    // mask_tile: kept rank-2 [q_size, block_size] from the dispatcher; the
+    // body wants [batch, 1, q_size, block_size] for broadcast over heads.
+    auto mask_tile = std::make_shared<ov::op::v0::Parameter>(mask_dtype,
+                                                             ov::Shape{q_size, tile_size});
+    set_param_name(mask_tile, OnlineSoftmaxTileInputId::MASK_TILE);
+
+    // ------------------------------------------------------------------
+    // Internal layout adapters: external shapes -> body shapes.
+    // ------------------------------------------------------------------
+    // Q: [q_size, H*S] -> [q_size, H, S] -> [H, q_size, S] -> [1, H, q_size, S]
+    auto q_reshape_3d_pattern = ov::op::v0::Constant::create(
+        ov::element::i64,
+        ov::Shape{3},
+        std::vector<int64_t>{static_cast<int64_t>(q_size),
+                             static_cast<int64_t>(num_q_heads),
+                             static_cast<int64_t>(head_dim)});
+    auto q_3d = std::make_shared<ov::op::v1::Reshape>(q, q_reshape_3d_pattern, false);
+    auto q_transpose_order = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{3}, std::vector<int64_t>{1, 0, 2});
+    auto q_transposed = std::make_shared<ov::op::v1::Transpose>(q_3d, q_transpose_order);
+    auto q_unsqueeze_axes = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, std::vector<int64_t>{0});
+    auto q_4d = std::make_shared<ov::op::v0::Unsqueeze>(q_transposed, q_unsqueeze_axes);
+    q_4d->set_friendly_name("q_pa_reshaped");
+
+    // V: [1, Hk, block_size, S] -> [1, Hk, S, block_size]
+    auto v_transpose_order = ov::op::v0::Constant::create(ov::element::i64,
+                                                          ov::Shape{4},
+                                                          std::vector<int64_t>{0, 1, 3, 2});
+    auto v_transposed = std::make_shared<ov::op::v1::Transpose>(v_tile, v_transpose_order);
+    v_transposed->set_friendly_name("v_pa_transposed");
+
+    // mask: [q_size, block_size] -> [1, 1, q_size, block_size]
+    auto mask_reshape_pattern = ov::op::v0::Constant::create(
+        ov::element::i64,
+        ov::Shape{4},
+        std::vector<int64_t>{1, 1, static_cast<int64_t>(q_size), static_cast<int64_t>(tile_size)});
+    auto mask_4d = std::make_shared<ov::op::v1::Reshape>(mask_tile, mask_reshape_pattern, false);
+    mask_4d->set_friendly_name("mask_pa_reshaped");
+
+    // ------------------------------------------------------------------
+    // Build the body inputs (Convert to f32) using the body-shape nodes.
+    // ------------------------------------------------------------------
+    TileF32Nodes f32;
+    f32.past_acc_f32 = std::make_shared<ov::op::v0::Convert>(past_acc, compute_dtype);
+    f32.past_max_f32 = std::make_shared<ov::op::v0::Convert>(past_max, compute_dtype);
+    f32.past_d_f32 = std::make_shared<ov::op::v0::Convert>(past_d, compute_dtype);
+    f32.k_tile_f32 = std::make_shared<ov::op::v0::Convert>(k_tile, compute_dtype);
+    f32.v_tile_f32 = std::make_shared<ov::op::v0::Convert>(v_transposed, compute_dtype);
+    f32.q_f32 = std::make_shared<ov::op::v0::Convert>(q_4d, compute_dtype);
+    f32.mask_tile_f32 = (mask_dtype == compute_dtype)
+                            ? std::static_pointer_cast<ov::Node>(mask_4d)
+                            : std::static_pointer_cast<ov::Node>(
+                                  std::make_shared<ov::op::v0::Convert>(mask_4d, compute_dtype));
+
+    // Broadcast K/V from kv_heads to num_q_heads, then run the kernel body.
+    auto [k_broadcast, v_broadcast] =
+        broadcast_kv_tiles(f32.k_tile_f32, f32.v_tile_f32, batch, num_q_heads, num_kv_heads, tile_size, head_dim);
+
+    auto results = execute_online_softmax_tile(f32,
+                                               f32.q_f32,
+                                               k_broadcast,
+                                               v_broadcast,
+                                               batch,
+                                               num_q_heads,
+                                               num_kv_heads,
+                                               q_size,
+                                               tile_size,
+                                               head_dim,
+                                               /*use_grouped=*/false);
+
+    ov::ResultVector model_results;
+    std::string model_name;
+    if (is_final_tile) {
+        model_results = create_final_tile_outputs(results,
+                                                  output_dtype,
+                                                  batch,
+                                                  q_size,
+                                                  num_q_heads,
+                                                  head_dim,
+                                                  /*fused_flash_attention=*/false);
+        model_name = "OnlineSoftmax_PA_Final_Tile";
+    } else {
+        model_results = create_regular_tile_outputs(results, input_dtype);
+        model_name = "OnlineSoftmax_PA_Tile";
+    }
+
+    ov::ParameterVector model_params{past_acc, past_max, past_d, k_tile, v_tile, q, mask_tile};
+    return std::make_shared<ov::Model>(model_results, model_params, model_name);
+}
+
 }  // namespace npuw
 }  // namespace ov

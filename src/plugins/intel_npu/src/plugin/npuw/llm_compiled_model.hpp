@@ -187,18 +187,26 @@ private:
     // bailed during compilation and the caller should fall back to the
     // existing CPU PA execution path.
     std::optional<function::PagedAttention> m_pa_runtime;
+    std::optional<function::PagedAttention> m_pa_runtime_generate;
     // PA tile sub-models compile via ov::Core directly (not via the NPUW
     // factory) so the full NPUW pipeline doesn't recurse into a leaf model.
+    // Prefill and generate variants differ only in q_size — both are needed
+    // because the partitioner-scope handoff stamps compiled::PagedAttention
+    // for each Function with whichever scope was active at compile time.
     ov::SoPtr<ov::ICompiledModel> m_pa_tile_compiled_ext;
     ov::SoPtr<ov::ICompiledModel> m_pa_final_tile_compiled_ext;
+    ov::SoPtr<ov::ICompiledModel> m_pa_tile_compiled_ext_generate;
+    ov::SoPtr<ov::ICompiledModel> m_pa_final_tile_compiled_ext_generate;
 
     // Builds the function::PagedAttention runtime extension from
-    // `shape_source_model` (the post-Bake prefill model in practice) and
+    // `shape_source_model` (post-Bake prefill or generate model) and
     // compiles both tile sub-models on `plugin` with `tile_compile_config`.
     // No-op when m_pa_mode is false. On any failure (no PA op detected,
     // tile-model construction failure, or compile error) the partial state
     // is rolled back and the existing CPU PA fallback remains in effect.
-    void setup_paged_runtime(const std::shared_ptr<ov::Model>& shape_source_model,
+    enum class PagedRuntimeKind { Prefill, Generate };
+    void setup_paged_runtime(PagedRuntimeKind kind,
+                             const std::shared_ptr<ov::Model>& shape_source_model,
                              const std::shared_ptr<const ov::IPlugin>& plugin,
                              const ov::AnyMap& tile_compile_config);
 };
