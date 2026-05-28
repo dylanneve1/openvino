@@ -4,6 +4,9 @@
 
 #include "paged_llm_infer_request.hpp"
 
+#include <algorithm>
+#include <cstring>
+
 #include "infer_request_utils.hpp"
 #include "llm_compiled_model.hpp"
 #include "logging.hpp"
@@ -15,18 +18,19 @@ namespace npuw {
 
 PagedLLMInferRequest::PagedLLMInferRequest(const std::shared_ptr<ov::npuw::LLMCompiledModel>& compiled_model)
     : LLMInferBaseRequest(compiled_model) {
+    init_ports();
+
     m_block_size = compiled_model->m_pa_block_size;
     m_num_blocks = compiled_model->m_pa_num_blocks;
     m_max_seqs = compiled_model->m_pa_max_seqs;
 
-    // Determine input name: input_ids or inputs_embeds
-    m_input_ids_name = ov::npuw::util::find_port_by_name(compiled_model->m_prefill_compiled->inputs(),
-                                                          layer_names::input_ids)
-                               .has_value()
-                           ? layer_names::input_ids
-                           : layer_names::inputs_embeds;
+    // Inner models may use either input_ids or inputs_embeds (VLM path).
+    m_input_ids_name =
+        ov::npuw::util::find_port_by_name(compiled_model->m_prefill_compiled->inputs(), layer_names::input_ids)
+                .has_value()
+            ? layer_names::input_ids
+            : layer_names::inputs_embeds;
 
-    // Create prefill request
     m_prefill_request = compiled_model->m_prefill_compiled->create_infer_request();
     for (const auto& port : m_prefill_request->get_compiled_model()->inputs()) {
         m_prefill_in_ports.emplace(port.get_any_name(), port);
@@ -35,7 +39,7 @@ PagedLLMInferRequest::PagedLLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
         m_prefill_out_ports.emplace(port.get_any_name(), port);
     }
 
-    // Create generate request (single variant for PA — no multi-variant fan-out)
+    // Single-variant generate (no pyramid fan-out for PA).
     m_generate_request = compiled_model->m_generate_compiled_variants.back()->create_infer_request();
     for (const auto& port : m_generate_request->get_compiled_model()->inputs()) {
         m_generate_in_ports.emplace(port.get_any_name(), port);
@@ -44,51 +48,51 @@ PagedLLMInferRequest::PagedLLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
         m_generate_out_ports.emplace(port.get_any_name(), port);
     }
 
-    // Optional LM head
+    // Optional shared LM head.
+    //
+    // The non-PA flow statically slices output_embeds down to the LM head's
+    // [1, 1, hidden] input shape, so a single shared tensor works for both
+    // requests. PA flips the leading dim to B_token (rank-3 [B_token, 1, H])
+    // and SliceOutEmbeds picks the wrong axis, so we keep the rank-3 buffer
+    // intact and copy the live last token's row into the LM head input at
+    // runtime. Generate emits a single-row buffer either way, so the shared
+    // tensor still works there.
     if (compiled_model->m_lm_head_compiled) {
         m_lm_head_request = compiled_model->m_lm_head_compiled->create_infer_request();
         m_lm_head_logits_port = m_lm_head_request->get_outputs()[0];
-        const auto lm_head_input_port = m_lm_head_request->get_inputs()[0];
-        // Share embed output → LM head input
-        m_prefill_request->set_tensor(m_prefill_out_ports.at(layer_names::output_embeds),
-                                      m_lm_head_request->get_tensor(lm_head_input_port));
-        m_generate_request->set_tensor(m_generate_out_ports.at(layer_names::output_embeds),
-                                       m_lm_head_request->get_tensor(lm_head_input_port));
+        m_lm_head_input_port = m_lm_head_request->get_inputs()[0];
+        m_lm_head_input_tensor = m_lm_head_request->get_tensor(m_lm_head_input_port);
+        m_generate_request->set_tensor(m_generate_out_ports.at(layer_names::output_embeds), m_lm_head_input_tensor);
     }
 
-    // Allocate KV cache tensors and share between prefill and generate requests.
-    // Find all key_cache.N / value_cache.N Parameters by scanning prefill inputs.
+    // Allocate KV cache tensors (one per layer) and share them between prefill
+    // and generate requests. The PA op reads/writes block-paged storage, so
+    // the same physical tensor is correct for both phases.
     for (const auto& [name, port] : m_prefill_in_ports) {
-        if (name.find("key_cache.") == 0 || name.find("value_cache.") == 0) {
-            auto shape = port.get_shape();
-            auto elem_type = port.get_element_type();
-            auto tensor = ov::SoPtr<ov::ITensor>(ov::make_tensor(elem_type, shape), nullptr);
-            ov::npuw::util::fill_tensor_bytes(tensor, 0u);
-
-            m_prefill_request->set_tensor(port, tensor);
-
-            // Share the same tensor with generate model (same Parameter name expected)
-            if (m_generate_in_ports.count(name)) {
-                m_generate_request->set_tensor(m_generate_in_ports.at(name), tensor);
-            }
-
-            if (name.find("key_cache.") == 0) {
-                m_key_cache_tensors.push_back(tensor);
-            } else {
-                m_value_cache_tensors.push_back(tensor);
-            }
+        const bool is_key = name.find("key_cache.") == 0;
+        const bool is_value = name.find("value_cache.") == 0;
+        if (!is_key && !is_value) {
+            continue;
         }
+        auto tensor =
+            ov::SoPtr<ov::ITensor>(ov::make_tensor(port.get_element_type(), port.get_shape()), nullptr);
+        ov::npuw::util::fill_tensor_bytes(tensor, 0u);
+
+        m_prefill_request->set_tensor(port, tensor);
+        if (auto it = m_generate_in_ports.find(name); it != m_generate_in_ports.end()) {
+            m_generate_request->set_tensor(it->second, tensor);
+        }
+        (is_key ? m_key_cache_tensors : m_value_cache_tensors).push_back(tensor);
     }
 
-    LOG_DEBUG("PagedLLMInferRequest: allocated " << m_key_cache_tensors.size() << " KV cache layers, block_size="
-                                                 << m_block_size << " num_blocks=" << m_num_blocks);
+    LOG_DEBUG("PagedLLMInferRequest: allocated " << m_key_cache_tensors.size()
+                                                 << " KV cache layers, block_size=" << m_block_size
+                                                 << " num_blocks=" << m_num_blocks);
 }
 
 void PagedLLMInferRequest::prepare_for_new_conversation() {
     m_num_stored_tokens = 0;
     m_first_infer = true;
-
-    // Zero all KV cache tensors
     for (auto& t : m_key_cache_tensors) {
         ov::npuw::util::fill_tensor_bytes(t, 0u);
     }
@@ -97,20 +101,23 @@ void PagedLLMInferRequest::prepare_for_new_conversation() {
     }
 }
 
-void PagedLLMInferRequest::update_block_table() {
-    // Single-sequence contiguous block table: blocks [0, 1, 2, ..., N-1]
-    // past_lens = [m_num_stored_tokens]
-    // subsequence_begins = [0, num_tokens_this_step]  -- CSR offsets into token stream
-    // block_indices = [0, 1, 2, ..., blocks_used-1]
-    // block_indices_begins = [0, blocks_used]
-
-    uint32_t blocks_used = (m_num_stored_tokens + m_block_size - 1) / m_block_size;
+void PagedLLMInferRequest::update_block_table(uint32_t tokens_this_step) {
+    // Single-sequence contiguous block table:
+    //   past_lens            = [m_num_stored_tokens]
+    //   subsequence_begins   = [0, tokens_this_step]
+    //   block_indices        = [0, 1, ..., blocks_used - 1]
+    //   block_indices_begins = [0, blocks_used]
+    //
+    // blocks_used must cover every slot the PA op will touch — past + current —
+    // otherwise a new K/V row lands outside any reserved block and the
+    // subsequent attention read pulls garbage.
+    const uint32_t total_tokens = m_num_stored_tokens + tokens_this_step;
+    uint32_t blocks_used = (total_tokens + m_block_size - 1) / m_block_size;
     if (blocks_used == 0) {
-        blocks_used = 1;  // At least 1 block for first token
+        blocks_used = 1;
     }
 
-    auto fill_pa_input = [&](const PortsMap& ports, std::shared_ptr<ov::IAsyncInferRequest>& req) {
-        // past_lens
+    auto fill_pa_inputs = [&](const PortsMap& ports, std::shared_ptr<ov::IAsyncInferRequest>& req) {
         if (auto it = ports.find("past_lens"); it != ports.end()) {
             auto t = req->get_tensor(it->second);
             auto* data = t->data<int32_t>();
@@ -119,29 +126,25 @@ void PagedLLMInferRequest::update_block_table() {
                 data[i] = 0;
             }
         }
-        // subsequence_begins
         if (auto it = ports.find("subsequence_begins"); it != ports.end()) {
             auto t = req->get_tensor(it->second);
             auto* data = t->data<int32_t>();
             data[0] = 0;
-            // data[1] is set by the caller (number of tokens in this step)
+            data[1] = static_cast<int32_t>(tokens_this_step);
             for (uint32_t i = 2; i <= m_max_seqs; ++i) {
                 data[i] = data[1];
             }
         }
-        // block_indices
         if (auto it = ports.find("block_indices"); it != ports.end()) {
             auto t = req->get_tensor(it->second);
             auto* data = t->data<int32_t>();
             for (uint32_t i = 0; i < blocks_used; ++i) {
                 data[i] = static_cast<int32_t>(i);
             }
-            // Sentinel the rest
             for (size_t i = blocks_used; i < t->get_size(); ++i) {
                 data[i] = 0;
             }
         }
-        // block_indices_begins
         if (auto it = ports.find("block_indices_begins"); it != ports.end()) {
             auto t = req->get_tensor(it->second);
             auto* data = t->data<int32_t>();
@@ -153,50 +156,80 @@ void PagedLLMInferRequest::update_block_table() {
         }
     };
 
-    fill_pa_input(m_prefill_in_ports, m_prefill_request);
-    fill_pa_input(m_generate_in_ports, m_generate_request);
+    fill_pa_inputs(m_prefill_in_ports, m_prefill_request);
+    fill_pa_inputs(m_generate_in_ports, m_generate_request);
 }
 
 void PagedLLMInferRequest::infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
-                                          ov::SoPtr<ov::ITensor> attention_mask,
-                                          ov::SoPtr<ov::ITensor> position_ids) {
+                                         ov::SoPtr<ov::ITensor> attention_mask,
+                                         ov::SoPtr<ov::ITensor> position_ids) {
     LOG_DEBUG("PagedLLMInferRequest: prefill");
-    const auto seq_len = input_ids->get_shape()[1];
 
-    // Set subsequence_begins[1] = seq_len (number of tokens in this step)
-    if (auto it = m_prefill_in_ports.find("subsequence_begins"); it != m_prefill_in_ports.end()) {
-        auto t = m_prefill_request->get_tensor(it->second);
-        t->data<int32_t>()[1] = static_cast<int32_t>(seq_len);
-    }
+    const auto seq_len = static_cast<uint32_t>(input_ids->get_shape()[1]);
 
-    update_block_table();
-
-    // Set input_ids
+    // The inner prefill model has rank-1 input shape [B_token = max_prompt_size]
+    // baked by BakePagedAttentionStaticShapes. We declare q_len = B_token to PA
+    // (subsequence_begins[1] = B_token), not the real seq_len, because the CPU
+    // PA executor's concat_pastkv kernel iterates b = 0..B_token-1 over the K/V
+    // input tensors but only writes _slot_mapping entries for indices [0, q_len).
+    // With q_len < B_token the trailing slot_mapping entries hold uninitialised
+    // data and the kernel scatters K/V into garbage block slots, corrupting
+    // legitimate cache blocks. Setting q_len == B_token gives every padded row
+    // a valid contiguous slot. PA's built-in causal mask ensures real Q rows
+    // [0, seq_len) only see real K rows; the padded Q outputs are discarded.
     auto padded_input = m_prefill_request->get_tensor(m_prefill_in_ports.at(m_input_ids_name));
+    const uint32_t b_token = static_cast<uint32_t>(padded_input->get_shape().at(0));
+    update_block_table(b_token);
+
+    // Copy the real prompt to the head of the padded buffer; zero the tail.
+    ov::npuw::util::fill_tensor_bytes(padded_input, 0u);
     std::copy_n(reinterpret_cast<uint8_t*>(input_ids->data()),
                 input_ids->get_byte_size(),
-                reinterpret_cast<uint8_t*>(padded_input->data()) + padded_input->get_byte_size() -
-                    input_ids->get_byte_size());
+                reinterpret_cast<uint8_t*>(padded_input->data()));
 
-    // Set attention_mask
-    if (auto it = m_prefill_in_ports.find(layer_names::attention_mask); it != m_prefill_in_ports.end()) {
-        auto padded_mask = m_prefill_request->get_tensor(it->second);
-        std::copy_n(attention_mask->data<int64_t>(),
-                    attention_mask->get_size(),
-                    padded_mask->data<int64_t>() + padded_mask->get_size() - attention_mask->get_size());
-    }
+    // attention_mask is dropped by SDPAToPagedAttention; PA reads sequence info
+    // from past_lens / subsequence_begins instead.
+    (void)attention_mask;
 
-    // Set position_ids
+    // position_ids: rank-1 [B_token]. Real positions go to the head; the padded
+    // tail gets monotonically increasing values (seq_len, seq_len+1, ...) so
+    // every Q row has a unique RoPE phase. Padded outputs are discarded; we
+    // just want them to be valid numerical inputs.
     if (auto it = m_prefill_in_ports.find(layer_names::position_ids); it != m_prefill_in_ports.end()) {
         auto padded_pos = m_prefill_request->get_tensor(it->second);
-        ov::npuw::util::pad_position_ids(padded_pos, position_ids);
+        auto* dst = padded_pos->data<int64_t>();
+        if (position_ids && position_ids->get_size() > 0) {
+            const auto* src = position_ids->data<int64_t>();
+            const size_t real_n = std::min<size_t>(position_ids->get_size(), b_token);
+            std::copy_n(src, real_n, dst);
+            for (size_t i = real_n; i < b_token; ++i) {
+                dst[i] = static_cast<int64_t>(i);
+            }
+        } else {
+            for (size_t i = 0; i < b_token; ++i) {
+                dst[i] = static_cast<int64_t>(i);
+            }
+        }
     }
 
     m_prefill_request->infer();
-    m_num_stored_tokens += static_cast<uint32_t>(seq_len);
+    m_num_stored_tokens += seq_len;
+    m_last_prefill_seq_len = seq_len;
 
-    // Get logits
     if (m_lm_head_request) {
+        // PA prefill output_embeds is [B_token, 1, hidden]; the real last token
+        // sits at row (seq_len - 1). Copy that row into the LM head input.
+        auto prefill_embeds = m_prefill_request->get_tensor(m_prefill_out_ports.at(layer_names::output_embeds));
+        const auto& shape = prefill_embeds->get_shape();
+        OPENVINO_ASSERT(shape.size() == 3 && shape[1] == 1,
+                        "PA prefill output_embeds expected to be rank-3 [B_token, 1, H], got ",
+                        shape);
+        const size_t row_bytes = shape[2] * prefill_embeds->get_element_type().size();
+        const size_t src_row = static_cast<size_t>(seq_len) - 1;
+        const auto* src = reinterpret_cast<const uint8_t*>(prefill_embeds->data()) + src_row * row_bytes;
+        OPENVINO_ASSERT(m_lm_head_input_tensor->get_byte_size() >= row_bytes);
+        std::copy_n(src, row_bytes, reinterpret_cast<uint8_t*>(m_lm_head_input_tensor->data()));
+
         m_lm_head_request->infer();
         m_logits = m_lm_head_request->get_tensor(m_lm_head_logits_port);
     } else {
@@ -205,40 +238,33 @@ void PagedLLMInferRequest::infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
 }
 
 void PagedLLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
-                                           ov::SoPtr<ov::ITensor> attention_mask,
-                                           ov::SoPtr<ov::ITensor> position_ids) {
+                                          ov::SoPtr<ov::ITensor> attention_mask,
+                                          ov::SoPtr<ov::ITensor> position_ids) {
     LOG_DEBUG("PagedLLMInferRequest: generate");
 
-    // Set subsequence_begins[1] = 1 (single token)
-    if (auto it = m_generate_in_ports.find("subsequence_begins"); it != m_generate_in_ports.end()) {
-        auto t = m_generate_request->get_tensor(it->second);
-        t->data<int32_t>()[1] = 1;
-    }
+    update_block_table(/*tokens_this_step=*/1);
 
-    update_block_table();
-
-    // Set input_ids (single token)
     auto gen_input = m_generate_request->get_tensor(m_generate_in_ports.at(m_input_ids_name));
     std::copy_n(reinterpret_cast<uint8_t*>(input_ids->data()),
                 input_ids->get_byte_size(),
                 reinterpret_cast<uint8_t*>(gen_input->data()));
 
-    // Set attention_mask
-    if (auto it = m_generate_in_ports.find(layer_names::attention_mask); it != m_generate_in_ports.end()) {
-        auto gen_mask = m_generate_request->get_tensor(it->second);
-        std::copy_n(attention_mask->data<int64_t>(), attention_mask->get_size(), gen_mask->data<int64_t>());
-    }
+    // attention_mask is dropped by SDPAToPagedAttention; ignore if outer caller
+    // still supplies it.
+    (void)attention_mask;
 
-    // Set position_ids
-    if (auto it = m_generate_in_ports.find(layer_names::position_ids); it != m_generate_in_ports.end()) {
-        auto gen_pos = m_generate_request->get_tensor(it->second);
-        std::copy_n(position_ids->data<int64_t>(), position_ids->get_size(), gen_pos->data<int64_t>());
+    if (position_ids && position_ids->get_size() > 0) {
+        if (auto it = m_generate_in_ports.find(layer_names::position_ids); it != m_generate_in_ports.end()) {
+            auto gen_pos = m_generate_request->get_tensor(it->second);
+            std::copy_n(reinterpret_cast<const uint8_t*>(position_ids->data()),
+                        std::min(position_ids->get_byte_size(), gen_pos->get_byte_size()),
+                        reinterpret_cast<uint8_t*>(gen_pos->data()));
+        }
     }
 
     m_generate_request->infer();
     m_num_stored_tokens += 1;
 
-    // Get logits
     if (m_lm_head_request) {
         m_lm_head_request->infer();
         m_logits = m_lm_head_request->get_tensor(m_lm_head_logits_port);
@@ -248,13 +274,24 @@ void PagedLLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
 }
 
 void PagedLLMInferRequest::infer() {
-    auto input_ids = get_tensor(get_inputs()[0]);
-    auto attention_mask =
-        get_tensor(*ov::npuw::util::find_port_by_name(get_inputs(), layer_names::attention_mask));
-    auto position_ids =
-        get_tensor(*ov::npuw::util::find_port_by_name(get_inputs(), layer_names::position_ids));
+    const auto& inputs = get_inputs();
 
-    const auto seq_len = input_ids->get_shape()[1];
+    auto input_ids_port = ov::npuw::util::find_port_by_name(inputs, m_input_ids_name);
+    OPENVINO_ASSERT(input_ids_port.has_value(), "PA: ", m_input_ids_name, " port missing on outer model");
+    auto input_ids = get_tensor(input_ids_port.value());
+
+    auto attention_mask_port = ov::npuw::util::find_port_by_name(inputs, layer_names::attention_mask);
+    auto attention_mask =
+        attention_mask_port.has_value() ? get_tensor(attention_mask_port.value()) : ov::SoPtr<ov::ITensor>();
+
+    auto position_ids_port = ov::npuw::util::find_port_by_name(inputs, layer_names::position_ids);
+    auto position_ids =
+        position_ids_port.has_value() ? get_tensor(position_ids_port.value()) : ov::SoPtr<ov::ITensor>();
+
+    // Outer-facing input_ids stays rank-2 [batch, seq]; the rank-1 PA flattening
+    // only applies to the inner kvcache_model.
+    const auto& shape = input_ids->get_shape();
+    const auto seq_len = shape.size() >= 2 ? shape[1] : shape[0];
 
     if (seq_len > 1 || m_first_infer) {
         prepare_for_new_conversation();
@@ -266,11 +303,9 @@ void PagedLLMInferRequest::infer() {
 }
 
 ov::SoPtr<ov::ITensor> PagedLLMInferRequest::get_tensor(const ov::Output<const ov::Node>& port) const {
-    const auto& name = port.get_any_name();
-    if (name == layer_names::logits && m_logits) {
+    if (port.get_any_name() == layer_names::logits && m_logits) {
         return m_logits;
     }
-    // Fall through to base class default (allocate-on-demand from external port)
     return ISyncInferRequest::get_tensor(port);
 }
 

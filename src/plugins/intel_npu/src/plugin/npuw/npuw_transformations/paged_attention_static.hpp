@@ -26,7 +26,8 @@ public:
     BakePagedAttentionStaticShapes(uint32_t num_blocks,
                                    uint32_t block_size,
                                    uint32_t max_seqs,
-                                   uint32_t max_context_len);
+                                   uint32_t max_context_len,
+                                   uint32_t input_size);
 
     bool run_on_model(const std::shared_ptr<ov::Model>& m) override;
 
@@ -35,6 +36,7 @@ private:
     uint32_t m_block_size;
     uint32_t m_max_seqs;
     uint32_t m_max_context_len;
+    uint32_t m_input_size;
 };
 
 }  // namespace ov::npuw
