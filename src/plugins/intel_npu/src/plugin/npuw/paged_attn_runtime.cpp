@@ -138,13 +138,15 @@ std::optional<PagedAttention> PagedAttention::from(const std::shared_ptr<ov::Mod
         return std::nullopt;
     }
     if (pa_ops.size() > 1) {
+        // Multi-layer model: every PA op shares geometry (H, Hk, S, block_size)
+        // because each is fed by the same baked key_cache.N / value_cache.N
+        // shape, so the tile sub-model can be built from any of them and
+        // reused per layer at dispatch time. The infer-time orchestrator
+        // selects the per-layer KV pool via _layer_index, which is parsed
+        // from the PA op's KEY_CACHE Parameter name below.
         LOG_DEBUG("function::PagedAttention::from: model '" << model->get_friendly_name() << "' contains "
                                                             << pa_ops.size()
-                                                            << " PA ops; multi-op orchestration is not implemented yet.");
-        // The downstream orchestrator will need to handle one per layer when
-        // we extend to use_per_layer_block_indices_inputs=true. For now we
-        // bail rather than silently pick one.
-        return std::nullopt;
+                                                            << " PA ops; building tile from the first.");
     }
 
     const auto& pa = pa_ops.front();

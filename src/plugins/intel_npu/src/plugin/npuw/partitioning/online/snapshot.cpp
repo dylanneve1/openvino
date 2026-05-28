@@ -10,6 +10,7 @@
 #include "../patterns/compute.hpp"
 #include "../patterns/gqa.hpp"
 #include "../patterns/moe.hpp"
+#include "../patterns/paged_attn.hpp"
 #include "../patterns/sdpa.hpp"
 #include "group.hpp"
 #include "openvino/op/util/op_types.hpp"
@@ -770,6 +771,7 @@ void Snapshot::earlyRegroup() {
                 HNDL_ATTN(SDPA);
                 HNDL_ATTN(SDPADecomposed);
                 HNDL_ATTN(GQA);
+                HNDL_ATTN(PagedAttn);
 #undef HNDL_MOE
 #undef HNDL_ATTN
 #undef HNDL_FAKE

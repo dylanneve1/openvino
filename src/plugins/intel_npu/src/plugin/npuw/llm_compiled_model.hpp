@@ -185,8 +185,10 @@ private:
     // bailed during compilation and the caller should fall back to the
     // existing CPU PA execution path.
     std::optional<function::PagedAttention> m_pa_runtime;
-    std::shared_ptr<ov::npuw::ICompiledModel_v0> m_pa_tile_compiled;
-    std::shared_ptr<ov::npuw::ICompiledModel_v0> m_pa_final_tile_compiled;
+    // PA tile sub-models compile via ov::Core directly (not via the NPUW
+    // factory) so the full NPUW pipeline doesn't recurse into a leaf model.
+    ov::SoPtr<ov::ICompiledModel> m_pa_tile_compiled_ext;
+    ov::SoPtr<ov::ICompiledModel> m_pa_final_tile_compiled_ext;
 
     // Builds the function::PagedAttention runtime extension from
     // `shape_source_model` (the post-Bake prefill model in practice) and
