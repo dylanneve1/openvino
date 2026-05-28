@@ -654,7 +654,11 @@ std::vector<std::shared_ptr<ov::Model>> ov::npuw::LLMCompiledModel::create_gener
         if (m_pa_mode) {
             // Skip legacy ReshapeToStatic — the PA op has no contiguous KV
             // seq dim to reshape. Bake static shapes for paged inputs instead.
-            ov::npuw::BakePagedAttentionStaticShapes(m_pa_num_blocks, m_pa_block_size, m_pa_max_seqs, kv_size)
+            ov::npuw::BakePagedAttentionStaticShapes(m_pa_num_blocks,
+                                                     m_pa_block_size,
+                                                     m_pa_max_seqs,
+                                                     kv_size,
+                                                     /*input_size=*/max_generation_token_len)
                 .run_on_model(generate_variant);
         } else {
             ov::npuw::ReshapeToStatic(max_generation_token_len, kv_size, axes, m_max_lora_rank, whisper_lhs_seq_size)
@@ -663,6 +667,14 @@ std::vector<std::shared_ptr<ov::Model>> ov::npuw::LLMCompiledModel::create_gener
 
         // Set unique name for this variant
         generate_variant->set_friendly_name(generate_model->get_friendly_name() + "_kv" + std::to_string(kv_size));
+        if (m_pa_mode) {
+            for (const auto& in : generate_variant->inputs()) {
+                LOG_DEBUG("  generate input  '" << in.get_any_name() << "' shape=" << in.get_partial_shape());
+            }
+            for (const auto& out : generate_variant->outputs()) {
+                LOG_DEBUG("  generate output '" << out.get_any_name() << "' shape=" << out.get_partial_shape());
+            }
+        }
         generate_model_variants.push_back(generate_variant);
     }
     LOG_INFO("Created all generate model variants");
@@ -718,12 +730,31 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     LOG_DEBUG("Creating LLMCompiledModel");
     LOG_BLOCK();
     ::intel_npu::registerNPUWLLMOptions(*m_options_desc);
+    // Also register ROOT-group NPUW options on m_cfg so we can read PA-related
+    // settings (NPUW_ATTN_PAGED_*, NPUW_ATTN_PAGED_NPU_LOWERING, NPUW_ATTN_DEVICE)
+    // here, not just inside the inner ov::npuw::CompiledModel.
+    ::intel_npu::registerNPUWOptions(*m_options_desc);
 
     ov::AnyMap npuw_llm_props;
     ov::AnyMap other_props;
     split_llm_properties(properties, npuw_llm_props, other_props);
     const auto npudesc = extract_npu_descriptor(plugin, other_props);
     auto use_eagle_key = pop_option(other_props, std::string("NPUW_EAGLE"));
+
+    // Promote NPUW ROOT options that LLMCompiledModel reads for PA shaping
+    // into m_cfg, while keeping copies in other_props so the inner
+    // CompiledModel still sees them.
+    auto promote_to_cfg = [&](const std::string& key) {
+        auto it = other_props.find(key);
+        if (it != other_props.end()) {
+            npuw_llm_props.emplace(it->first, it->second);
+        }
+    };
+    promote_to_cfg("NPUW_ATTN_PAGED_BLOCK_SIZE");
+    promote_to_cfg("NPUW_ATTN_PAGED_NUM_BLOCKS");
+    promote_to_cfg("NPUW_ATTN_PAGED_MAX_SEQS");
+    promote_to_cfg("NPUW_ATTN_PAGED_NPU_LOWERING");
+    promote_to_cfg("NPUW_ATTN_DEVICE");
 
     // Remove map-valued section configs before m_cfg.update(any_copy(...)), since Config expects string options.
     auto prefill_config_opt = pop_option(npuw_llm_props, std::string("NPUW_LLM_PREFILL_CONFIG"));
@@ -980,7 +1011,8 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         ov::npuw::BakePagedAttentionStaticShapes(m_pa_num_blocks,
                                                  m_pa_block_size,
                                                  m_pa_max_seqs,
-                                                 m_kvcache_desc.max_prompt_size)
+                                                 m_kvcache_desc.max_prompt_size,
+                                                 /*input_size=*/m_kvcache_desc.max_prompt_size)
             .run_on_model(prefill_model);
 
         // With static-shape key_cache.N / value_cache.N now in the model,
@@ -1015,12 +1047,29 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
 
     if (lm_head_model) {
         LOG_DEBUG("Shared LM head: slice the prefill output");
-        // KVCache model is already reshaped to [1, max_generation_token_len, embed size],
-        // so only apply slice to the Prefill model:
-        ov::npuw::SliceOutEmbeds(axes.batch, m_kvcache_desc.max_generation_token_len).run_on_model(prefill_model);
-        LOG_DEBUG("Make LM head model with static shapes");
-        ov::npuw::ReshapeSlicedHeadToStatic(axes.batch, m_kvcache_desc.max_generation_token_len)
-            .run_on_model(lm_head_model);
+        if (m_pa_mode) {
+            // PA prefill output_embeds is rank-3 [B_token, 1, hidden] with
+            // B_token = max_prompt_size. The real last token sits at index
+            // (real_seq_len - 1), which is unknown at compile time, so we
+            // can't bake a static slice the way the non-PA path does. Instead,
+            // leave the prefill output intact and size the LM head for a
+            // single-token input — PagedLLMInferRequest copies the live last
+            // row into the LM head input at runtime.
+            LOG_DEBUG("Shared LM head (PA): skip prefill SliceOutEmbeds; "
+                      "runtime extracts the live last embed.");
+            ov::npuw::ReshapeSlicedHeadToStatic(/*batch_dim=*/0, /*token_len=*/1)
+                .run_on_model(lm_head_model);
+        } else {
+            // KVCache model is already reshaped to [1, max_generation_token_len, embed size],
+            // so only apply slice to the Prefill model:
+            ov::npuw::SliceOutEmbeds(axes.batch, m_kvcache_desc.max_generation_token_len)
+                .run_on_model(prefill_model);
+            LOG_DEBUG("Shared LM head: slice the prefill output - DONE");
+            LOG_DEBUG("Make LM head model with static shapes");
+            ov::npuw::ReshapeSlicedHeadToStatic(axes.batch, m_kvcache_desc.max_generation_token_len)
+                .run_on_model(lm_head_model);
+        }
+        LOG_DEBUG("Make LM head model with static shapes - DONE");
     }
 
     LOG_DEBUG("5.1, decompose GroupQueryAttention OP");
@@ -1186,6 +1235,26 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     if (generate_attn_pyramid || generate_attn_hfa || generate_attn_dyn || generate_attn_paged) {
         generate_config["NPUW_ATTN"] = ::intel_npu::NPUW_LLM_GENERATE_ATTENTION_HINT::toString(generate_attn_hint);
         merge_config_with(generate_config, dyn_attn_opts);
+    }
+
+    // Pin KV-cache precision to f16 for PA subgraphs. Without this the CPU
+    // plugin's ConvertPagedAttnInputs runs with its default
+    // keyCachePrecision=u8 + by-channel quantization, mutating the inner
+    // key_cache.N Parameters to u8 [?, H, block_size + 8, head_dim]. That
+    // breaks the f16/static [num_blocks, H, block_size, head_dim] shape
+    // BakePagedAttentionStaticShapes already baked on the NPUW side and
+    // produces a precision mismatch at set_tensor time.
+    if (m_pa_mode) {
+        // Keep K/V cache exactly f16 (matches the [num_blocks, H, block_size,
+        // head_dim] shape baked by BakePagedAttentionStaticShapes). Pin
+        // inferencePrecision = f32 so format_cache_precision keeps the cache
+        // type unchanged (it only promotes f16→bf16 when infer is bf16) AND
+        // the math keeps full precision — running PA at f16 caused NaN
+        // accumulation on long-ish prompts.
+        prefill_config[ov::hint::kv_cache_precision.name()] = ov::element::f16;
+        generate_config[ov::hint::kv_cache_precision.name()] = ov::element::f16;
+        prefill_config[ov::hint::inference_precision.name()] = ov::element::f32;
+        generate_config[ov::hint::inference_precision.name()] = ov::element::f32;
     }
 
     // Note: with dynamic attention in EITHER STAGE, we have to
@@ -1947,7 +2016,14 @@ void ov::npuw::LLMCompiledModel::setup_paged_runtime(const std::shared_ptr<ov::M
         return;
     }
 
-    auto pa = ov::npuw::function::PagedAttention::from(shape_source_model);
+    std::optional<ov::npuw::function::PagedAttention> pa;
+    try {
+        pa = ov::npuw::function::PagedAttention::from(shape_source_model);
+    } catch (const std::exception& e) {
+        LOG_WARN("setup_paged_runtime: PagedAttention::from() threw: " << e.what()
+                 << ". CPU PA fallback remains in effect.");
+        return;
+    }
     if (!pa) {
         LOG_DEBUG("setup_paged_runtime: PagedAttention::from() declined — no compatible PA op on '"
                   << shape_source_model->get_friendly_name() << "'.");

@@ -681,15 +681,14 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
         m_compiled_submodels[real_id].devices_to_avoid = device_list_to_set(orderedSubgraphs[real_id]._avoid_list);
 
         // Subgraphs containing PagedAttentionExtension are auto-routed to
-        // NPUW_ATTN_DEVICE (default CPU) because the NPU compiler currently
-        // has no PA executor. The NPU-resident lowering's runtime dispatch
-        // (attn_subgraph BehaviorKind::Paged) is being built up incrementally;
-        // until it computes the attention output on NPU, keep the CPU
-        // fallback active. Once the runtime dispatch is validated end-to-end
-        // this auto-route should be removed entirely (see
-        // PAGED_ATTN_LOWERING_DESIGN.md Step 5c + 7).
+        // NPUW_ATTN_DEVICE (default CPU) when the NPU-resident PA lowering
+        // is not active. With NPUW_ATTN_PAGED_NPU_LOWERING=YES, attn_subgraph
+        // pushes BehaviorKind::Paged for these subgraphs and the runtime
+        // dispatch computes attention on NPU via compiled tile sub-models —
+        // bypass the CPU fallback in that case so NPU lowering takes effect.
         const auto attn_device = m_cfg.get<::intel_npu::NPUW_ATTN_DEVICE>();
-        if (!attn_device.empty() && !forced_sub_devices.count(id)) {
+        const bool pa_npu_lowering = m_cfg.get<::intel_npu::NPUW_ATTN_PAGED_NPU_LOWERING>();
+        if (!pa_npu_lowering && !attn_device.empty() && !forced_sub_devices.count(id)) {
             const auto& submodel_model = m_compiled_submodels[real_id].model;
             if (submodel_model) {
                 for (const auto& op : submodel_model->get_ordered_ops()) {
@@ -2491,6 +2490,7 @@ void ov::npuw::CompiledModel::implement_properties() {
                           BIND(npuw::partitioning::attn_paged_block_size, NPUW_ATTN_PAGED_BLOCK_SIZE),
                           BIND(npuw::partitioning::attn_paged_num_blocks, NPUW_ATTN_PAGED_NUM_BLOCKS),
                           BIND(npuw::partitioning::attn_paged_max_seqs, NPUW_ATTN_PAGED_MAX_SEQS),
+                          BIND(npuw::partitioning::attn_paged_npu_lowering, NPUW_ATTN_PAGED_NPU_LOWERING),
                           BIND(npuw::partitioning::attn_device, NPUW_ATTN_DEVICE),
                           BIND(npuw::parallel_compilation, NPUW_PARALLEL_COMPILE),
                           BIND(npuw::ensure_compatibility, NPUW_ENSURE_COMPATIBILITY),
