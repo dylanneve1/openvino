@@ -21,6 +21,13 @@ PagedLLMInferRequest::PagedLLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
 
     m_block_size = compiled_model->m_pa_block_size;
     m_max_seqs = compiled_model->m_pa_max_seqs;
+    // The NPU-resident tile-loop dispatch only fires when both the per-layer
+    // KV pools and the compiled tile sub-models were successfully built — see
+    // setup_paged_block_managers / setup_paged_runtime. If either is missing,
+    // attn_subgraph leaves the PA op in place and execution falls through to
+    // the CPU PA executor, which expects different q_len semantics.
+    m_npu_lowering = compiled_model->m_pa_npu_lowering && !compiled_model->m_pa_layer_managers.empty() &&
+                     compiled_model->m_pa_tile_compiled && compiled_model->m_pa_final_tile_compiled;
 
     // Inner models may use either input_ids or inputs_embeds (VLM path).
     m_input_ids_name =
@@ -164,18 +171,32 @@ void PagedLLMInferRequest::infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
     const auto seq_len = static_cast<uint32_t>(input_ids->get_shape()[1]);
 
     // The inner prefill model has rank-1 input shape [B_token = max_prompt_size]
-    // baked by BakePagedAttentionStaticShapes. We declare q_len = B_token to PA
-    // (subsequence_begins[1] = B_token), not the real seq_len, because the CPU
-    // PA executor's concat_pastkv kernel iterates b = 0..B_token-1 over the K/V
-    // input tensors but only writes _slot_mapping entries for indices [0, q_len).
-    // With q_len < B_token the trailing slot_mapping entries hold uninitialised
-    // data and the kernel scatters K/V into garbage block slots, corrupting
-    // legitimate cache blocks. Setting q_len == B_token gives every padded row
-    // a valid contiguous slot. PA's built-in causal mask ensures real Q rows
-    // [0, seq_len) only see real K rows; the padded Q outputs are discarded.
+    // baked by BakePagedAttentionStaticShapes. The PA op's q_len comes from
+    // subsequence_begins[1] - subsequence_begins[0]; what we declare for q_len
+    // depends on the executor:
+    //
+    //  CPU PA fallback (default):
+    //    q_len = B_token. The CPU executor's concat_pastkv kernel iterates
+    //    b = 0..B_token-1 over the K/V input tensors but only writes
+    //    _slot_mapping entries for indices [0, q_len). With q_len < B_token
+    //    the trailing slot_mapping entries hold uninitialised data and the
+    //    kernel scatters K/V into garbage block slots, corrupting cache
+    //    blocks that legitimate Q rows later read from. Setting q_len ==
+    //    B_token gives every padded row a valid contiguous slot; PA's
+    //    built-in causal mask ensures real Q rows [0, seq_len) only see
+    //    real K rows, and the padded Q outputs are discarded.
+    //
+    //  NPU lowering (NPUW_ATTN_PAGED_NPU_LOWERING=YES):
+    //    q_len = seq_len (real prompt length). The NPU dispatch in
+    //    attn_subgraph.cpp reads new_tokens = subseq_begins[1] - [0] and
+    //    writes that many K/V rows into the tail block; it asserts
+    //    tail_offset + new_tokens <= block_size. With q_len = B_token > 32
+    //    the assert fires, and even if it didn't, the tile loop would
+    //    fold padded Q into the running attention state.
     auto padded_input = m_prefill_request->get_tensor(m_prefill_in_ports.at(m_input_ids_name));
     const uint32_t b_token = static_cast<uint32_t>(padded_input->get_shape().at(0));
-    update_block_table(b_token);
+    const uint32_t q_len = m_npu_lowering ? seq_len : b_token;
+    update_block_table(q_len);
 
     // Copy the real prompt to the head of the padded buffer; zero the tail.
     ov::npuw::util::fill_tensor_bytes(padded_input, 0u);
