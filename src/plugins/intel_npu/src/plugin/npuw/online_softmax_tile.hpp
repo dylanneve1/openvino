@@ -122,5 +122,29 @@ std::shared_ptr<ov::Model> create_online_softmax_tile_model(const ov::Shape& q_s
                                                             bool fused_flash_attention = false,
                                                             const ov::element::Type& output_dtype = ov::element::f16);
 
+// PA-flavoured tile model. Adapts the kernel I/O to match the layouts
+// produced by SDPAToPagedAttention + ConvertPagedAttnInputs:
+//   - Q is rank-2 [q_size, H*S]; reshaped+transposed internally to
+//     [1, H, q_size, S] for the kernel body.
+//   - K_TILE keeps the body's [1, Hk, block_size, S] shape — matches the
+//     KV-cache pool block layout SDPAToPagedAttention bakes.
+//   - V_TILE is [1, Hk, block_size, S] (same layout as KV blocks);
+//     transposed internally to [1, Hk, S, block_size] for the kernel.
+//   - mask_tile is rank-2 [q_size, block_size]; reshaped to
+//     [1, 1, q_size, block_size] for broadcast over heads.
+//
+// past_acc / past_max / past_d / output keep the body's 4-D shapes —
+// the orchestrator owns those state buffers and never has to materialise
+// PA-side equivalents.
+std::shared_ptr<ov::Model> create_pa_online_softmax_tile_model(size_t num_q_heads,
+                                                               size_t num_kv_heads,
+                                                               size_t q_size,
+                                                               size_t head_dim,
+                                                               int64_t block_size,
+                                                               const ov::element::Type& input_dtype,
+                                                               const ov::element::Type& mask_dtype,
+                                                               bool is_final_tile = false,
+                                                               const ov::element::Type& output_dtype = ov::element::f16);
+
 }  // namespace npuw
 }  // namespace ov

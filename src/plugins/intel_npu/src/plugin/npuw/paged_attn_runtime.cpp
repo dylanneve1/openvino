@@ -249,47 +249,35 @@ std::optional<PagedAttention> PagedAttention::from(const std::shared_ptr<ov::Mod
         return out;
     }
 
-    // Build the two tile sub-models. The body is the SAME online softmax HFA
-    // already runs on NPU (host_flash_attention.cpp:264-297); we reuse
-    // create_online_softmax_tile_model so PA and SDPA share the kernel, with PA's block
-    // size as the tile size. The runtime orchestrator (Step 5) feeds these
-    // with K/V slices fetched via the block table instead of from an
-    // SDPA-Concat input.
-    //
-    // Tile-model Q shape is [batch=1, num_q_heads, query_size, head_size].
-    // The runtime is responsible for reshaping PA's [B_token, H*S] query
-    // tensor to this layout before binding (Step 5).
-    const ov::Shape q_shape{1u, out._num_q_heads, out._query_size, out._head_size};
-
-    // Pull dtypes from the PA op's inputs. KEY_CACHE is f16 by default after
-    // ConvertPagedAttnInputs. Mask compute happens in f32 inside the tile
-    // (HFA convention); HFA's tile builder converts inputs to f32 internally
-    // and casts results back. For PA, attention masks are typically f32 or
-    // implicit (built from past_lens); the runtime will materialize an f32
-    // mask tile per iteration (Step 6).
+    // Build the two tile sub-models using the PA-flavoured wrapper so the
+    // external I/O matches PA's [B_token, H*S] / [1, Hk, block_size, S]
+    // layouts directly. The kernel body is identical to HFA's online
+    // softmax; only the entry-point shape adapters differ.
     const auto& key_cache_param = pa->get_input_node_shared_ptr(static_cast<std::size_t>(PAInputId::KEY_CACHE));
     const ov::element::Type input_dtype = key_cache_param->get_element_type();
     const ov::element::Type mask_dtype = ov::element::f32;
     const ov::element::Type output_dtype = pa->get_output_element_type(0);
 
     try {
-        out._tile_model = create_online_softmax_tile_model(q_shape,
-                                                input_dtype,
-                                                mask_dtype,
-                                                /*tile_size=*/out._block_size,
-                                                /*kv_num_heads=*/out._num_kv_heads,
-                                                /*is_final_tile=*/false,
-                                                /*fused_flash_attention=*/false,
-                                                /*output_dtype=*/output_dtype);
+        out._tile_model = create_pa_online_softmax_tile_model(out._num_q_heads,
+                                                              out._num_kv_heads,
+                                                              out._query_size,
+                                                              out._head_size,
+                                                              out._block_size,
+                                                              input_dtype,
+                                                              mask_dtype,
+                                                              /*is_final_tile=*/false,
+                                                              output_dtype);
 
-        out._final_tile_model = create_online_softmax_tile_model(q_shape,
-                                                      input_dtype,
-                                                      mask_dtype,
-                                                      /*tile_size=*/out._block_size,
-                                                      /*kv_num_heads=*/out._num_kv_heads,
-                                                      /*is_final_tile=*/true,
-                                                      /*fused_flash_attention=*/false,
-                                                      /*output_dtype=*/output_dtype);
+        out._final_tile_model = create_pa_online_softmax_tile_model(out._num_q_heads,
+                                                                    out._num_kv_heads,
+                                                                    out._query_size,
+                                                                    out._head_size,
+                                                                    out._block_size,
+                                                                    input_dtype,
+                                                                    mask_dtype,
+                                                                    /*is_final_tile=*/true,
+                                                                    output_dtype);
     } catch (const std::exception& e) {
         LOG_WARN("function::PagedAttention::from: tile-model construction failed: " << e.what());
         out._tile_model.reset();
@@ -316,7 +304,8 @@ std::optional<PagedAttention> PagedAttention::from(const std::shared_ptr<ov::Mod
 
     LOG_INFO("function::PagedAttention::from: built tile sub-models. tile_model="
              << out._tile_model->get_friendly_name() << " final_tile_model="
-             << out._final_tile_model->get_friendly_name() << " q_shape=" << q_shape
+             << out._final_tile_model->get_friendly_name() << " H=" << out._num_q_heads
+             << " Hk=" << out._num_kv_heads << " q_size=" << out._query_size << " S=" << out._head_size
              << " input_dtype=" << input_dtype << " output_dtype=" << output_dtype);
 
     return out;
