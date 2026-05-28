@@ -552,10 +552,15 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
                 // A function call: store the model for function call only once...
                 compiledFunctions.insert({subgraph._funcall, id});
 
-                // For HFA, use the final tile model instead of the original SDPA model
-                // because the original SDPA model won't be compiled
+                // For HFA / PA, replace the original attention-bearing model
+                // with the final tile sub-model — the runtime orchestrator
+                // drives the attention compute via tile-loop dispatch and the
+                // layer subgraph itself becomes the (single-call) final-tile
+                // invocation.
                 if (fcn_template._host_flash_attention) {
                     m_compiled_submodels[id].model = fcn_template._host_flash_attention.value()._final_tile_model;
+                } else if (fcn_template._paged_attention && fcn_template._paged_attention->is_valid()) {
+                    m_compiled_submodels[id].model = fcn_template._paged_attention.value()._final_tile_model;
                 } else {
                     m_compiled_submodels[id].model = fcn_template._model;
                 }

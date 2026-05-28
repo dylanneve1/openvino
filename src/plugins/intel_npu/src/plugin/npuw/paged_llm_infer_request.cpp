@@ -21,14 +21,18 @@ PagedLLMInferRequest::PagedLLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
 
     m_block_size = compiled_model->m_pa_block_size;
     m_max_seqs = compiled_model->m_pa_max_seqs;
-    // The NPU-resident tile-loop dispatch path is currently inactive on the
-    // LLMPipeline path. The CPU PA executor handles every PA op compile and
-    // requires q_len = B_token (padded length) to keep concat_pastkv's
-    // slot_mapping initialised. Set this to true only when the dispatch path
-    // is fully wired end-to-end (partitioner cuts q_proj/k_proj/v_proj into
-    // a separate group, layer body becomes the tile sub-model, tile dispatch
-    // captures Q/K/V correctly).
-    m_npu_lowering = false;
+    // NPU lowering is live when both prefill and generate variants got their
+    // tile sub-models compiled and the per-layer KV pools are populated. In
+    // that case the layer subgraph IS the final tile sub-model (see
+    // compiled_model.cpp swap), so attn_subgraph dispatches the tile loop in
+    // place of the PA op and we must declare q_len = real seq_len for the
+    // per-block writeback to fit. When the lowering bailed (no tile compile,
+    // no managers, etc.), the CPU PA executor handles the PA op directly and
+    // expects q_len = B_token (padded), so we keep that convention here too.
+    m_npu_lowering = compiled_model->m_pa_npu_lowering && !compiled_model->m_pa_layer_managers.empty() &&
+                     compiled_model->m_pa_tile_compiled_ext && compiled_model->m_pa_final_tile_compiled_ext &&
+                     compiled_model->m_pa_tile_compiled_ext_generate &&
+                     compiled_model->m_pa_final_tile_compiled_ext_generate;
 
     // Inner models may use either input_ids or inputs_embeds (VLM path).
     m_input_ids_name =
