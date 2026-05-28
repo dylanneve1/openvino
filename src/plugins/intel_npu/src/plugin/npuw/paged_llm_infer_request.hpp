@@ -53,6 +53,13 @@ private:
     uint32_t m_block_size = 0;
     uint32_t m_max_seqs = 0;
 
+    // True when NPUW_ATTN_PAGED_NPU_LOWERING=YES. Selects the prefill
+    // metadata convention: NPU lowering wants q_len = real seq_len (its
+    // tail-block writeback asserts new_tokens <= block_size); the CPU PA
+    // executor's concat_pastkv kernel needs q_len = B_token (padded length)
+    // to avoid uninitialised slot_mapping reads.
+    bool m_npu_lowering = false;
+
     // Allocated KV cache tensors (one per layer). Owned by this request
     // for the single-sequence path; GenAI CB pipeline would set_tensor
     // externally in the multi-sequence path.
