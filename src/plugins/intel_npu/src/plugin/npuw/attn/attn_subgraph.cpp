@@ -878,11 +878,19 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                     return false;
                 case BehaviorKind::Paged:
                     if (const auto* pa = ov::npuw::attn::get_compiled_pa(pipeline.context)) {
-                        // Mirrors HFA: cache every PA input by index. run() looks
-                        // them up via _pa_param_index_map[PAInputId::*].
+                        // Cache every input by index. run() looks them up via
+                        // _pa_param_index_map[PAInputId::*]. Size io.inputs to
+                        // cover the original Function template's parameter
+                        // range — the recorded indices are not bounded by the
+                        // swapped tile model's input count.
+                        std::size_t max_idx = get_param_base(ctx, ctx.real_subgraph_idx);
+                        for (const auto& kv : pa->_pa_param_index_map) {
+                            max_idx = std::max(max_idx, kv.second + 1u);
+                        }
+                        max_idx = std::max(max_idx, input_idx + 1u);
                         auto& io = get_behavior_io(state,
                                                    ctx.subgraph_idx,
-                                                   get_param_base(ctx, ctx.real_subgraph_idx),
+                                                   max_idx,
                                                    pa->_compiled_final_tile_model->outputs().size());
                         io.inputs.at(input_idx) = tensor;
                         return true;
@@ -1320,9 +1328,18 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                                     pa_desc->_layer_index,
                                     " has no K/V pool");
 
+                    // io.inputs must cover every index recorded in
+                    // _pa_param_index_map (which refers to the ORIGINAL
+                    // Function template's Parameter list, not the swapped
+                    // tile model's). Size up to the maximum recorded index
+                    // so pa_input() can safely access it.
+                    std::size_t max_idx = get_param_base(ctx, ctx.real_subgraph_idx);
+                    for (const auto& kv : pa_desc->_pa_param_index_map) {
+                        max_idx = std::max(max_idx, kv.second + 1u);
+                    }
                     auto& io = get_behavior_io(state,
                                                ctx.subgraph_idx,
-                                               get_param_base(ctx, ctx.real_subgraph_idx),
+                                               max_idx,
                                                pa_desc->_compiled_final_tile_model->outputs().size());
                     const auto& base = pa_desc->_pa_param_index_map;
                     auto pa_input = [&](PAInputId id) -> ov::SoPtr<ov::ITensor> {

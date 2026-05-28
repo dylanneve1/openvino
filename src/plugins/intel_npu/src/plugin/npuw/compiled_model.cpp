@@ -592,6 +592,15 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
                 const auto real_id = m_compiled_submodels[id].replaced_by.value();
                 m_compiled_submodels[id].pipeline.runtime_behavior =
                     m_compiled_submodels[real_id].pipeline.runtime_behavior;
+                // Behavior callbacks (bind_function_input, run, ...) read the
+                // pipeline context via the funcall's own pipeline, so make
+                // sure it carries the same compiled-state container the body
+                // does. Without this, get_compiled_pa() / get_compiled_hfa()
+                // return null on funcalls and bind_function_input falls
+                // through to the legacy set_tensor path against the swapped
+                // (tile) compiled model.
+                m_compiled_submodels[id].pipeline.context =
+                    m_compiled_submodels[real_id].pipeline.context;
             }
             m_compiled_submodels[id].host_gather = subgraph._host_gather;
             m_compiled_submodels[id].quant_unpack_gather = subgraph._quant_unpack_gather;
@@ -604,11 +613,13 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
                 fcn_template._host_flash_attention ||
                 (fcn_template._paged_attention && fcn_template._paged_attention->is_valid());
             if (swapped_for_tile) {
-                // Pick the function-body model (own slot for body, the
-                // replaced_by target for a funcall).
-                const auto body_id = m_compiled_submodels[id].replaced_by.value_or(id);
-                const auto& body_model = m_compiled_submodels[body_id].model;
-                m_compiled_submodels[id].param_base = body_model ? body_model->get_parameters().size() : 0u;
+                // Keep param_base = original layer's regular-input count so
+                // function_prologue's bind loop covers every link the
+                // partitioner connected (Q/K/V, KV cache, past_lens, etc.),
+                // even though the compiled model is now the tile sub-model.
+                // The closure (weights) is dropped — the tile sub-model has
+                // none — so unpack_closure's loop is a no-op.
+                m_compiled_submodels[id].param_base = fcn_template._param_offset;
                 closure_desc.closure.clear();
                 closure_desc.closure_uid.clear();
                 closure_desc.is_remote.clear();
