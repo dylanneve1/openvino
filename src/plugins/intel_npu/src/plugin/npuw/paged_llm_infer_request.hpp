@@ -28,12 +28,8 @@ public:
 
 private:
     void prepare_for_new_conversation();
-    void infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
-                       ov::SoPtr<ov::ITensor> attention_mask,
-                       ov::SoPtr<ov::ITensor> position_ids);
-    void infer_generate(ov::SoPtr<ov::ITensor> input_ids,
-                        ov::SoPtr<ov::ITensor> attention_mask,
-                        ov::SoPtr<ov::ITensor> position_ids);
+    void infer_prefill(ov::SoPtr<ov::ITensor> input_ids, ov::SoPtr<ov::ITensor> position_ids);
+    void infer_generate(ov::SoPtr<ov::ITensor> input_ids, ov::SoPtr<ov::ITensor> position_ids);
     void update_block_table(uint32_t tokens_this_step);
 
     std::shared_ptr<ov::IAsyncInferRequest> m_prefill_request;
@@ -55,7 +51,6 @@ private:
     // Paged attention state: single-sequence contiguous blocks.
     uint32_t m_num_stored_tokens = 0;
     uint32_t m_block_size = 0;
-    uint32_t m_num_blocks = 0;
     uint32_t m_max_seqs = 0;
 
     // Allocated KV cache tensors (one per layer). Owned by this request
@@ -65,11 +60,6 @@ private:
     std::vector<ov::SoPtr<ov::ITensor>> m_value_cache_tensors;
 
     bool m_first_infer = true;
-
-    // Real prompt length last seen at prefill, before padding to max_prompt_size.
-    // The shared LM head reads the embedding at position [seq_len - 1] of the
-    // prefill output to produce logits for the first generated token.
-    uint32_t m_last_prefill_seq_len = 0;
 
     std::string m_input_ids_name;
 };
