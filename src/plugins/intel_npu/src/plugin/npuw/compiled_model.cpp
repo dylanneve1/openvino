@@ -595,14 +595,36 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
             }
             m_compiled_submodels[id].host_gather = subgraph._host_gather;
             m_compiled_submodels[id].quant_unpack_gather = subgraph._quant_unpack_gather;
-            m_compiled_submodels[id].param_base = fcn_template._param_offset;
-            closure_desc.closure = subgraph._closure;
-            m_compiled_submodels[id].lazy_closure = subgraph._lazy_closure;
-            closure_desc.closure_uid.resize(subgraph._closure.size(), -1);
-            m_compiled_submodels[id].scales = subgraph._scales;
-            m_compiled_submodels[id].zerops = subgraph._zerops;
+            // PA / HFA layer bodies swap the layer model out for the tile sub-
+            // model, which has no closure of its own (Q/K/V/state are bound at
+            // dispatch time). Drop the original layer closure here so that
+            // unpack_closure() has nothing to walk and param_base lines up with
+            // the tile model's input count.
+            const bool swapped_for_tile =
+                fcn_template._host_flash_attention ||
+                (fcn_template._paged_attention && fcn_template._paged_attention->is_valid());
+            if (swapped_for_tile) {
+                // Pick the function-body model (own slot for body, the
+                // replaced_by target for a funcall).
+                const auto body_id = m_compiled_submodels[id].replaced_by.value_or(id);
+                const auto& body_model = m_compiled_submodels[body_id].model;
+                m_compiled_submodels[id].param_base = body_model ? body_model->get_parameters().size() : 0u;
+                closure_desc.closure.clear();
+                closure_desc.closure_uid.clear();
+                closure_desc.is_remote.clear();
+                m_compiled_submodels[id].lazy_closure.clear();
+                m_compiled_submodels[id].scales.clear();
+                m_compiled_submodels[id].zerops.clear();
+            } else {
+                m_compiled_submodels[id].param_base = fcn_template._param_offset;
+                closure_desc.closure = subgraph._closure;
+                m_compiled_submodels[id].lazy_closure = subgraph._lazy_closure;
+                closure_desc.closure_uid.resize(subgraph._closure.size(), -1);
+                m_compiled_submodels[id].scales = subgraph._scales;
+                m_compiled_submodels[id].zerops = subgraph._zerops;
+                closure_desc.is_remote.resize(subgraph._closure.size(), false);
+            }
             m_compiled_submodels[id].forced_to_fcall = subgraph._forced_to_fcall;
-            closure_desc.is_remote.resize(subgraph._closure.size(), false);
         }  // if(!funcall)
 
         if (!m_compiled_submodels[id].model && !m_compiled_submodels[id].replaced_by) {
