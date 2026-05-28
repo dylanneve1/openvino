@@ -909,6 +909,7 @@ void ov::npuw::JustInferRequest::unsafe_during(std::size_t real_idx, std::size_t
     auto& comp_model_desc = m_npuw_model->m_compiled_submodels[real_idx];
 
     if (!comp_model_desc.spatial && ov::npuw::attn::get_compiled_hfa(comp_model_desc.pipeline.context) == nullptr &&
+        ov::npuw::attn::get_compiled_pa(comp_model_desc.pipeline.context) == nullptr &&
         !ov::npuw::moe::has_compiled_experts(comp_model_desc.pipeline)) {
         // Normal: trigger request asynchronously, run `f` in this context
         // FIXME: dynamic could hit here too, but it has special logic
@@ -918,7 +919,9 @@ void ov::npuw::JustInferRequest::unsafe_during(std::size_t real_idx, std::size_t
         f();  // expect noexcept
         r->wait();
     } else {
-        // Spatial or HFA: Run f asynchronously while executing spatial/HFA inference
+        // Spatial / HFA / PA / MoE: Run f asynchronously while executing the
+        // behavior-specific dispatch (no plain start_async on the funcall
+        // request — its compute is replaced by the behavior).
         auto future = std::async(std::launch::async, f);
         unsafe_infer(real_idx, idx);
         future.wait();
