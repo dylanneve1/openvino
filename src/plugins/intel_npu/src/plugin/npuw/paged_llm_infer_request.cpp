@@ -5,7 +5,6 @@
 #include "paged_llm_infer_request.hpp"
 
 #include <algorithm>
-#include <cstring>
 
 #include "infer_request_utils.hpp"
 #include "llm_compiled_model.hpp"
@@ -21,7 +20,6 @@ PagedLLMInferRequest::PagedLLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
     init_ports();
 
     m_block_size = compiled_model->m_pa_block_size;
-    m_num_blocks = compiled_model->m_pa_num_blocks;
     m_max_seqs = compiled_model->m_pa_max_seqs;
 
     // Inner models may use either input_ids or inputs_embeds (VLM path).
@@ -85,9 +83,8 @@ PagedLLMInferRequest::PagedLLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
         (is_key ? m_key_cache_tensors : m_value_cache_tensors).push_back(tensor);
     }
 
-    LOG_DEBUG("PagedLLMInferRequest: allocated " << m_key_cache_tensors.size()
-                                                 << " KV cache layers, block_size=" << m_block_size
-                                                 << " num_blocks=" << m_num_blocks);
+    LOG_DEBUG("PagedLLMInferRequest: allocated " << m_key_cache_tensors.size() << " KV cache layers, block_size="
+                                                 << m_block_size << " max_seqs=" << m_max_seqs);
 }
 
 void PagedLLMInferRequest::prepare_for_new_conversation() {
@@ -161,7 +158,6 @@ void PagedLLMInferRequest::update_block_table(uint32_t tokens_this_step) {
 }
 
 void PagedLLMInferRequest::infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
-                                         ov::SoPtr<ov::ITensor> attention_mask,
                                          ov::SoPtr<ov::ITensor> position_ids) {
     LOG_DEBUG("PagedLLMInferRequest: prefill");
 
@@ -187,10 +183,6 @@ void PagedLLMInferRequest::infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
                 input_ids->get_byte_size(),
                 reinterpret_cast<uint8_t*>(padded_input->data()));
 
-    // attention_mask is dropped by SDPAToPagedAttention; PA reads sequence info
-    // from past_lens / subsequence_begins instead.
-    (void)attention_mask;
-
     // position_ids: rank-1 [B_token]. Real positions go to the head; the padded
     // tail gets monotonically increasing values (seq_len, seq_len+1, ...) so
     // every Q row has a unique RoPE phase. Padded outputs are discarded; we
@@ -214,7 +206,6 @@ void PagedLLMInferRequest::infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
 
     m_prefill_request->infer();
     m_num_stored_tokens += seq_len;
-    m_last_prefill_seq_len = seq_len;
 
     if (m_lm_head_request) {
         // PA prefill output_embeds is [B_token, 1, hidden]; the real last token
@@ -238,7 +229,6 @@ void PagedLLMInferRequest::infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
 }
 
 void PagedLLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
-                                          ov::SoPtr<ov::ITensor> attention_mask,
                                           ov::SoPtr<ov::ITensor> position_ids) {
     LOG_DEBUG("PagedLLMInferRequest: generate");
 
@@ -248,10 +238,6 @@ void PagedLLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
     std::copy_n(reinterpret_cast<uint8_t*>(input_ids->data()),
                 input_ids->get_byte_size(),
                 reinterpret_cast<uint8_t*>(gen_input->data()));
-
-    // attention_mask is dropped by SDPAToPagedAttention; ignore if outer caller
-    // still supplies it.
-    (void)attention_mask;
 
     if (position_ids && position_ids->get_size() > 0) {
         if (auto it = m_generate_in_ports.find(layer_names::position_ids); it != m_generate_in_ports.end()) {
@@ -280,13 +266,12 @@ void PagedLLMInferRequest::infer() {
     OPENVINO_ASSERT(input_ids_port.has_value(), "PA: ", m_input_ids_name, " port missing on outer model");
     auto input_ids = get_tensor(input_ids_port.value());
 
-    auto attention_mask_port = ov::npuw::util::find_port_by_name(inputs, layer_names::attention_mask);
-    auto attention_mask =
-        attention_mask_port.has_value() ? get_tensor(attention_mask_port.value()) : ov::SoPtr<ov::ITensor>();
-
     auto position_ids_port = ov::npuw::util::find_port_by_name(inputs, layer_names::position_ids);
     auto position_ids =
         position_ids_port.has_value() ? get_tensor(position_ids_port.value()) : ov::SoPtr<ov::ITensor>();
+
+    // attention_mask is intentionally not read: SDPAToPagedAttention drops it
+    // and PA derives causal information from past_lens / subsequence_begins.
 
     // Outer-facing input_ids stays rank-2 [batch, seq]; the rank-1 PA flattening
     // only applies to the inner kvcache_model.
@@ -295,10 +280,10 @@ void PagedLLMInferRequest::infer() {
 
     if (seq_len > 1 || m_first_infer) {
         prepare_for_new_conversation();
-        infer_prefill(input_ids, attention_mask, position_ids);
+        infer_prefill(input_ids, position_ids);
         m_first_infer = false;
     } else {
-        infer_generate(input_ids, attention_mask, position_ids);
+        infer_generate(input_ids, position_ids);
     }
 }
 

@@ -894,27 +894,28 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     }
 
     // Paged Attention path: detect upstream application (GenAI's
-    // ContinuousBatchingPipeline runs SDPAToPagedAttention itself before
-    // core.compile_model), and apply the pass here for LLMPipeline / direct
-    // compile_model callers when either hint is PAGED.
+    // ContinuousBatchingPipeline runs SDPAToPagedAttention before core.compile),
+    // or apply the pass here for LLMPipeline / direct compile_model callers
+    // when either hint is PAGED.
     //
-    // ORDER MATTERS: SDPAToPagedAttention requires the model to still be
-    // stateful (it reads the Variables that represent the KV cache). It
-    // MUST run BEFORE StatefulToStateless. The non-PA path keeps the old
-    // ordering — StatefulToStateless first, then no PA.
+    // ORDER MATTERS: SDPAToPagedAttention reads the stateful Variables that
+    // represent the KV cache. It MUST run BEFORE StatefulToStateless. The
+    // non-PA path keeps the old ordering — StatefulToStateless first.
     {
         const auto pf_attn_hint = m_cfg.get<::intel_npu::NPUW_LLM_PREFILL_ATTENTION_HINT>();
         const auto gn_attn_hint = m_cfg.get<::intel_npu::NPUW_LLM_GENERATE_ATTENTION_HINT>();
-        m_pa_mode = (pf_attn_hint == ::intel_npu::npuw::llm::AttentionHint::PAGED) ||
-                    (gn_attn_hint == ::intel_npu::npuw::llm::AttentionHint::PAGED);
-        m_pa_already_applied = model_has_paged_attention(kvcache_model);
+        const bool hint_is_paged = (pf_attn_hint == ::intel_npu::npuw::llm::AttentionHint::PAGED) ||
+                                   (gn_attn_hint == ::intel_npu::npuw::llm::AttentionHint::PAGED);
+        const bool already_paged = model_has_paged_attention(kvcache_model);
 
-        if (m_pa_already_applied) {
-            // GenAI already paged the model. Force PAGED mode regardless of
-            // hints — there is no SDPA pattern left to handle any other way.
+        if (already_paged) {
+            // GenAI already paged the model upstream. Force PAGED mode
+            // regardless of hints — no SDPA pattern remains to handle any
+            // other way.
             m_pa_mode = true;
             LOG_DEBUG("Detected upstream SDPAToPagedAttention application; forcing PAGED mode.");
-        } else if (m_pa_mode) {
+        } else if (hint_is_paged) {
+            m_pa_mode = true;
             LOG_DEBUG("Applying ov::pass::SDPAToPagedAttention to kvcache model.");
             ov::pass::SDPAToPagedAttention(/*use_per_layer_block_indices_inputs=*/false,
                                            /*use_score_outputs=*/false,
@@ -924,18 +925,17 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
                                            /*allow_adaptive_rkv=*/false,
                                            /*allow_qq_bias=*/false)
                 .run_on_model(kvcache_model);
-            m_pa_already_applied = true;
         }
     }
 
-    // SDPAToPagedAttention has already consumed the model's stateful Variables
-    // (rewriting them into the PA op's key_cache.N / value_cache.N inputs +
-    // past_lens / block_indices). What's left is a paged but non-stateful
-    // graph — running StatefulToStateless on it would fail with
+    // SDPAToPagedAttention consumes the model's stateful Variables (rewriting
+    // them into the PA op's key_cache.N / value_cache.N inputs + past_lens /
+    // block_indices). The result is a paged but non-stateful graph — running
+    // StatefulToStateless on it would fail with
     //   "Stateful models without `beam_idx` input are not supported"
     // because the conversion already removed beam_idx along with the rest of
     // the stateful machinery. Skip it on the PA path.
-    if (!m_is_embedding && !m_pa_already_applied) {
+    if (!m_is_embedding && !m_pa_mode) {
         LOG_DEBUG("Transform kvcache model from stateful to stateless.");
         ov::pass::StatefulToStateless().run_on_model(kvcache_model);
     }
