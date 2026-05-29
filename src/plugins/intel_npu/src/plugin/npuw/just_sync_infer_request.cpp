@@ -887,6 +887,23 @@ void ov::npuw::JustInferRequest::function_prologue(std::size_t idx) {
             m_spatial_io[real_idx].outputs.at(i) = o_tensor;
         }
     }
+
+    // Swapped attention bodies (PA/HFA tile) expose fewer compiled outputs
+    // than the original layer, but the partition graph still wires the
+    // original (present-K/V) output ports downstream. Offer those extra
+    // funcall_result tensors to the behavior so its dispatch can populate
+    // them (e.g. PA copies present K/V through) instead of leaving the
+    // downstream consumer reading an uninitialised buffer.
+    if (behavior != nullptr && behavior_ctx.has_value()) {
+        const auto compiled_outs = func_desc.compiled_model->outputs().size();
+        const auto orig_outs = func_desc.attn_orig_output_shapes.size();
+        for (std::size_t i = compiled_outs; i < orig_outs; ++i) {
+            auto it = m_funcall_result.find({idx, i});
+            if (it != m_funcall_result.end()) {
+                behavior->bind_function_output(*behavior_ctx, i, it->second);
+            }
+        }
+    }
     LOG_DEBUG("Done");
 }
 
