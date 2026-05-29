@@ -297,6 +297,18 @@ private:
 
         bool forced_to_fcall = false;
 
+        // For HFA / PA layer bodies whose model was swapped for a narrower
+        // tile sub-model: the original layer body's output port shapes /
+        // element types. The compiled (tile) model exposes only output 0
+        // (attention result); the partitioner still wires downstream
+        // consumers to the original higher-numbered outputs (vestigial
+        // present-K/V exits the SDPA->PA rewrite leaves behind). The infer
+        // request pre-allocates placeholder funcall_result tensors for those
+        // ports from this list so a consumer's prologue never trips an empty
+        // map::at. Empty for non-swapped subgraphs.
+        std::vector<ov::Shape> attn_orig_output_shapes;
+        std::vector<ov::element::Type> attn_orig_output_types;
+
         // Metrics
         execution_stats stat;
 
