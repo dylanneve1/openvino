@@ -191,7 +191,13 @@ void ov::npuw::FuncMemMgr::assign_memory() {
             const auto real_idx = comp_model_desc.replaced_by.value();
             const auto& proto_comp_model_desc = m_model->m_compiled_submodels[real_idx];
 
-            const auto num_outs = proto_comp_model_desc.compiled_model->outputs().size();
+            // For a swapped attention body (PA/HFA tile) the compiled model
+            // exposes fewer outputs than the original layer; downstream links
+            // still reference the original (vestigial present-K/V) ports.
+            // Assign memory for the full original output count so the read-
+            // count simulation and buffer reuse stay consistent.
+            const auto compiled_outs = proto_comp_model_desc.compiled_model->outputs().size();
+            const auto num_outs = std::max(compiled_outs, proto_comp_model_desc.attn_orig_output_shapes.size());
             for (std::size_t out_idx = 0u; out_idx < num_outs; out_idx++) {
                 const LinkFrom this_out = LinkFrom{idx, out_idx};
                 assign(this_out);
@@ -253,16 +259,27 @@ void ov::npuw::FuncMemMgr::assign(const LinkFrom& from) {
         const auto& proto_comp_model_desc = m_model->m_compiled_submodels[real_idx];
         const auto& proto_comp_model = proto_comp_model_desc.compiled_model;
 
-        const auto& oport = proto_comp_model->outputs()[from.second];
-        ov::Shape oshape = oport.get_shape();
-
-        if (proto_comp_model_desc.spatial) {
-            oshape[proto_comp_model_desc.spatial->out_dim] = proto_comp_model_desc.spatial->range;
+        const auto compiled_outs = proto_comp_model->outputs().size();
+        ov::Shape oshape;
+        ov::element::Type otype;
+        if (from.second < compiled_outs) {
+            const auto& oport = proto_comp_model->outputs()[from.second];
+            oshape = oport.get_shape();
+            otype = oport.get_element_type();
+            if (proto_comp_model_desc.spatial) {
+                oshape[proto_comp_model_desc.spatial->out_dim] = proto_comp_model_desc.spatial->range;
+            }
+        } else {
+            // Vestigial output of a swapped attention body — shape/type from
+            // the recorded original layer-body output ports.
+            NPUW_ASSERT(from.second < proto_comp_model_desc.attn_orig_output_shapes.size());
+            oshape = proto_comp_model_desc.attn_orig_output_shapes[from.second];
+            otype = proto_comp_model_desc.attn_orig_output_types[from.second];
         }
         const auto& device = m_model->funcall_mem_device(real_idx);
         // FIXME: handle the lazy way (see BaseSyncInferRequest::get_tensor())
         // and share between submodels to reduce memory consumption
-        TensorPtr new_tensor = m_alloc(oport.get_element_type(), oshape, device);
+        TensorPtr new_tensor = m_alloc(otype, oshape, device);
         NPUW_ASSERT(new_tensor);
 
         assigned_memory.push_back(Assignment{new_tensor, from});
@@ -315,13 +332,12 @@ ov::npuw::JustInferRequest::JustInferRequest(const std::shared_ptr<ov::npuw::Com
             const auto real_idx = comp_model_desc.replaced_by.value();
             auto& proto_comp_model_desc = m_npuw_model->m_compiled_submodels[real_idx];
             auto& proto_comp_model = proto_comp_model_desc.compiled_model;
-            auto num_outputs = proto_comp_model->outputs().size();
-
-            // If the compiled model has been swapped (HFA / PA tile sub-model
-            // is narrower than the original layer), look at the link map for
-            // any downstream consumer that still references a higher output
-            // port — funcall_result entries must exist for them too so the
-            // next subgraph's prologue doesn't trip an empty map::at.
+            // For a swapped attention body the compiled tile model is narrower
+            // than the original layer; FuncMemMgr assigns memory for the full
+            // original output count (incl. vestigial present-K/V), so mirror
+            // that here.
+            auto num_outputs = std::max(proto_comp_model->outputs().size(),
+                                        proto_comp_model_desc.attn_orig_output_shapes.size());
             for (const auto& kv : m_npuw_model->m_submodels_input_to_prev_output) {
                 const auto producer = kv.second.first;
                 const auto port = kv.second.second;
@@ -366,30 +382,12 @@ ov::npuw::JustInferRequest::JustInferRequest(const std::shared_ptr<ov::npuw::Com
                 moe_real_idx = real_idx;
             }  // if(moe_experts)
 
-            const auto compiled_out_count = proto_comp_model->outputs().size();
             for (size_t out_idx = 0; out_idx < num_outputs; out_idx++) {
                 const auto from = LinkFrom{i, out_idx};
-                if (out_idx < compiled_out_count) {
-                    m_funcall_result[from] = m_func_mem_mgr.get_tensor(from);
-                } else {
-                    // Vestigial output of a swapped attention body (present
-                    // K/V the tile sub-model doesn't reproduce). Allocate a
-                    // standalone placeholder from the recorded original
-                    // shape so downstream prologues find a tensor; nothing
-                    // numerically depends on it in the PA / HFA flow.
-                    const auto& extra_shapes = proto_comp_model_desc.attn_orig_output_shapes;
-                    const auto& extra_types = proto_comp_model_desc.attn_orig_output_types;
-                    NPUW_ASSERT(out_idx < extra_shapes.size());
-                    auto ph = allocMem(extra_types[out_idx],
-                                       extra_shapes[out_idx],
-                                       m_npuw_model->funcall_mem_device(real_idx));
-                    // Zero-init: a downstream consumer that reads this vestigial
-                    // present-K/V port must not see uninitialised (NaN) memory.
-                    if (ph && ph->data() && ph->get_byte_size() > 0) {
-                        std::memset(ph->data(), 0, ph->get_byte_size());
-                    }
-                    m_funcall_result[from] = ph;
-                }
+                // FuncMemMgr::assign_memory() now pre-assigns every original
+                // output port (incl. swapped-body vestigial present-K/V), so
+                // get_tensor() resolves all of them.
+                m_funcall_result[from] = m_func_mem_mgr.get_tensor(from);
             }
             if (real_idx != i) {
                 // If this function call is NOT the function body, do nothing here - the original
