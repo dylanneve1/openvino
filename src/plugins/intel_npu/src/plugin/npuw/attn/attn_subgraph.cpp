@@ -64,8 +64,11 @@ struct PagedRuntimeState {
     ov::SoPtr<ov::ITensor> state_acc;
     ov::SoPtr<ov::ITensor> state_max;
     ov::SoPtr<ov::ITensor> state_d;
-    // Mask tile buffer, refilled in place per iteration.
+    // Mask tile buffers, refilled in place per iteration. The cached tile
+    // (block_size-wide kv) and final tile (q_size-wide present kv) have
+    // different MASK_TILE widths, so each needs its own buffer.
     ov::SoPtr<ov::ITensor> mask_tile_buffer;
+    ov::SoPtr<ov::ITensor> mask_tile_buffer_final;
     bool initialized = false;
 };
 
@@ -577,6 +580,12 @@ void ensure_paged_requests(ov::npuw::v1::subgraphs::InferContext& ctx, RuntimeSt
         ov::SoPtr<ov::ITensor>(ov::make_tensor(d_port.get_element_type(), d_port.get_shape()), nullptr);
     state.pa_state.mask_tile_buffer =
         ov::SoPtr<ov::ITensor>(ov::make_tensor(mask_port.get_element_type(), mask_port.get_shape()), nullptr);
+
+    const auto final_mask_port =
+        state.pa_state.final_tile_request->get_compiled_model()->inputs().at(
+            static_cast<std::size_t>(OnlineSoftmaxTileInputId::MASK_TILE));
+    state.pa_state.mask_tile_buffer_final = ov::SoPtr<ov::ITensor>(
+        ov::make_tensor(final_mask_port.get_element_type(), final_mask_port.get_shape()), nullptr);
 
     state.pa_state.initialized = true;
 }
@@ -1398,6 +1407,14 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
 
                     initialize_pa_state(state.pa_state);
 
+                    if (std::getenv("PA_DBG")) {
+                        LOG_INFO("PA dispatch L" << pa_desc->_layer_index << " past_lens=" << past_lens
+                                                  << " new_tokens=" << new_tokens << " active_blocks="
+                                                  << num_active_blocks << " q_size=" << pa_desc->_query_size
+                                                  << " Qshape=" << query_tensor->get_shape()
+                                                  << " Kshape=" << present_key_tensor->get_shape());
+                    }
+
                     // Allocate KV pool blocks that the dispatch is about to
                     // touch. block_indices_data lists the physical block ids
                     // the metadata uses; the pool allocates lazily, so make
@@ -1462,11 +1479,16 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                     bind_tile_out(OnlineSoftmaxTileOutputId::MAXX, state.pa_state.state_max);
                     bind_tile_out(OnlineSoftmaxTileOutputId::D, state.pa_state.state_d);
 
-                    // The cached-block tile loop. The "tail" block (the one being
-                    // filled by the new tokens) is excluded — it is consumed by
-                    // the final tile via the present K/V tensors instead. So we
-                    // iterate up to (num_active_blocks - 1).
-                    const uint32_t cached_block_count = num_active_blocks > 0 ? num_active_blocks - 1 : 0;
+                    // The cached-block tile loop walks the blocks that hold the
+                    // already-stored PAST tokens (past_lens of them). The
+                    // present (this step's new_tokens) is NOT in the pool yet —
+                    // it's attended by the final tile via present_key/value and
+                    // only written to the pool afterwards. So the cached span is
+                    // ceil(past_lens / block_size), independent of how many
+                    // blocks the present will later occupy.
+                    const uint32_t block_size_u = static_cast<uint32_t>(pa_desc->_block_size);
+                    const uint32_t cached_block_count =
+                        (past_lens + block_size_u - 1u) / block_size_u;
                     for (uint32_t i = 0; i < cached_block_count; ++i) {
                         fill_pa_mask_for_cached_block(state.pa_state.mask_tile_buffer, past_lens, i);
                         const auto phys_id = static_cast<uint32_t>(block_indices_data[bib_start + i]);
@@ -1480,9 +1502,9 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                     // Final tile: present K/V from this step. Mask switches to
                     // causal-within-new-tokens. Output is the layer's attention
                     // result, written into io.outputs[0] for downstream consumers.
-                    fill_pa_mask_for_present(state.pa_state.mask_tile_buffer, new_tokens);
+                    fill_pa_mask_for_present(state.pa_state.mask_tile_buffer_final, new_tokens);
                     bind_final_in(OnlineSoftmaxTileInputId::Q, query_tensor);
-                    bind_final_in(OnlineSoftmaxTileInputId::MASK_TILE, state.pa_state.mask_tile_buffer);
+                    bind_final_in(OnlineSoftmaxTileInputId::MASK_TILE, state.pa_state.mask_tile_buffer_final);
                     bind_final_in(OnlineSoftmaxTileInputId::PAST_ACC, state.pa_state.state_acc);
                     bind_final_in(OnlineSoftmaxTileInputId::PAST_MAX, state.pa_state.state_max);
                     bind_final_in(OnlineSoftmaxTileInputId::PAST_D, state.pa_state.state_d);
@@ -1515,6 +1537,16 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                         final_req->set_tensor(final_outputs.at(0), io.outputs.at(0));
                     }
                     final_req->infer();
+                    if (std::getenv("PA_DBG") && pa_desc->_layer_index == 0 && past_lens == 0) {
+                        auto out = final_req->get_tensor(final_outputs.at(0));
+                        const auto* p = reinterpret_cast<const uint16_t*>(out->data());
+                        // f16 row (new_tokens-1) first 4 cols
+                        const auto cols = out->get_shape().back();
+                        const auto row = (new_tokens - 1) * cols;
+                        LOG_INFO("PA L0 final out shape=" << out->get_shape() << " row" << (new_tokens - 1)
+                                                           << " raw f16: " << p[row] << " " << p[row + 1] << " "
+                                                           << p[row + 2] << " " << p[row + 3]);
+                    }
 
                     // Write the new K/V into the pool blocks so the next call
                     // sees them as cached. SDPAToPagedAttention's PA op does this
