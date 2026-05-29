@@ -380,9 +380,15 @@ ov::npuw::JustInferRequest::JustInferRequest(const std::shared_ptr<ov::npuw::Com
                     const auto& extra_shapes = proto_comp_model_desc.attn_orig_output_shapes;
                     const auto& extra_types = proto_comp_model_desc.attn_orig_output_types;
                     NPUW_ASSERT(out_idx < extra_shapes.size());
-                    m_funcall_result[from] = allocMem(extra_types[out_idx],
-                                                      extra_shapes[out_idx],
-                                                      m_npuw_model->funcall_mem_device(real_idx));
+                    auto ph = allocMem(extra_types[out_idx],
+                                       extra_shapes[out_idx],
+                                       m_npuw_model->funcall_mem_device(real_idx));
+                    // Zero-init: a downstream consumer that reads this vestigial
+                    // present-K/V port must not see uninitialised (NaN) memory.
+                    if (ph && ph->data() && ph->get_byte_size() > 0) {
+                        std::memset(ph->data(), 0, ph->get_byte_size());
+                    }
+                    m_funcall_result[from] = ph;
                 }
             }
             if (real_idx != i) {

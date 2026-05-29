@@ -5,6 +5,8 @@
 #include "attn_subgraph.hpp"
 
 #include <array>
+#include <cstdlib>
+#include <fstream>
 #include <limits>
 #include <sstream>
 #include <unordered_map>
@@ -74,6 +76,14 @@ struct PagedRuntimeState {
 
 struct RuntimeState {
     std::unordered_map<std::size_t, BehaviorIO> call_io;
+    // PA: the tile body is ONE repeated subgraph called once per transformer
+    // layer, but each layer needs its own KV-cache pool. The compiled PA
+    // descriptor is shared across calls, so its _layer_index is always the
+    // body's (0). Track the call sweep here: layer = pa_dispatch_count %
+    // num_layer_pools. Layers always run in full front-to-back sweeps (one
+    // per prefill, one per generate token), so the modulo recovers the right
+    // pool without a per-infer reset hook.
+    std::size_t pa_dispatch_count = 0;
     runtime::attention::Selector::Ptr attention_selector;
     runtime::pyramid_attention::Selector::Ptr pyramid_selector;
     runtime::host_flash_attention::Selector::Ptr hfa_selector;
@@ -1350,18 +1360,20 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                                        "models or layer managers missing). The partitioner -> dispatch "
                                        "compiled-handle bridge is not yet wired.");
                     }
-                    if (pa_desc->_layer_index >= pa_desc->_layer_key_managers.size()) {
-                        OPENVINO_THROW("PagedAttention dispatch: layer ",
-                                       pa_desc->_layer_index,
-                                       " out of range (have ",
-                                       pa_desc->_layer_key_managers.size(),
-                                       " pools)");
-                    }
-                    const auto& layer_key = pa_desc->_layer_key_managers[pa_desc->_layer_index];
-                    const auto& layer_value = pa_desc->_layer_value_managers[pa_desc->_layer_index];
+                    // The tile body is a single repeated subgraph shared by all
+                    // transformer layers, so pa_desc->_layer_index (baked from
+                    // the body's own key_cache.N) is always the body layer.
+                    // Recover the actual layer from the per-sweep dispatch
+                    // counter: layers execute in topological (front-to-back)
+                    // order, one full sweep per prefill / generate step.
+                    const auto num_pools = pa_desc->_layer_key_managers.size();
+                    const auto layer_idx = state.pa_dispatch_count % num_pools;
+                    state.pa_dispatch_count++;
+                    const auto& layer_key = pa_desc->_layer_key_managers[layer_idx];
+                    const auto& layer_value = pa_desc->_layer_value_managers[layer_idx];
                     OPENVINO_ASSERT(layer_key && layer_value,
                                     "PagedAttention dispatch: layer ",
-                                    pa_desc->_layer_index,
+                                    layer_idx,
                                     " has no K/V pool");
 
                     // io.inputs must cover every index recorded in
@@ -1415,8 +1427,40 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
 
                     initialize_pa_state(state.pa_state);
 
+                    if (std::getenv("PA_DUMP_QKV") && layer_idx == 0 && past_lens == 0) {
+                        LOG_INFO("PA io.inputs scan (QUERY_idx="
+                                 << (base.count(PAInputId::QUERY) ? (int)base.at(PAInputId::QUERY) : -1) << "):");
+                        for (std::size_t ii = 0; ii < io.inputs.size(); ++ii) {
+                            if (!io.inputs[ii]) {
+                                LOG_INFO("  io.inputs[" << ii << "] = null");
+                                continue;
+                            }
+                            const auto sh = io.inputs[ii]->get_shape();
+                            const auto* p = reinterpret_cast<const uint16_t*>(io.inputs[ii]->data());
+                            std::size_t nan = 0;
+                            const auto n = io.inputs[ii]->get_size();
+                            for (std::size_t z = 0; z < n; ++z)
+                                if ((p[z] & 0x7C00) == 0x7C00 && (p[z] & 0x03FF)) ++nan;
+                            std::stringstream ss;
+                            ss << sh;
+                            LOG_INFO("  io.inputs[" << ii << "] shape=" << ss.str() << " size=" << n
+                                                     << " nan=" << nan);
+                        }
+                    }
+
+                    if (std::getenv("PA_DBG2")) {
+                        const auto& qt = pa_input(PAInputId::QUERY);
+                        std::size_t qnan = 0;
+                        if (qt) {
+                            const auto* p = reinterpret_cast<const uint16_t*>(qt->data());
+                            for (std::size_t z = 0; z < qt->get_size(); ++z)
+                                if ((p[z] & 0x7C00) == 0x7C00 && (p[z] & 0x03FF)) ++qnan;
+                        }
+                        LOG_INFO("PA L" << layer_idx << " past_lens=" << past_lens
+                                         << " new_tokens=" << new_tokens << " Qnan=" << qnan);
+                    }
                     if (std::getenv("PA_DBG")) {
-                        LOG_INFO("PA dispatch L" << pa_desc->_layer_index << " past_lens=" << past_lens
+                        LOG_INFO("PA dispatch L" << layer_idx << " past_lens=" << past_lens
                                                   << " new_tokens=" << new_tokens << " active_blocks="
                                                   << num_active_blocks << " q_size=" << pa_desc->_query_size
                                                   << " Qshape=" << query_tensor->get_shape()
@@ -1539,21 +1583,33 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                         }
                         return dst;
                     };
-                    bind_final_in(OnlineSoftmaxTileInputId::K_TILE, pack_present_for_final(present_key_tensor));
-                    bind_final_in(OnlineSoftmaxTileInputId::V_TILE, pack_present_for_final(present_value_tensor));
+                    auto packed_k_final = pack_present_for_final(present_key_tensor);
+                    auto packed_v_final = pack_present_for_final(present_value_tensor);
+                    bind_final_in(OnlineSoftmaxTileInputId::K_TILE, packed_k_final);
+                    bind_final_in(OnlineSoftmaxTileInputId::V_TILE, packed_v_final);
+                    static int s_pa_dump_n = 0;
+                    const bool do_qkv_dump = std::getenv("PA_DUMP_QKV") && layer_idx == 0 &&
+                                             new_tokens > 1 && s_pa_dump_n == 0;
+                    if (do_qkv_dump) {
+                        auto dump = [&](const char* nm, const ov::SoPtr<ov::ITensor>& t) {
+                            std::ofstream f(std::string("/tmp/pa_qkv_") + nm + ".bin", std::ios::binary);
+                            f.write(reinterpret_cast<const char*>(t->data()), t->get_byte_size());
+                            LOG_INFO("dumped " << nm << " shape=" << t->get_shape() << " new_tokens=" << new_tokens);
+                        };
+                        dump("q", reshape_view(query_tensor, tile_inputs.at(static_cast<std::size_t>(OnlineSoftmaxTileInputId::Q)).get_shape()));
+                        dump("k", packed_k_final);
+                        dump("v", packed_v_final);
+                    }
                     if (!io.outputs.empty() && io.outputs.at(0)) {
                         final_req->set_tensor(final_outputs.at(0), io.outputs.at(0));
                     }
                     final_req->infer();
-                    if (std::getenv("PA_DBG") && pa_desc->_layer_index == 0 && past_lens == 0) {
+                    if (do_qkv_dump) {
                         auto out = final_req->get_tensor(final_outputs.at(0));
-                        const auto* p = reinterpret_cast<const uint16_t*>(out->data());
-                        // f16 row (new_tokens-1) first 4 cols
-                        const auto cols = out->get_shape().back();
-                        const auto row = (new_tokens - 1) * cols;
-                        LOG_INFO("PA L0 final out shape=" << out->get_shape() << " row" << (new_tokens - 1)
-                                                           << " raw f16: " << p[row] << " " << p[row + 1] << " "
-                                                           << p[row + 2] << " " << p[row + 3]);
+                        std::ofstream f("/tmp/pa_qkv_out.bin", std::ios::binary);
+                        f.write(reinterpret_cast<const char*>(out->data()), out->get_byte_size());
+                        LOG_INFO("dumped out shape=" << out->get_shape());
+                        s_pa_dump_n = 1;
                     }
 
                     // Write the new K/V into the pool blocks so the next call
@@ -1604,7 +1660,7 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                             OPENVINO_ASSERT(cur_block < num_active_blocks,
                                             "PagedAttention dispatch: block-table too short to absorb "
                                             "new K/V at layer ",
-                                            pa_desc->_layer_index,
+                                            layer_idx,
                                             " (need=",
                                             new_tokens,
                                             " active_blocks=",
