@@ -1195,5 +1195,15 @@ void ov::npuw::JustInferRequest::update_subrequest_links(std::size_t) {
 
 bool ov::npuw::JustInferRequest::is_pipelined(std::size_t idx) const {
     const auto& desc = m_npuw_model->m_compiled_submodels[real(idx)];
+    // PA / HFA bodies run their compute through the behavior's own tile
+    // requests (state.pa_state / hfa), not the function subrequest, and
+    // funnel the result through io.outputs. Function pipelining swaps the
+    // subrequest underneath them, which breaks that hand-off (the next
+    // layer reads an unbound output). Keep those bodies non-pipelined.
+    if (desc.replaced_by &&
+        (ov::npuw::attn::get_compiled_pa(desc.pipeline.context) != nullptr ||
+         ov::npuw::attn::get_compiled_hfa(desc.pipeline.context) != nullptr)) {
+        return false;
+    }
     return m_use_function_pipelining && desc.replaced_by && !desc.forced_to_fcall;
 }
