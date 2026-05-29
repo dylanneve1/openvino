@@ -484,9 +484,12 @@ void fill_pa_mask_for_cached_block(const ov::SoPtr<ov::ITensor>& mask_tile,
                                    uint32_t past_lens,
                                    uint32_t block_idx) {
     const auto shape = mask_tile->get_shape();
-    NPUW_ASSERT(shape.size() == 4);
-    const auto query_size = shape[2];
-    const auto block_size = shape[3];
+    // HFA mask is rank-4 [1,1,q,kv]; PA-flavoured tile model uses rank-2
+    // [q, kv]. Pick the q / kv dims from the trailing two entries in either
+    // case so this works for both layouts.
+    NPUW_ASSERT(shape.size() == 4 || shape.size() == 2);
+    const auto query_size = shape[shape.size() - 2];
+    const auto block_size = shape[shape.size() - 1];
     const uint64_t k_abs_start = static_cast<uint64_t>(block_idx) * static_cast<uint64_t>(block_size);
     const auto et = mask_tile->get_element_type();
     if (et == ov::element::f32) {
@@ -515,9 +518,9 @@ void fill_pa_mask_for_cached_block(const ov::SoPtr<ov::ITensor>& mask_tile,
 //   mask[q, k] = -inf  otherwise
 void fill_pa_mask_for_present(const ov::SoPtr<ov::ITensor>& mask_tile, uint32_t new_tokens) {
     const auto shape = mask_tile->get_shape();
-    NPUW_ASSERT(shape.size() == 4);
-    const auto query_size = shape[2];
-    const auto block_size = shape[3];
+    NPUW_ASSERT(shape.size() == 4 || shape.size() == 2);
+    const auto query_size = shape[shape.size() - 2];
+    const auto block_size = shape[shape.size() - 1];
     const auto et = mask_tile->get_element_type();
     if (et == ov::element::f32) {
         auto* data = mask_tile->data<float>();
@@ -1387,20 +1390,56 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
 
                     initialize_pa_state(state.pa_state);
 
+                    // Allocate KV pool blocks that the dispatch is about to
+                    // touch. block_indices_data lists the physical block ids
+                    // the metadata uses; the pool allocates lazily, so make
+                    // sure every id [bib_start, bib_end) is backed before
+                    // get_block_tensor() is called.
+                    for (uint32_t i = 0; i < num_active_blocks; ++i) {
+                        const auto phys_id =
+                            static_cast<uint32_t>(block_indices_data[bib_start + i]);
+                        while (layer_key->refcount(phys_id) == 0) {
+                            (void)layer_key->allocate_block();
+                        }
+                        while (layer_value->refcount(phys_id) == 0) {
+                            (void)layer_value->allocate_block();
+                        }
+                    }
+
                     auto& tile_req = state.pa_state.tile_request;
                     auto& final_req = state.pa_state.final_tile_request;
                     const auto& tile_inputs = tile_req->get_compiled_model()->inputs();
                     const auto& tile_outputs = tile_req->get_compiled_model()->outputs();
                     const auto& final_inputs = final_req->get_compiled_model()->inputs();
                     const auto& final_outputs = final_req->get_compiled_model()->outputs();
+
+                    // Upstream Q / K / V tensors come from the layer's
+                    // q_proj/k_proj/v_proj path in [B, H, q, S] layout. The
+                    // PA-flavoured tile sub-model expects rank-2
+                    // [q_size, H*S] / [q_size, Hk*S]. Same memory order, just
+                    // rank differs — wrap the SoPtr in a Tensor view with the
+                    // target shape before set_tensor() validates.
+                    auto reshape_view = [](const ov::SoPtr<ov::ITensor>& src,
+                                           const ov::Shape& shape) -> ov::SoPtr<ov::ITensor> {
+                        if (!src) {
+                            return src;
+                        }
+                        if (src->get_shape() == shape) {
+                            return src;
+                        }
+                        return ov::SoPtr<ov::ITensor>{
+                            ov::make_tensor(src->get_element_type(), shape, src->data()), nullptr};
+                    };
                     auto bind_tile_in = [&](OnlineSoftmaxTileInputId id, const ov::SoPtr<ov::ITensor>& t) {
-                        tile_req->set_tensor(tile_inputs.at(static_cast<std::size_t>(id)), t);
+                        const auto& port = tile_inputs.at(static_cast<std::size_t>(id));
+                        tile_req->set_tensor(port, reshape_view(t, port.get_shape()));
                     };
                     auto bind_tile_out = [&](OnlineSoftmaxTileOutputId id, const ov::SoPtr<ov::ITensor>& t) {
                         tile_req->set_tensor(tile_outputs.at(static_cast<std::size_t>(id)), t);
                     };
                     auto bind_final_in = [&](OnlineSoftmaxTileInputId id, const ov::SoPtr<ov::ITensor>& t) {
-                        final_req->set_tensor(final_inputs.at(static_cast<std::size_t>(id)), t);
+                        const auto& port = final_inputs.at(static_cast<std::size_t>(id));
+                        final_req->set_tensor(port, reshape_view(t, port.get_shape()));
                     };
 
                     bind_tile_in(OnlineSoftmaxTileInputId::Q, query_tensor);
