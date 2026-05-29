@@ -759,12 +759,34 @@ void ov::npuw::JustInferRequest::function_prologue(std::size_t idx) {
     // Function call prologue:
     // 1. Walk through function dependencies and set the respective tensors
     //    as parameters
+    const auto sub_input_count = func_desc.compiled_model->inputs().size();
     for (size_t i = 0; i < func_desc.param_base; i++) {
         LOG_DEBUG("Binding parameter[" << i << "]...");
         LOG_BLOCK();
-        const auto& iport = func_desc.compiled_model->inputs()[i];
 
         auto link_iter = m_npuw_model->m_submodels_input_to_prev_output.find({idx, i});
+
+        // PA / HFA bodies swap the function model for a smaller tile sub-
+        // model; indices past its input count are not real Parameters on
+        // the compiled model. Route them to the dispatch behavior's
+        // bind_function_input and skip the legacy set_tensor path.
+        if (i >= sub_input_count) {
+            if (link_iter != m_npuw_model->m_submodels_input_to_prev_output.end() && behavior != nullptr &&
+                behavior_ctx.has_value()) {
+                std::size_t prod_idx;
+                std::size_t prod_port;
+                std::tie(prod_idx, prod_port) = link_iter->second;
+                const auto& i_tensor = !m_npuw_model->m_compiled_submodels[prod_idx].replaced_by
+                                           ? m_subrequests[prod_idx]->get_tensor(
+                                                 m_npuw_model->m_compiled_submodels[prod_idx]
+                                                     .compiled_model->outputs()[prod_port])
+                                           : m_funcall_result.at({prod_idx, prod_port});
+                behavior->bind_function_input(*behavior_ctx, i, i_tensor);
+            }
+            continue;
+        }
+        const auto& iport = func_desc.compiled_model->inputs()[i];
+
         if (link_iter != m_npuw_model->m_submodels_input_to_prev_output.end()) {
             std::size_t prod_idx;
             std::size_t prod_port;
