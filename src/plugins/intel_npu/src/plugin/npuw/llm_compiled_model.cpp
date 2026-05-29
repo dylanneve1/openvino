@@ -756,6 +756,7 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     promote_to_cfg("NPUW_ATTN_PAGED_MAX_SEQS");
     promote_to_cfg("NPUW_ATTN_PAGED_NPU_LOWERING");
     promote_to_cfg("NPUW_ATTN_DEVICE");
+    promote_to_cfg("NPUW_DEVICES");
 
     // Remove map-valued section configs before m_cfg.update(any_copy(...)), since Config expects string options.
     auto prefill_config_opt = pop_option(npuw_llm_props, std::string("NPUW_LLM_PREFILL_CONFIG"));
@@ -1024,7 +1025,18 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         // (function::PagedAttention) is in place — see
         // PAGED_ATTN_LOWERING_DESIGN.md. No memory is allocated here:
         // allocate_block() is what triggers per-block allocMem.
-        setup_paged_block_managers(prefill_model, plugin, /*device=*/"NPU");
+        // KV-cache block pool device follows NPUW_DEVICES (first entry). With
+        // NPUW_DEVICES=CPU the blocks allocate via the CPU plugin and the
+        // dispatch can run end-to-end on a host without the L0/NPU backend.
+        auto pa_pool_device = [&]() {
+            const auto devs = m_cfg.getString<::intel_npu::NPUW_DEVICES>();
+            const auto comma = devs.find(',');
+            return comma == std::string::npos ? devs : devs.substr(0, comma);
+        }();
+        if (pa_pool_device.empty()) {
+            pa_pool_device = "NPU";
+        }
+        setup_paged_block_managers(prefill_model, plugin, pa_pool_device);
     } else if (m_use_chunk_prefill) {
         ov::npuw::ReshapeToStatic(static_cast<uint32_t>(m_prefill_chunk_size),
                                   m_kvcache_desc.max_prompt_size,
