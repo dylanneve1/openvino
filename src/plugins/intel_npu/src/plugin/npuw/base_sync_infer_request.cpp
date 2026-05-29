@@ -440,6 +440,7 @@ void ov::npuw::IBaseInferRequest::bind_global_params(std::size_t idx, RqPtr requ
         });
     };
 
+    const auto sub_input_count = request->get_inputs().size();
     for (auto&& it : iodesc.global_params) {
         std::size_t param_idx{}, sub_in_idx{};
         std::tie(param_idx, sub_in_idx) = it;
@@ -447,6 +448,21 @@ void ov::npuw::IBaseInferRequest::bind_global_params(std::size_t idx, RqPtr requ
 
         const auto& g_port = m_npuw_model->inputs()[param_idx];
         const auto& g_tnsr = get_tensor(g_port);
+
+        // PA / HFA layer bodies get swapped to a smaller tile sub-model at
+        // compile time. The global_params mapping was built from the original
+        // layer's Parameter list and may point past the tile model's input
+        // count; in that case the behavior caches the tensor for the dispatch
+        // and the legacy set_tensor branch must be skipped entirely.
+        if (sub_in_idx >= sub_input_count) {
+            if (bind_behavior_input(idx, real_idx, sub_in_idx, g_tnsr, request)) {
+                continue;
+            }
+            LOG_DEBUG("Skip OOB global param " << param_idx << " -> sub_in[" << sub_in_idx
+                                                << "] (sub has " << sub_input_count << " inputs)");
+            continue;
+        }
+
         const auto& s_port = request->get_inputs()[sub_in_idx];
         LOG_DEBUG("Processing " << g_port << " -> " << s_port << "...");
         LOG_BLOCK();
