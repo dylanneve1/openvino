@@ -1408,9 +1408,10 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                     // Upstream Q / K / V tensors come from the layer's
                     // q_proj/k_proj/v_proj path in [B, H, q, S] layout. The
                     // PA-flavoured tile sub-model expects rank-2
-                    // [q_size, H*S] / [q_size, Hk*S]. Same memory order, just
-                    // rank differs — wrap the SoPtr in a Tensor view with the
-                    // target shape before set_tensor() validates.
+                    // [q_size, H*S] / [q_size, Hk*S]. Allocate a packed
+                    // target buffer and memcpy into it — make_tensor on top
+                    // of a foreign data pointer treats the source as strided
+                    // and trips set_tensor()'s contiguity assertion.
                     auto reshape_view = [](const ov::SoPtr<ov::ITensor>& src,
                                            const ov::Shape& shape) -> ov::SoPtr<ov::ITensor> {
                         if (!src) {
@@ -1419,8 +1420,10 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                         if (src->get_shape() == shape) {
                             return src;
                         }
-                        return ov::SoPtr<ov::ITensor>{
-                            ov::make_tensor(src->get_element_type(), shape, src->data()), nullptr};
+                        const auto et = src->get_element_type();
+                        ov::SoPtr<ov::ITensor> dst{ov::make_tensor(et, shape), nullptr};
+                        std::memcpy(dst->data(), src->data(), dst->get_byte_size());
+                        return dst;
                     };
                     auto bind_tile_in = [&](OnlineSoftmaxTileInputId id, const ov::SoPtr<ov::ITensor>& t) {
                         const auto& port = tile_inputs.at(static_cast<std::size_t>(id));
