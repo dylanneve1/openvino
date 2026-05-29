@@ -565,6 +565,14 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
                 if (fcn_template._host_flash_attention) {
                     m_compiled_submodels[id].model = fcn_template._host_flash_attention.value()._final_tile_model;
                 } else if (fcn_template._paged_attention && fcn_template._paged_attention->is_valid()) {
+                    // Record the original layer body's output port shapes so
+                    // the infer request can pre-allocate placeholder
+                    // funcall_result tensors for the vestigial present-K/V
+                    // outputs the tile sub-model does not reproduce.
+                    for (const auto& out : fcn_template._model->outputs()) {
+                        m_compiled_submodels[id].attn_orig_output_shapes.push_back(out.get_shape());
+                        m_compiled_submodels[id].attn_orig_output_types.push_back(out.get_element_type());
+                    }
                     m_compiled_submodels[id].model = fcn_template._paged_attention.value()._final_tile_model;
                 } else {
                     m_compiled_submodels[id].model = fcn_template._model;

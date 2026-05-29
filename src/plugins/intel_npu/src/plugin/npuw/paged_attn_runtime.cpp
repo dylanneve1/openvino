@@ -292,7 +292,12 @@ std::optional<PagedAttention> PagedAttention::from(const std::shared_ptr<ov::Mod
     const auto& key_cache_param = pa->get_input_node_shared_ptr(static_cast<std::size_t>(PAInputId::KEY_CACHE));
     const ov::element::Type input_dtype = key_cache_param->get_element_type();
     const ov::element::Type mask_dtype = ov::element::f32;
-    const ov::element::Type output_dtype = pa->get_output_element_type(0);
+    // The downstream o_proj consumes the attention output at the layer body's
+    // output-0 dtype, which is the KV-cache (f16) precision after the
+    // SDPA->PA rewrite — not necessarily the PA op's own output element type.
+    // Match input_dtype so the swapped tile body slots in without a precision
+    // mismatch at the funcall boundary.
+    const ov::element::Type output_dtype = input_dtype;
 
     try {
         out._tile_model = create_pa_online_softmax_tile_model(out._num_q_heads,

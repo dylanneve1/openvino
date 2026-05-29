@@ -913,10 +913,26 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
             bool bind_function_output(ov::npuw::v1::subgraphs::InferContext& ctx,
                                       std::size_t output_idx,
                                       const ov::SoPtr<ov::ITensor>& tensor) override {
-                (void)ctx;
-                (void)output_idx;
-                (void)tensor;
-                return false;
+                if (m_kind != BehaviorKind::Paged) {
+                    return false;
+                }
+                // PA dispatch: capture the funcall's output tensor so the
+                // tile loop's final_req can write into it directly. Without
+                // this, the m_funcall_result entry stays unbound and the
+                // next subgraph trips an empty map::at on its first input.
+                const auto& pipeline = get_subgraph_pipeline(ctx, ctx.real_subgraph_idx);
+                const auto* pa = ov::npuw::attn::get_compiled_pa(pipeline.context);
+                if (pa == nullptr) {
+                    return false;
+                }
+                auto& state = get_runtime_state(ctx);
+                const auto num_outs = pa->_compiled_final_tile_model->outputs().size();
+                auto& io = get_behavior_io(state, ctx.subgraph_idx, get_param_base(ctx, ctx.real_subgraph_idx),
+                                           num_outs);
+                if (output_idx < io.outputs.size()) {
+                    io.outputs[output_idx] = tensor;
+                }
+                return true;
             }
 
             void prologue(ov::npuw::v1::subgraphs::InferContext& ctx) override {
@@ -1478,8 +1494,31 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                     bind_final_in(OnlineSoftmaxTileInputId::PAST_ACC, state.pa_state.state_acc);
                     bind_final_in(OnlineSoftmaxTileInputId::PAST_MAX, state.pa_state.state_max);
                     bind_final_in(OnlineSoftmaxTileInputId::PAST_D, state.pa_state.state_d);
-                    bind_final_in(OnlineSoftmaxTileInputId::K_TILE, present_key_tensor);
-                    bind_final_in(OnlineSoftmaxTileInputId::V_TILE, present_value_tensor);
+
+                    // Final tile's K_TILE / V_TILE expect [1, Hk, q_size, S].
+                    // PA op emits present K/V as rank-2 [B_token, Hk*S]; pack
+                    // them via a transpose copy (heads packed -> heads outer)
+                    // matching the pool block layout.
+                    const auto Hk = static_cast<std::size_t>(pa_desc->_num_kv_heads);
+                    const auto S = static_cast<std::size_t>(pa_desc->_head_size);
+                    const auto Q = static_cast<std::size_t>(pa_desc->_query_size);
+                    auto pack_present_for_final = [&](const ov::SoPtr<ov::ITensor>& src) {
+                        ov::SoPtr<ov::ITensor> dst{
+                            ov::make_tensor(src->get_element_type(), ov::Shape{1, Hk, Q, S}), nullptr};
+                        const auto et_size = src->get_element_type().size();
+                        const auto* sp = reinterpret_cast<const uint8_t*>(src->data());
+                        auto* dp = reinterpret_cast<uint8_t*>(dst->data());
+                        for (std::size_t b = 0; b < Q; ++b) {
+                            for (std::size_t h = 0; h < Hk; ++h) {
+                                const auto src_off = (b * Hk + h) * S * et_size;
+                                const auto dst_off = (h * Q + b) * S * et_size;
+                                std::memcpy(dp + dst_off, sp + src_off, S * et_size);
+                            }
+                        }
+                        return dst;
+                    };
+                    bind_final_in(OnlineSoftmaxTileInputId::K_TILE, pack_present_for_final(present_key_tensor));
+                    bind_final_in(OnlineSoftmaxTileInputId::V_TILE, pack_present_for_final(present_value_tensor));
                     if (!io.outputs.empty() && io.outputs.at(0)) {
                         final_req->set_tensor(final_outputs.at(0), io.outputs.at(0));
                     }
@@ -1498,6 +1537,32 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                     // until all new_tokens are placed.
                     if (num_active_blocks > 0 && new_tokens > 0) {
                         const uint32_t block_size = static_cast<uint32_t>(pa_desc->_block_size);
+                        const auto Hk = static_cast<std::size_t>(pa_desc->_num_kv_heads);
+                        const auto S = static_cast<std::size_t>(pa_desc->_head_size);
+                        const auto B = static_cast<std::size_t>(new_tokens);
+
+                        // PA op emits present K/V as rank-2 [B_token, Hk*S].
+                        // Wrap them in rank-4 [1, Hk, B_token, S] views with
+                        // a transpose copy so they share layout with the pool
+                        // blocks (and we can use view(seq_dim=2)).
+                        auto pack_present = [&](const ov::SoPtr<ov::ITensor>& src) {
+                            ov::SoPtr<ov::ITensor> dst{
+                                ov::make_tensor(src->get_element_type(), ov::Shape{1, Hk, B, S}), nullptr};
+                            const auto et_size = src->get_element_type().size();
+                            const auto* sp = reinterpret_cast<const uint8_t*>(src->data());
+                            auto* dp = reinterpret_cast<uint8_t*>(dst->data());
+                            for (std::size_t b = 0; b < B; ++b) {
+                                for (std::size_t h = 0; h < Hk; ++h) {
+                                    const auto src_off = (b * Hk + h) * S * et_size;
+                                    const auto dst_off = (h * B + b) * S * et_size;
+                                    std::memcpy(dp + dst_off, sp + src_off, S * et_size);
+                                }
+                            }
+                            return dst;
+                        };
+                        auto present_k_packed = pack_present(present_key_tensor);
+                        auto present_v_packed = pack_present(present_value_tensor);
+
                         uint32_t remaining = new_tokens;
                         uint32_t src_offset = 0;
                         const uint32_t first_block_idx = past_lens / block_size;
@@ -1520,18 +1585,21 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                                 static_cast<uint32_t>(block_indices_data[bib_start + cur_block]);
                             auto blk_k = layer_key->get_block_tensor(phys_id);
                             auto blk_v = layer_value->get_block_tensor(phys_id);
-                            // Sequence dim differs between K and V (axis 2 for K,
-                            // axis 3 for V — see online_softmax_tile.cpp:create_tile_params).
+                            // Pool blocks are [1, Hk, block_size, S] for both
+                            // K and V (PA's value cache uses dim order
+                            // {0,1,2,3}, see paged_attention_static.cpp). The
+                            // present-side packed views above match that
+                            // layout, so axis 2 is the seq dim on both ends.
                             ov::npuw::copy_tensor_by_dim(
-                                ov::npuw::util::view(present_key_tensor, /*seq_dim=*/2, src_offset, fits),
+                                ov::npuw::util::view(present_k_packed, /*seq_dim=*/2, src_offset, fits),
                                 ov::npuw::util::view(blk_k, /*seq_dim=*/2, cur_offset, fits),
                                 /*src_dim=*/2,
                                 /*dst_dim=*/2);
                             ov::npuw::copy_tensor_by_dim(
-                                ov::npuw::util::view(present_value_tensor, /*seq_dim=*/3, src_offset, fits),
-                                ov::npuw::util::view(blk_v, /*seq_dim=*/3, cur_offset, fits),
-                                /*src_dim=*/3,
-                                /*dst_dim=*/3);
+                                ov::npuw::util::view(present_v_packed, /*seq_dim=*/2, src_offset, fits),
+                                ov::npuw::util::view(blk_v, /*seq_dim=*/2, cur_offset, fits),
+                                /*src_dim=*/2,
+                                /*dst_dim=*/2);
                             layer_key->update_block_tokens(phys_id, cur_offset + fits);
                             layer_value->update_block_tokens(phys_id, cur_offset + fits);
                             src_offset += fits;
