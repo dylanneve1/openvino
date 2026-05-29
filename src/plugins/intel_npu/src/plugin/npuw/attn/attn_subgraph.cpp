@@ -149,10 +149,15 @@ BehaviorIO& get_behavior_io(RuntimeState& state,
                             std::size_t num_inputs,
                             std::size_t num_outputs) {
     auto& io = state.call_io[subgraph_idx];
-    if (io.inputs.size() != num_inputs) {
+    // Grow only — never shrink. Different call sites pass different counts for
+    // the same call (e.g. PA's run() asks for the tile model's single output
+    // while function_prologue already sized io.outputs to include the original
+    // layer's present-K/V passthrough ports). Shrinking here would drop those
+    // already-bound tensors.
+    if (io.inputs.size() < num_inputs) {
         io.inputs.resize(num_inputs);
     }
-    if (io.outputs.size() != num_outputs) {
+    if (io.outputs.size() < num_outputs) {
         io.outputs.resize(num_outputs);
     }
     return io;
@@ -938,12 +943,17 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                     return false;
                 }
                 auto& state = get_runtime_state(ctx);
-                const auto num_outs = pa->_compiled_final_tile_model->outputs().size();
+                // Size io.outputs to cover every offered port — the tile model
+                // exposes one (attn result), but the original layer body also
+                // had present-K/V output ports the dispatch passes through.
+                const auto num_outs =
+                    std::max(pa->_compiled_final_tile_model->outputs().size(), output_idx + 1);
                 auto& io = get_behavior_io(state, ctx.subgraph_idx, get_param_base(ctx, ctx.real_subgraph_idx),
                                            num_outs);
-                if (output_idx < io.outputs.size()) {
-                    io.outputs[output_idx] = tensor;
+                if (output_idx >= io.outputs.size()) {
+                    io.outputs.resize(output_idx + 1);
                 }
+                io.outputs[output_idx] = tensor;
                 return true;
             }
 
@@ -1541,6 +1551,30 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                         final_req->set_tensor(final_outputs.at(0), io.outputs.at(0));
                     }
                     final_req->infer();
+
+                    // The original layer body also exported present-K/V on
+                    // output ports >0 (consumed downstream — e.g. the model's
+                    // KV-cache Result or the next layer). The tile model only
+                    // produces the attention result, so pass the present K/V
+                    // through by copying io.inputs[KEY]/[VALUE] into those
+                    // funcall_result buffers. present K/V byte layout matches
+                    // the [B_token, Hk*S] the output ports expect.
+                    {
+                        const auto copy_into = [](const ov::SoPtr<ov::ITensor>& dst,
+                                                  const ov::SoPtr<ov::ITensor>& src) {
+                            if (!dst || !src) {
+                                return;
+                            }
+                            const auto n = std::min(dst->get_byte_size(), src->get_byte_size());
+                            std::memcpy(dst->data(), src->data(), n);
+                        };
+                        if (io.outputs.size() > 1) {
+                            copy_into(io.outputs[1], present_key_tensor);
+                        }
+                        if (io.outputs.size() > 2) {
+                            copy_into(io.outputs[2], present_value_tensor);
+                        }
+                    }
 
                     // Write the new K/V into the pool blocks so the next call
                     // sees them as cached. SDPAToPagedAttention's PA op does this
