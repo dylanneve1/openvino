@@ -696,10 +696,11 @@ std::shared_ptr<ov::Model> create_pa_online_softmax_tile_model(size_t num_q_head
                                                                const ov::element::Type& input_dtype,
                                                                const ov::element::Type& mask_dtype,
                                                                bool is_final_tile,
-                                                               const ov::element::Type& output_dtype) {
+                                                               const ov::element::Type& output_dtype,
+                                                               float scale) {
     LOG_DEBUG("Creating PA online-softmax " << (is_final_tile ? "FINAL " : "") << "tile model with q_size=" << q_size
                                               << ", block_size=" << block_size << ", H=" << num_q_heads
-                                              << ", Hk=" << num_kv_heads << ", S=" << head_dim);
+                                              << ", Hk=" << num_kv_heads << ", S=" << head_dim << ", scale=" << scale);
 
     NPUW_ASSERT(num_q_heads % num_kv_heads == 0 && "Q heads must be divisible by KV heads");
     const size_t batch = 1u;
@@ -793,6 +794,15 @@ std::shared_ptr<ov::Model> create_pa_online_softmax_tile_model(size_t num_q_head
     f32.k_tile_f32 = std::make_shared<ov::op::v0::Convert>(k_tile, compute_dtype);
     f32.v_tile_f32 = std::make_shared<ov::op::v0::Convert>(v_transposed, compute_dtype);
     f32.q_f32 = std::make_shared<ov::op::v0::Convert>(q_4d, compute_dtype);
+    // Apply the SDPA scale (1/sqrt(head_dim) or the PA op's explicit scale).
+    // The online-softmax body's QK MatMul is unscaled — HFA relies on the
+    // upstream SDPA decomposition having pre-scaled Q, but PA's q_proj output
+    // is raw, so we fold the scale into Q here.
+    if (scale != 0.0f) {
+        auto scale_c = ov::op::v0::Constant::create(compute_dtype, ov::Shape{}, {scale});
+        f32.q_f32 = std::make_shared<ov::op::v1::Multiply>(f32.q_f32, scale_c);
+        f32.q_f32->set_friendly_name("q_f32_scaled");
+    }
     f32.mask_tile_f32 = (mask_dtype == compute_dtype)
                             ? std::static_pointer_cast<ov::Node>(mask_4d)
                             : std::static_pointer_cast<ov::Node>(

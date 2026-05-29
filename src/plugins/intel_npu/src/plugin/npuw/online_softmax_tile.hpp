@@ -144,7 +144,8 @@ std::shared_ptr<ov::Model> create_pa_online_softmax_tile_model(size_t num_q_head
                                                                const ov::element::Type& input_dtype,
                                                                const ov::element::Type& mask_dtype,
                                                                bool is_final_tile = false,
-                                                               const ov::element::Type& output_dtype = ov::element::f16);
+                                                               const ov::element::Type& output_dtype = ov::element::f16,
+                                                               float scale = 0.0f);
 
 }  // namespace npuw
 }  // namespace ov

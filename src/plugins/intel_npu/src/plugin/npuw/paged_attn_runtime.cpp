@@ -308,7 +308,8 @@ std::optional<PagedAttention> PagedAttention::from(const std::shared_ptr<ov::Mod
                                                               input_dtype,
                                                               mask_dtype,
                                                               /*is_final_tile=*/false,
-                                                              output_dtype);
+                                                              output_dtype,
+                                                              out._scale);
 
         out._final_tile_model = create_pa_online_softmax_tile_model(out._num_q_heads,
                                                                     out._num_kv_heads,
@@ -318,7 +319,8 @@ std::optional<PagedAttention> PagedAttention::from(const std::shared_ptr<ov::Mod
                                                                     input_dtype,
                                                                     mask_dtype,
                                                                     /*is_final_tile=*/true,
-                                                                    output_dtype);
+                                                                    output_dtype,
+                                                                    out._scale);
     } catch (const std::exception& e) {
         LOG_WARN("function::PagedAttention::from: tile-model construction failed: " << e.what());
         out._tile_model.reset();

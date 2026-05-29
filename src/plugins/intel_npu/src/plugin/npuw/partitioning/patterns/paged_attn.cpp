@@ -38,10 +38,15 @@ namespace {
 // one repeating unit and the q/k/v_proj MatMuls remain in the upstream
 // compute group as boundary anchors.
 bool is_attn_glue_op(const std::shared_ptr<ov::Node>& node) {
+    // Only pure shape-manipulation ops count as glue. Element-wise ops
+    // (RoPE's Multiply/Add, residual Add) and Concat must stay in the
+    // upstream/downstream compute group: pulling the residual Add into the
+    // attn tag links neighbouring layers and pulling RoPE in makes the
+    // tagged set vary per layer, both of which break the partitioner's
+    // repeated-block detection (it then emits a unique FCEW per layer
+    // instead of one shared REP).
     return ov::as_type_ptr<ov::op::v1::Reshape>(node) || ov::as_type_ptr<ov::op::v1::Transpose>(node) ||
-           ov::as_type_ptr<ov::op::v0::Convert>(node) || ov::as_type_ptr<ov::op::v1::Multiply>(node) ||
-           ov::as_type_ptr<ov::op::v1::Add>(node) || ov::as_type_ptr<ov::op::v0::Concat>(node) ||
-           ov::as_type_ptr<ov::op::v0::Unsqueeze>(node);
+           ov::as_type_ptr<ov::op::v0::Convert>(node) || ov::as_type_ptr<ov::op::v0::Unsqueeze>(node);
 }
 
 bool is_boundary_op(const std::shared_ptr<ov::Node>& node) {
