@@ -1229,7 +1229,18 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         {"NPUW_UNFOLD_IREQS", "NO"},
     };
 
-    if (m_use_chunk_prefill && (prefill_attn_pyramid || prefill_attn_hfa || prefill_attn_dyn || prefill_attn_paged)) {
+    // PYRAMID / HFA / DYNAMIC only need the attention partitioner treatment on
+    // prefill when prefill is chunked — an unchunked prefill is a single static
+    // pass. PAGED is different: the NPU-lowering tile loop is what writes the
+    // prompt's K/V into the per-layer KVCacheBlockManager pools, and the
+    // generate phase reads those same pools. If prefill is left as a plain
+    // static pass its PagedAttentionExtension stays unlowered and scatters the
+    // prompt K/V into the inner key_cache.N Parameters instead of the pools, so
+    // generate attends over an empty cache and degenerates. Generate is ungated
+    // below; prefill must match for PAGED regardless of chunking.
+    const bool prefill_attn_chunked =
+        m_use_chunk_prefill && (prefill_attn_pyramid || prefill_attn_hfa || prefill_attn_dyn);
+    if (prefill_attn_chunked || prefill_attn_paged) {
         prefill_config["NPUW_ATTN"] = ::intel_npu::NPUW_LLM_PREFILL_ATTENTION_HINT::toString(prefill_attn_hint);
         merge_config_with(prefill_config, dyn_attn_opts);
     }

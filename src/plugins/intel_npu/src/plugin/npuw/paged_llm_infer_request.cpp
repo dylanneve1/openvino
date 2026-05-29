@@ -147,10 +147,16 @@ void PagedLLMInferRequest::update_block_table(uint32_t tokens_this_step) {
         if (auto it = ports.find("block_indices"); it != ports.end()) {
             auto t = req->get_tensor(it->second);
             auto* data = t->data<int32_t>();
-            for (uint32_t i = 0; i < blocks_used; ++i) {
+            // block_indices is baked to max_seqs * ceil(max_context_len /
+            // block_size) entries — large enough for the whole compiled
+            // context — so blocks_used never overruns it in practice. Guard the
+            // write anyway and zero the unused tail for determinism.
+            const uint32_t cap = static_cast<uint32_t>(t->get_size());
+            const uint32_t used = std::min(blocks_used, cap);
+            for (uint32_t i = 0; i < used; ++i) {
                 data[i] = static_cast<int32_t>(i);
             }
-            for (size_t i = blocks_used; i < t->get_size(); ++i) {
+            for (size_t i = used; i < t->get_size(); ++i) {
                 data[i] = 0;
             }
         }
