@@ -4,6 +4,8 @@
 
 #include "kv_cache_block_manager.hpp"
 
+#include <cstring>
+
 #include "logging.hpp"
 #include "util.hpp"
 
@@ -72,6 +74,14 @@ std::optional<uint32_t> KVCacheBlockManager::allocate_block() {
         block.tensor = ov::npuw::util::allocMem(element_type_, block_shape_, device_, plugin_);
         LOG_DEBUG("KVCacheBlockManager: Allocated memory for block " << block_id << " (shape=" << block_shape_
                                                                      << ", device=" << device_ << ")");
+    }
+    // Zero the block: partially-filled blocks (e.g. the tail block after a
+    // prefill that doesn't land on a block_size boundary) leave unwritten
+    // slots. The attention tile reads the whole block and masks the invalid
+    // slots with -inf, but K·q on uninitialised (NaN) slots yields NaN that
+    // survives the mask add. Zeroing keeps masked slots numerically inert.
+    if (block.tensor && block.tensor->data() && block.tensor->get_byte_size() > 0) {
+        std::memset(block.tensor->data(), 0, block.tensor->get_byte_size());
     }
 
     // Reset block state; caller owns one reference.
