@@ -315,7 +315,20 @@ ov::npuw::JustInferRequest::JustInferRequest(const std::shared_ptr<ov::npuw::Com
             const auto real_idx = comp_model_desc.replaced_by.value();
             auto& proto_comp_model_desc = m_npuw_model->m_compiled_submodels[real_idx];
             auto& proto_comp_model = proto_comp_model_desc.compiled_model;
-            const auto num_outputs = proto_comp_model->outputs().size();
+            auto num_outputs = proto_comp_model->outputs().size();
+
+            // If the compiled model has been swapped (HFA / PA tile sub-model
+            // is narrower than the original layer), look at the link map for
+            // any downstream consumer that still references a higher output
+            // port — funcall_result entries must exist for them too so the
+            // next subgraph's prologue doesn't trip an empty map::at.
+            for (const auto& kv : m_npuw_model->m_submodels_input_to_prev_output) {
+                const auto producer = kv.second.first;
+                const auto port = kv.second.second;
+                if (producer == i && port + 1u > num_outputs) {
+                    num_outputs = port + 1u;
+                }
+            }
 
             // Initialize the spatial IO placeholders, if required
             if (proto_comp_model_desc.spatial) {
@@ -353,9 +366,24 @@ ov::npuw::JustInferRequest::JustInferRequest(const std::shared_ptr<ov::npuw::Com
                 moe_real_idx = real_idx;
             }  // if(moe_experts)
 
+            const auto compiled_out_count = proto_comp_model->outputs().size();
             for (size_t out_idx = 0; out_idx < num_outputs; out_idx++) {
                 const auto from = LinkFrom{i, out_idx};
-                m_funcall_result[from] = m_func_mem_mgr.get_tensor(from);
+                if (out_idx < compiled_out_count) {
+                    m_funcall_result[from] = m_func_mem_mgr.get_tensor(from);
+                } else {
+                    // Vestigial output of a swapped attention body (present
+                    // K/V the tile sub-model doesn't reproduce). Allocate a
+                    // standalone placeholder from the recorded original
+                    // shape so downstream prologues find a tensor; nothing
+                    // numerically depends on it in the PA / HFA flow.
+                    const auto& extra_shapes = proto_comp_model_desc.attn_orig_output_shapes;
+                    const auto& extra_types = proto_comp_model_desc.attn_orig_output_types;
+                    NPUW_ASSERT(out_idx < extra_shapes.size());
+                    m_funcall_result[from] = allocMem(extra_types[out_idx],
+                                                      extra_shapes[out_idx],
+                                                      m_npuw_model->funcall_mem_device(real_idx));
+                }
             }
             if (real_idx != i) {
                 // If this function call is NOT the function body, do nothing here - the original

@@ -704,7 +704,10 @@ std::shared_ptr<ov::Model> create_pa_online_softmax_tile_model(size_t num_q_head
     NPUW_ASSERT(num_q_heads % num_kv_heads == 0 && "Q heads must be divisible by KV heads");
     const size_t batch = 1u;
     const auto compute_dtype = ov::element::f32;
-    const auto tile_size = static_cast<size_t>(block_size);
+    // Cached tile reads one pool block (size = block_size); the final tile
+    // attends over the present K/V (size = q_size = B_token rows).
+    const auto tile_size =
+        is_final_tile ? q_size : static_cast<size_t>(block_size);
 
     auto set_param_name = [](std::shared_ptr<ov::op::v0::Parameter>& param, OnlineSoftmaxTileInputId id) {
         const char* name = online_softmax_tile_input_id_to_string(id);
@@ -814,13 +817,29 @@ std::shared_ptr<ov::Model> create_pa_online_softmax_tile_model(size_t num_q_head
     ov::ResultVector model_results;
     std::string model_name;
     if (is_final_tile) {
-        model_results = create_final_tile_outputs(results,
-                                                  output_dtype,
-                                                  batch,
-                                                  q_size,
-                                                  num_q_heads,
-                                                  head_dim,
-                                                  /*fused_flash_attention=*/false);
+        // PA's attention output exits the layer body as rank-2
+        // [q_size, num_q_heads * head_dim] (the SDPAToPagedAttention rewrite
+        // leaves the PA op feeding an o_proj MatMul with that layout). The
+        // HFA helper produces rank-3 [batch, seq, H*S]; replicate its math
+        // but reshape to rank-2 and emit in output_dtype so the swapped
+        // layer body matches every downstream consumer the partitioner wired.
+        auto final_result =
+            std::make_shared<ov::op::v1::Divide>(results.acc.get_node_shared_ptr(), results.d.get_node_shared_ptr());
+        final_result->set_friendly_name("pa_final_result");
+        // [1, H, q, S] -> [1, q, H, S]
+        auto transpose_order =
+            std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{4}, std::vector<int64_t>{0, 2, 1, 3});
+        auto transposed = std::make_shared<ov::op::v1::Transpose>(final_result, transpose_order);
+        // [1, q, H, S] -> [q, H*S]
+        auto reshape_pattern = std::make_shared<ov::op::v0::Constant>(
+            ov::element::i64,
+            ov::Shape{2},
+            std::vector<int64_t>{static_cast<int64_t>(q_size), static_cast<int64_t>(num_q_heads * head_dim)});
+        auto reshaped = std::make_shared<ov::op::v1::Reshape>(transposed, reshape_pattern, false);
+        auto final_output = std::make_shared<ov::op::v0::Convert>(reshaped, output_dtype);
+        final_output->set_friendly_name("pa_final_output");
+        final_output->output(0).get_tensor().set_names({"output"});
+        model_results = {std::make_shared<ov::op::v0::Result>(final_output)};
         model_name = "OnlineSoftmax_PA_Final_Tile";
     } else {
         model_results = create_regular_tile_outputs(results, input_dtype);
