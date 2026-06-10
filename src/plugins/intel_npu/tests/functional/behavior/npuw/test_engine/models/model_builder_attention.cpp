@@ -49,16 +49,16 @@ ov::Output<ov::Node> make_repeat_kv(const ov::Output<ov::Node>& kv,
     const size_t actual_kv_heads = (num_kv_heads == 0) ? num_heads : num_kv_heads;
     const size_t n_rep = num_heads / actual_kv_heads;
 
-    if (!shared_broadcast_shape.get_node() && n_rep == 1) {
-        return kv;
-    }
-
     OPENVINO_ASSERT(num_heads % actual_kv_heads == 0,
                     "num_heads (",
                     num_heads,
                     ") must be divisible by num_kv_heads (",
                     actual_kv_heads,
                     ")");
+
+    if (!shared_broadcast_shape.get_node() && n_rep == 1) {
+        return kv;
+    }
 
     ov::Output<ov::Node> broadcast_shape_output;
     if (shared_broadcast_shape.get_node()) {
@@ -224,8 +224,9 @@ ov::Output<ov::Node> make_sdpa(const ov::Output<ov::Node>& q,
     std::shared_ptr<ov::op::v13::ScaledDotProductAttention> sdpa;
     if (head_dim_for_scale > 0 && attention_mask.get_node()) {
         // 5-input SDPA: Q, K, V, mask, scale (required for embedding model pattern matching)
+        // Scale must match the Q/K/V element type — SDPA rejects mixed input types.
         auto scale_val = 1.0f / std::sqrt(static_cast<float>(head_dim_for_scale));
-        auto scale = ov::opset11::Constant::create(ov::element::f32, ov::Shape{}, {scale_val});
+        auto scale = ov::opset11::Constant::create(q.get_element_type(), ov::Shape{}, {scale_val});
         scale->set_friendly_name(name + ".scale");
         sdpa = std::make_shared<ov::op::v13::ScaledDotProductAttention>(q, k, v, attention_mask, scale, false);
     } else if (attention_mask.get_node()) {

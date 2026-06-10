@@ -192,6 +192,10 @@ std::shared_ptr<ov::Model> ModelBuilder::get_model_with_repeated_blocks_and_resu
     std::size_t repetitions,
     const std::vector<std::size_t>& block_indices) {
     clear();
+    if (repetitions == 0) {
+        repetitions = 1;
+    }
+
     // Generate head
     std::shared_ptr<ov::op::v0::Parameter> input =
         std::make_shared<ov::op::v0::Parameter>(ov::element::i32, ov::Shape{1, 1, 40});

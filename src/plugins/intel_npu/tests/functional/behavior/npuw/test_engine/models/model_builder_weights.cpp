@@ -208,7 +208,9 @@ ov::Output<ov::Node> CompressedWeight::operator()(const std::string& name,
         scale_shape = has_groups ? ov::Shape{rows, num_groups, 1} : ov::Shape{rows, 1};
     }
     const size_t scale_count = batch * (has_groups ? rows * num_groups : rows);
-    const float scale_range = 1.0f / static_cast<float>(hi);
+    // nf4 stores codebook indices that dequantize to [-1, 1], so the decompressed
+    // magnitude is already ~1 and the scale must not divide by the index range.
+    const float scale_range = (storage_type == ov::element::nf4) ? 1.0f : 1.0f / static_cast<float>(hi);
     uint32_t s_state = seed_from_name(name + "_scale");
     std::vector<float> scale_data(scale_count);
     for (size_t i = 0; i < scale_data.size(); ++i) {
