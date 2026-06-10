@@ -261,6 +261,9 @@ ov::Output<ov::Node> Attention::operator()(const ov::Output<ov::Node>& q,
                                            const ov::Output<ov::Node>& v,
                                            const std::string& prefix,
                                            size_t layer_idx) const {
+    // Unlike make_repeat_kv, the K/V reshapes and projections cannot treat 0 as
+    // "MHA" — resolve it up front (see BaseModelConfig::get_kv_heads).
+    OPENVINO_ASSERT(num_kv_heads > 0, "Attention::num_kv_heads must be non-zero; resolve 0 (MHA) to num_heads");
     auto q_reshaped = make_multihead_reshape(q, num_heads, head_dim, prefix + attn_prefix + "q_reshape");
     auto k_reshaped = make_multihead_reshape(k, num_kv_heads, head_dim, prefix + attn_prefix + "k_reshape");
     auto v_reshaped = make_multihead_reshape(v, num_kv_heads, head_dim, prefix + attn_prefix + "v_reshape");
