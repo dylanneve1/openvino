@@ -19,24 +19,33 @@ void reshape_to_static(std::shared_ptr<ov::Model> model,
                        const uint32_t lora_rank,
                        const uint32_t lhs_seq_size = 0,
                        const bool is_prefill = false) {
+    // [SPIKE-TIER1] Recon only: let an env var override the static batch size so we can
+    // observe whether reshape -> NPUW partitioning -> CPU compile tolerate a batch-B graph,
+    // and where the infer-request data path breaks. NOT a real feature.
+    uint32_t spike_batch = 1u;
+    if (const char* e = std::getenv("NPUW_SPIKE_BATCH")) {
+        const int v = std::atoi(e);
+        spike_batch = v >= 1 ? static_cast<uint32_t>(v) : 1u;
+    }
+    LOG_INFO("[SPIKE-TIER1] reshape_to_static batch=" << spike_batch << " is_prefill=" << is_prefill);
     std::map<std::string, ov::PartialShape> new_shapes;
     for (const auto& input : model->inputs()) {
         const auto& input_name = input.get_any_name();
         ov::PartialShape new_shape;
         if (input_name.find("input_ids") != std::string::npos) {
-            new_shape = ov::PartialShape({1, input_size});
+            new_shape = ov::PartialShape({spike_batch, input_size});
         } else if (input_name.find("token_type_ids") != std::string::npos) {
-            new_shape = ov::PartialShape({1, input_size});
+            new_shape = ov::PartialShape({spike_batch, input_size});
         } else if (input_name.find("inputs_embeds") != std::string::npos) {
             // NB: VLMs case, model accepts inputs_embeds[BATCH, SEQ_LEN, EMB_SIZE]
             NPUW_ASSERT(input.get_partial_shape().size() == 3u);
             NPUW_ASSERT(input.get_partial_shape()[2].is_static());
             new_shape = ov::PartialShape({1, input_size, input.get_partial_shape()[2]});
         } else if (input_name.find("attention_mask") != std::string::npos) {
-            new_shape = ov::PartialShape({1, kvcache_size});
+            new_shape = ov::PartialShape({spike_batch, kvcache_size});
             if (lhs_seq_size && !is_prefill)
                 // NB: for whisper kvcache model attn mask should be size + 1
-                new_shape = ov::PartialShape({1, kvcache_size + 1});
+                new_shape = ov::PartialShape({spike_batch, kvcache_size + 1});
         } else if (input_name.find("position_ids") != std::string::npos) {
             const auto partial_shape_size = input.get_partial_shape().size();
             // NB: Regular LLM uses 2D shapes, Qwen2.5 VL/Omni, Qwen3.5 VL use 3D shapes
@@ -46,7 +55,7 @@ void reshape_to_static(std::shared_ptr<ov::Model> model,
             NPUW_ASSERT(partial_shape_size == 3u || partial_shape_size == 2u);
             auto first_dim_value = input.get_partial_shape()[0];
             new_shape = partial_shape_size == 3u ? ov::PartialShape({first_dim_value, 1, input_size})
-                                                 : ov::PartialShape({1, input_size});
+                                                 : ov::PartialShape({spike_batch, input_size});
         } else if (input_name.find("cache_position") != std::string::npos) {
             // NB: Whisper case
             new_shape = ov::PartialShape({1});
@@ -112,11 +121,11 @@ void reshape_to_static(std::shared_ptr<ov::Model> model,
             //       need to track that this assumption holds in future versions.
             const auto& shape_batch_dim = partial_shape[kv_axes_position.batch];
             NPUW_ASSERT(shape_batch_dim.is_dynamic() || shape_batch_dim.get_length() <= 1);
-            new_shape[kv_axes_position.batch] = 1;  // batch_dim
+            new_shape[kv_axes_position.batch] = spike_batch;  // batch_dim
         } else {
             const auto& partial_shape = input.get_partial_shape();
             new_shape = partial_shape;
-            new_shape[kv_axes_position.batch] = 1;
+            new_shape[kv_axes_position.batch] = spike_batch;
             if (lhs_seq_size) {  // Whisper model
                 new_shape[kv_axes_position.seq_len] = (input_name.find(".decoder") != std::string::npos)
                                                           ? kvcache_size - input_size  // kv_size for decoder
