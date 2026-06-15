@@ -18,22 +18,26 @@ void reshape_to_static(std::shared_ptr<ov::Model> model,
                        const ov::npuw::KVAxesPosition& kv_axes_position,
                        const uint32_t lora_rank,
                        const uint32_t lhs_seq_size = 0,
-                       const bool is_prefill = false) {
+                       const bool is_prefill = false,
+                       const uint32_t batch_size = 1) {
+    // batch_size > 1 enables a true static batch-B graph (NPUW_LLM_BATCH_SIZE). Only the
+    // plain LLM inputs and KV-cache carry the batch axis; Whisper / VLM-embeds / Eagle3 /
+    // LoRA / Gemma per-layer paths are out of scope and stay batch 1.
     std::map<std::string, ov::PartialShape> new_shapes;
     for (const auto& input : model->inputs()) {
         const auto& input_name = input.get_any_name();
         ov::PartialShape new_shape;
         if (input_name.find("input_ids") != std::string::npos) {
-            new_shape = ov::PartialShape({1, input_size});
+            new_shape = ov::PartialShape({batch_size, input_size});
         } else if (input_name.find("token_type_ids") != std::string::npos) {
-            new_shape = ov::PartialShape({1, input_size});
+            new_shape = ov::PartialShape({batch_size, input_size});
         } else if (input_name.find("inputs_embeds") != std::string::npos) {
             // NB: VLMs case, model accepts inputs_embeds[BATCH, SEQ_LEN, EMB_SIZE]
             NPUW_ASSERT(input.get_partial_shape().size() == 3u);
             NPUW_ASSERT(input.get_partial_shape()[2].is_static());
             new_shape = ov::PartialShape({1, input_size, input.get_partial_shape()[2]});
         } else if (input_name.find("attention_mask") != std::string::npos) {
-            new_shape = ov::PartialShape({1, kvcache_size});
+            new_shape = ov::PartialShape({batch_size, kvcache_size});
             if (lhs_seq_size && !is_prefill)
                 // NB: for whisper kvcache model attn mask should be size + 1
                 new_shape = ov::PartialShape({1, kvcache_size + 1});
@@ -46,7 +50,7 @@ void reshape_to_static(std::shared_ptr<ov::Model> model,
             NPUW_ASSERT(partial_shape_size == 3u || partial_shape_size == 2u);
             auto first_dim_value = input.get_partial_shape()[0];
             new_shape = partial_shape_size == 3u ? ov::PartialShape({first_dim_value, 1, input_size})
-                                                 : ov::PartialShape({1, input_size});
+                                                 : ov::PartialShape({batch_size, input_size});
         } else if (input_name.find("cache_position") != std::string::npos) {
             // NB: Whisper case
             new_shape = ov::PartialShape({1});
@@ -112,11 +116,11 @@ void reshape_to_static(std::shared_ptr<ov::Model> model,
             //       need to track that this assumption holds in future versions.
             const auto& shape_batch_dim = partial_shape[kv_axes_position.batch];
             NPUW_ASSERT(shape_batch_dim.is_dynamic() || shape_batch_dim.get_length() <= 1);
-            new_shape[kv_axes_position.batch] = 1;  // batch_dim
+            new_shape[kv_axes_position.batch] = batch_size;  // batch_dim
         } else {
             const auto& partial_shape = input.get_partial_shape();
             new_shape = partial_shape;
-            new_shape[kv_axes_position.batch] = 1;
+            new_shape[kv_axes_position.batch] = batch_size;
             if (lhs_seq_size) {  // Whisper model
                 new_shape[kv_axes_position.seq_len] = (input_name.find(".decoder") != std::string::npos)
                                                           ? kvcache_size - input_size  // kv_size for decoder
@@ -139,13 +143,15 @@ ReshapeToStatic::ReshapeToStatic(const uint32_t input_size,
                                  const KVAxesPosition& kv_axes_position,
                                  const uint32_t lora_rank,
                                  const uint32_t lhs_seq_size,
-                                 const bool is_prefill)
+                                 const bool is_prefill,
+                                 const uint32_t batch_size)
     : m_input_size(input_size),
       m_kvcache_size(kvcache_size),
       m_kv_axes_position(kv_axes_position),
       m_lora_rank(lora_rank),
       m_lhs_seq_size(lhs_seq_size),
-      m_is_prefill(is_prefill) {}
+      m_is_prefill(is_prefill),
+      m_batch_size(batch_size) {}
 
 bool ReshapeToStatic::run_on_model(const std::shared_ptr<ov::Model>& model) {
     reshape_to_static(model,
@@ -154,7 +160,8 @@ bool ReshapeToStatic::run_on_model(const std::shared_ptr<ov::Model>& model) {
                       m_kv_axes_position,
                       m_lora_rank,
                       m_lhs_seq_size,
-                      m_is_prefill);
+                      m_is_prefill,
+                      m_batch_size);
 
     return true;
 }

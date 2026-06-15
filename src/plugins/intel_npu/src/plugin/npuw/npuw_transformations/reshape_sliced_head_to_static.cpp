@@ -10,17 +10,18 @@ namespace {
 
 void reshape_sliced_head_to_static(std::shared_ptr<ov::Model> lm_head_model,
                                    const uint32_t& batch_dim,
-                                   std::size_t max_generation_token_len) {
+                                   std::size_t max_generation_token_len,
+                                   uint32_t batch_size) {
     // We have only one input with dynamic shapes: output embeds.
     // Output embeds should have "max_generation_token_len" for dimension representing
-    // number of embeddings to send to the matmul. Batch size should be equal to "1"
-    // for NPU.
+    // number of embeddings to send to the matmul. Batch size is 1 for normal decoding, or
+    // batch_size for a batched (NPUW_LLM_BATCH_SIZE>1) scoring prefill.
     const auto& input = lm_head_model->input(0);
     const auto& partial_shape = input.get_partial_shape();
     NPUW_ASSERT(partial_shape.size() == 3);
 
     ov::PartialShape new_shape = partial_shape;
-    new_shape[batch_dim] = 1;
+    new_shape[batch_dim] = batch_size;
     // Left dynamic axis will be for number of embeddings
     for (auto i = 0; i < new_shape.rank().get_length(); i++) {
         if (new_shape[i].is_dynamic()) {
@@ -38,12 +39,15 @@ void reshape_sliced_head_to_static(std::shared_ptr<ov::Model> lm_head_model,
 
 namespace ov::npuw {
 
-ReshapeSlicedHeadToStatic::ReshapeSlicedHeadToStatic(uint32_t batch_dim, std::size_t max_generation_token_len)
+ReshapeSlicedHeadToStatic::ReshapeSlicedHeadToStatic(uint32_t batch_dim,
+                                                     std::size_t max_generation_token_len,
+                                                     uint32_t batch_size)
     : m_batch_dim(batch_dim),
-      m_max_generation_token_len(max_generation_token_len) {}
+      m_max_generation_token_len(max_generation_token_len),
+      m_batch_size(batch_size) {}
 
 bool ReshapeSlicedHeadToStatic::run_on_model(const std::shared_ptr<ov::Model>& model) {
-    reshape_sliced_head_to_static(model, m_batch_dim, m_max_generation_token_len);
+    reshape_sliced_head_to_static(model, m_batch_dim, m_max_generation_token_len, m_batch_size);
 
     return true;
 }

@@ -903,18 +903,32 @@ void ov::npuw::LLMInferRequest::infer_whole_prefill(ov::SoPtr<ov::ITensor> input
     LOG_BLOCK();
 
     m_llm_profile["1/prefill:3a.prepare"].record([&]() {
-        // NB: padded_input can be either fp32(VLM) or i64(LLM)
+        // The prefill model is compiled with a static batch B (1 unless NPUW_LLM_BATCH_SIZE>1).
+        // input_ids/attention_mask arrive as [B, L] (L <= padded seq). Copy each of the B rows
+        // into its own row of the padded [B, PAD] tensor, right-aligned on the seq dim. For B==1
+        // this reduces to the original single right-aligned block copy.
+        const std::size_t in_batch = input_ids->get_shape()[layer_ids::INPUT_IDS_BATCH_DIM];
+
+        // NB: padded_input can be either fp32(VLM) or i64(LLM); copy by bytes.
         auto padded_input = m_prefill_request->get_tensor(m_prefill_in_ports.at(m_input_ids_name));
-        std::copy_n(reinterpret_cast<uint8_t*>(input_ids->data()),
-                    input_ids->get_byte_size(),
-                    reinterpret_cast<uint8_t*>(padded_input->data()) + padded_input->get_byte_size() -
-                        input_ids->get_byte_size());
+        const std::size_t src_row_bytes = input_ids->get_byte_size() / in_batch;
+        const std::size_t dst_row_bytes = padded_input->get_byte_size() / in_batch;
+        auto* src_ids = reinterpret_cast<uint8_t*>(input_ids->data());
+        auto* dst_ids = reinterpret_cast<uint8_t*>(padded_input->data());
+        for (std::size_t b = 0; b < in_batch; ++b) {
+            std::copy_n(src_ids + b * src_row_bytes,
+                        src_row_bytes,
+                        dst_ids + b * dst_row_bytes + (dst_row_bytes - src_row_bytes));
+        }
 
         auto padded_attention_mask = m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::attention_mask));
-        std::copy_n(
-            attention_mask->data<int64_t>(),
-            attention_mask->get_size(),
-            padded_attention_mask->data<int64_t>() + padded_attention_mask->get_size() - attention_mask->get_size());
+        const std::size_t am_src_row = attention_mask->get_size() / in_batch;
+        const std::size_t am_dst_row = padded_attention_mask->get_size() / in_batch;
+        const auto* src_am = attention_mask->data<int64_t>();
+        auto* dst_am = padded_attention_mask->data<int64_t>();
+        for (std::size_t b = 0; b < in_batch; ++b) {
+            std::copy_n(src_am + b * am_src_row, am_src_row, dst_am + b * am_dst_row + (am_dst_row - am_src_row));
+        }
 
         if (token_type_ids) {
             auto padded_token_type_ids =

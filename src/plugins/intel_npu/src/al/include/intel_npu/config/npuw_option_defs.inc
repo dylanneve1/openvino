@@ -52,6 +52,7 @@ INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_DUMP_IO, std::string, "", ov::intel_npu::npuw::du
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_DUMP_IO_ITERS, bool, false, ov::intel_npu::npuw::dump, io_iters, "NPUW_DUMP_IO_ITERS", ROOT, HIDDEN, UNCACHED, DEV)
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_LLM, bool, false, ov::intel_npu::npuw::llm, enabled, "NPUW_LLM", LLM, EXPOSED, CACHED, ALL)
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_LLM_BATCH_DIM, uint32_t, 0, ov::intel_npu::npuw::llm, batch_dim, "NPUW_LLM_BATCH_DIM", LLM, EXPOSED, CACHED, ALL)
+INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_LLM_BATCH_SIZE, uint32_t, 1, ov::intel_npu::npuw::llm, batch_size, "NPUW_LLM_BATCH_SIZE", LLM, EXPOSED, CACHED, ALL)
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_LLM_SEQ_LEN_DIM, uint32_t, 2, ov::intel_npu::npuw::llm, seq_len_dim, "NPUW_LLM_SEQ_LEN_DIM", LLM, EXPOSED, CACHED, ALL)
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_LLM_MAX_PROMPT_LEN, uint32_t, 1024, ov::intel_npu::npuw::llm, max_prompt_len, "NPUW_LLM_MAX_PROMPT_LEN", LLM, EXPOSED, CACHED, ALL)
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_LLM_MAX_GENERATION_TOKEN_LEN, uint32_t, 1, ov::intel_npu::npuw::llm, max_generation_token_len, "NPUW_LLM_MAX_GENERATION_TOKEN_LEN", LLM, EXPOSED, CACHED, ALL)

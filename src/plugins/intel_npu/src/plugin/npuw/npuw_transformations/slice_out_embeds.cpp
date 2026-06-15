@@ -31,13 +31,19 @@ void slice_out_embeds(std::shared_ptr<ov::Model> model,
             OPENVINO_ASSERT(shape[num_embeds_dim] >= max_generation_token_len,
                             "Number of output embeddings should be greater or equal to the slicing range!");
             if (shape[num_embeds_dim] != max_generation_token_len) {
-                std::vector<int32_t> start_pos{
-                    static_cast<int32_t>(batch_dim * (shape[num_embeds_dim] - max_generation_token_len)),
-                    static_cast<int32_t>(num_embeds_dim * (shape[num_embeds_dim] - max_generation_token_len)),
-                    0};
-                std::vector<int32_t> stop_pos{static_cast<int32_t>(batch_dim * (shape[num_embeds_dim] - 1)) + 1,
-                                              static_cast<int32_t>(num_embeds_dim * (shape[num_embeds_dim] - 1)) + 1,
-                                              static_cast<int32_t>(shape[2])};
+                // Keep the whole batch axis (0..B) and slice only the num-embeds axis down to the
+                // last max_generation_token_len positions. The previous code implicitly assumed
+                // batch==1 on the batch axis; using shape[batch_dim] as the batch extent keeps all
+                // B rows for a batched (NPUW_LLM_BATCH_SIZE>1) prefill.
+                const int32_t batch_extent = static_cast<int32_t>(shape[batch_dim]);
+                const int32_t embeds_start = static_cast<int32_t>(shape[num_embeds_dim] - max_generation_token_len);
+                std::vector<int32_t> start_pos{batch_dim == 0 ? 0 : embeds_start,
+                                               batch_dim == 0 ? embeds_start : 0,
+                                               0};
+                std::vector<int32_t> stop_pos{
+                    batch_dim == 0 ? batch_extent : static_cast<int32_t>(shape[num_embeds_dim]),
+                    batch_dim == 0 ? static_cast<int32_t>(shape[num_embeds_dim]) : batch_extent,
+                    static_cast<int32_t>(shape[2])};
                 auto start = std::make_shared<ov::op::v0::Constant>(ov::element::i32, ov::Shape{3}, start_pos);
                 auto stop = std::make_shared<ov::op::v0::Constant>(ov::element::i32, ov::Shape{3}, stop_pos);
                 auto step = std::make_shared<ov::op::v0::Constant>(ov::element::i32,

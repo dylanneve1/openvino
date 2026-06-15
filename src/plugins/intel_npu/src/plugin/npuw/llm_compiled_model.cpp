@@ -812,6 +812,20 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     const uint32_t seq_len_dim = m_cfg.get<::intel_npu::NPUW_LLM_SEQ_LEN_DIM>();
     KVAxesPosition axes{batch_dim, seq_len_dim};
 
+    // True static batch-B prefill (NPUW_LLM_BATCH_SIZE > 1): compile the prefill model with a
+    // real batch dimension so N independent prompts are scored in ONE inference, matching CPU/GPU.
+    // Intended for non-generating scoring/embedding pipelines; the generate model stays batch 1.
+    const uint32_t prefill_batch_size = m_cfg.get<::intel_npu::NPUW_LLM_BATCH_SIZE>();
+    m_prefill_batch_size = prefill_batch_size;
+    if (prefill_batch_size > 1u) {
+        // RoPE caching precomputes the rotary table at batch 1; the cached tensor cannot broadcast
+        // against a batch-B query (RoPE Multiply shape mismatch). Disable it for batched prefill.
+        if (m_cfg.get<::intel_npu::NPUW_LLM_CACHE_ROPE>()) {
+            LOG_INFO("NPUW_LLM_BATCH_SIZE > 1: forcing NPUW_LLM_CACHE_ROPE=NO (incompatible with batched RoPE).");
+            m_cfg.update({{"NPUW_LLM_CACHE_ROPE", "NO"}});
+        }
+    }
+
     LOG_DEBUG("Creating kvcache model as clone of passed one.");
     auto kvcache_model = model->clone();
 
@@ -892,7 +906,8 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
                                   axes,
                                   m_max_lora_rank,
                                   0,
-                                  true)
+                                  true,
+                                  prefill_batch_size)
             .run_on_model(prefill_model);
     } else {
         ov::npuw::ReshapeToStatic(m_kvcache_desc.max_prompt_size,
@@ -900,7 +915,8 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
                                   axes,
                                   m_max_lora_rank,
                                   whisper_lhs_seq_size,
-                                  true)
+                                  true,
+                                  prefill_batch_size)
             .run_on_model(prefill_model);
     }
     LOG_DEBUG("Make kvcache model with static shapes");
@@ -914,7 +930,9 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         // so only apply slice to the Prefill model:
         ov::npuw::SliceOutEmbeds(axes.batch, m_kvcache_desc.max_generation_token_len).run_on_model(prefill_model);
         LOG_DEBUG("Make LM head model with static shapes");
-        ov::npuw::ReshapeSlicedHeadToStatic(axes.batch, m_kvcache_desc.max_generation_token_len)
+        // For batched scoring the prefill output (and thus the lm-head input) keeps its batch
+        // dimension, so the lm-head must be reshaped to the same static batch.
+        ov::npuw::ReshapeSlicedHeadToStatic(axes.batch, m_kvcache_desc.max_generation_token_len, prefill_batch_size)
             .run_on_model(lm_head_model);
     }
 
@@ -1605,6 +1623,7 @@ void ov::npuw::LLMCompiledModel::implement_properties() {
 
     m_prop_to_opt.insert({BIND(npuw::llm::enabled, NPUW_LLM, get),
                           BIND(npuw::llm::batch_dim, NPUW_LLM_BATCH_DIM, get),
+                          BIND(npuw::llm::batch_size, NPUW_LLM_BATCH_SIZE, get),
                           BIND(npuw::llm::seq_len_dim, NPUW_LLM_SEQ_LEN_DIM, get),
                           BIND(npuw::llm::max_prompt_len, NPUW_LLM_MAX_PROMPT_LEN, get),
                           BIND(npuw::llm::min_response_len, NPUW_LLM_MIN_RESPONSE_LEN, get),

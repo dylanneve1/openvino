@@ -100,6 +100,8 @@ private:
     KVCacheDesc m_kvcache_desc;
     uint64_t m_prefill_chunk_size = 0;
     bool m_use_chunk_prefill = false;
+    // Static batch size of the prefill model (NPUW_LLM_BATCH_SIZE); 1 unless batched scoring.
+    uint32_t m_prefill_batch_size = 1;
     std::shared_ptr<ov::npuw::ICompiledModel_v0> m_kvcache_compiled;
     std::shared_ptr<ov::npuw::ICompiledModel_v0> m_prefill_compiled;
     // This model is optional, so can be null.
