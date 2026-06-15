@@ -10,6 +10,7 @@
 #include "llm_compiled_model_utils.hpp"
 #include "llm_infer_request.hpp"
 #include "logging.hpp"
+#include "v1/elements/batched.hpp"
 #include "moe_transformations/apply_moe_device_routed_transforms.hpp"
 #include "npuw_transformations/add_position_ids_param.hpp"
 #include "npuw_transformations/convert_kvcache_to_precision.hpp"
@@ -1569,13 +1570,30 @@ ov::Any ov::npuw::LLMCompiledModel::get_property(const std::string& name) const 
 
 std::shared_ptr<ov::ISyncInferRequest> ov::npuw::LLMCompiledModel::create_sync_infer_request() const {
     auto* non_const_this = const_cast<ov::npuw::LLMCompiledModel*>(this);  // because of const in API
+
     if (m_is_whisper) {
         return non_const_this->create_whisper_infer_request();
-    } else if (m_is_embedding) {
-        return non_const_this->create_embedding_infer_request();
-    } else {
-        return non_const_this->create_llm_infer_request();
     }
+
+    auto inner = m_is_embedding ? non_const_this->create_embedding_infer_request()
+                                : non_const_this->create_llm_infer_request();
+
+    // Batched scoring: wrap the single-sequence request with the batched element so a
+    // [N, ...] input is unrolled into N independent [1, ...] inferences (rows are scored
+    // one at a time, with the KV-cache reset between them) and stacked back into [N, ...].
+    // This is only valid for non-generating (scoring / embedding) pipelines -- the element
+    // resets state between rows -- so it is strictly opt-in via NPUW_LLM_BATCH and the
+    // pipeline that sets it must never run autoregressive generation.
+    if (m_cfg.get<::intel_npu::NPUW_LLM_BATCH>()) {
+        // Drive the single-sequence request synchronously (sync overload) so it runs on the
+        // calling thread rather than being re-scheduled onto this model's task executor -- the
+        // outer request is already async on that executor, and nesting on the same executor
+        // would deadlock.
+        auto self = std::static_pointer_cast<const ov::ICompiledModel>(shared_from_this());
+        return std::make_shared<ov::npuw::batched::InferRequest>(self, std::move(inner));
+    }
+
+    return inner;
 }
 
 std::shared_ptr<ov::ISyncInferRequest> ov::npuw::LLMCompiledModel::create_llm_infer_request() {
@@ -1620,6 +1638,7 @@ void ov::npuw::LLMCompiledModel::implement_properties() {
                           BIND(npuw::llm::prefill_attn_hint, NPUW_LLM_PREFILL_ATTENTION_HINT, getString),
                           BIND(npuw::llm::generate_attn_hint, NPUW_LLM_GENERATE_ATTENTION_HINT, getString),
                           BIND(npuw::llm::shared_lm_head, NPUW_LLM_SHARED_HEAD, get),
+                          BIND(npuw::llm::batch, NPUW_LLM_BATCH, get),
                           BIND(npuw::whisper::enabled, NPUW_WHISPER, get),
                           BIND(npuw::whisper::whisper_eos_token, NPUW_WHISPER_EOS_TOKEN, get),
                           BIND(npuw::whisper::whisper_decompose_sdpa, NPUW_WHISPER_DECOMPOSE_SDPA, get),

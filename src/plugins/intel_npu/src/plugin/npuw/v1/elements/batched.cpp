@@ -68,8 +68,10 @@ ov::Any ov::npuw::batched::CompiledModel::get_property(const std::string& name) 
 }
 
 std::shared_ptr<ov::ISyncInferRequest> ov::npuw::batched::CompiledModel::create_sync_infer_request() const {
-    auto self = std::static_pointer_cast<const CompiledModel>(shared_from_this());
-    return std::make_shared<InferRequest>(std::move(self));
+    auto self = std::static_pointer_cast<const ov::ICompiledModel>(shared_from_this());
+    auto inner_request = m_inner->create_infer_request();
+    OPENVINO_ASSERT(inner_request != nullptr, "Batched element: inner compiled model returned a null request");
+    return std::make_shared<InferRequest>(self, std::move(inner_request));
 }
 
 std::shared_ptr<ov::IAsyncInferRequest> ov::npuw::batched::CompiledModel::create_infer_request() const {
@@ -78,28 +80,93 @@ std::shared_ptr<ov::IAsyncInferRequest> ov::npuw::batched::CompiledModel::create
                                                     get_callback_executor());
 }
 
-ov::npuw::batched::InferRequest::InferRequest(std::shared_ptr<const CompiledModel> compiled_model)
+ov::npuw::batched::InferRequest::InferRequest(const std::shared_ptr<const ov::ICompiledModel>& compiled_model,
+                                              std::shared_ptr<ov::IAsyncInferRequest> inner_request)
     : ov::ISyncInferRequest(compiled_model),
-      m_compiled(std::move(compiled_model)) {}
+      m_inner_async(std::move(inner_request)) {
+    OPENVINO_ASSERT(m_inner_async != nullptr, "Batched element requires a non-null inner request");
+    init_public_tensors();
+}
 
-void ov::npuw::batched::InferRequest::ensure_inner_request_locked() const {
-    if (m_inner_request == nullptr) {
-        m_inner_request = m_compiled->m_inner->create_infer_request();
-        OPENVINO_ASSERT(m_inner_request != nullptr, "Batched element: inner compiled model returned a null request");
+ov::npuw::batched::InferRequest::InferRequest(const std::shared_ptr<const ov::ICompiledModel>& compiled_model,
+                                              std::shared_ptr<ov::ISyncInferRequest> inner_request)
+    : ov::ISyncInferRequest(compiled_model),
+      m_inner_sync(std::move(inner_request)) {
+    OPENVINO_ASSERT(m_inner_sync != nullptr, "Batched element requires a non-null inner request");
+    init_public_tensors();
+}
+
+void ov::npuw::batched::InferRequest::init_public_tensors() {
+    // Allocate a tensor for every public port so get_tensor() never returns an
+    // uninitialized handle (callers such as the Python infer(dict) dispatcher fetch
+    // the tensor before populating it). Dynamic dims are sized to 0 and resized later;
+    // the real [N, ...] tensors are bound by the caller (inputs) or by infer() (outputs).
+    const auto init_port = [this](const ov::Output<const ov::Node>& port) {
+        if (ov::ISyncInferRequest::get_tensor(port)) {
+            return;
+        }
+        const auto& pshape = port.get_partial_shape();
+        ov::Shape shape;
+        if (pshape.is_dynamic()) {
+            for (const auto& dim : pshape) {
+                shape.push_back(dim.is_static() ? dim.get_length() : 0);
+            }
+        } else {
+            shape = pshape.to_shape();
+        }
+        set_tensor(port, ov::get_tensor_impl(ov::Tensor(port.get_element_type(), shape)));
+    };
+    for (const auto& port : get_inputs()) {
+        init_port(port);
     }
+    for (const auto& port : get_outputs()) {
+        init_port(port);
+    }
+}
+
+const std::vector<ov::Output<const ov::Node>>& ov::npuw::batched::InferRequest::inner_inputs() const {
+    return m_inner_sync ? m_inner_sync->get_inputs() : m_inner_async->get_inputs();
+}
+
+const std::vector<ov::Output<const ov::Node>>& ov::npuw::batched::InferRequest::inner_outputs() const {
+    return m_inner_sync ? m_inner_sync->get_outputs() : m_inner_async->get_outputs();
+}
+
+void ov::npuw::batched::InferRequest::inner_set_tensor(const ov::Output<const ov::Node>& port,
+                                                       const ov::SoPtr<ov::ITensor>& tensor) {
+    if (m_inner_sync) {
+        m_inner_sync->set_tensor(port, tensor);
+    } else {
+        m_inner_async->set_tensor(port, tensor);
+    }
+}
+
+ov::SoPtr<ov::ITensor> ov::npuw::batched::InferRequest::inner_get_tensor(const ov::Output<const ov::Node>& port) const {
+    return m_inner_sync ? m_inner_sync->get_tensor(port) : m_inner_async->get_tensor(port);
+}
+
+void ov::npuw::batched::InferRequest::inner_infer() {
+    if (m_inner_sync) {
+        m_inner_sync->infer();
+    } else {
+        m_inner_async->infer();
+    }
+}
+
+std::vector<ov::SoPtr<ov::IVariableState>> ov::npuw::batched::InferRequest::inner_query_state() const {
+    return m_inner_sync ? m_inner_sync->query_state() : m_inner_async->query_state();
 }
 
 void ov::npuw::batched::InferRequest::infer() {
     std::lock_guard<std::mutex> lock(m_mutex);
-    ensure_inner_request_locked();
 
-    const auto& wrapper_inputs = m_compiled->inputs();
-    const auto& wrapper_outputs = m_compiled->outputs();
-    const auto& inner_inputs = m_compiled->m_inner->inputs();
-    const auto& inner_outputs = m_compiled->m_inner->outputs();
+    const auto& wrapper_inputs = get_inputs();
+    const auto& wrapper_outputs = get_outputs();
+    const auto& in_ports = inner_inputs();
+    const auto& out_ports = inner_outputs();
 
-    OPENVINO_ASSERT(wrapper_inputs.size() == inner_inputs.size() && wrapper_outputs.size() == inner_outputs.size(),
-                    "Batched element: inner model I/O does not match the wrapped model");
+    OPENVINO_ASSERT(wrapper_inputs.size() == in_ports.size() && wrapper_outputs.size() == out_ports.size(),
+                    "Batched element: inner request I/O does not match the wrapped model");
 
     // Batch size is taken from the first input that carries a batch dimension.
     std::size_t batch = 1;
@@ -117,7 +184,7 @@ void ov::npuw::batched::InferRequest::infer() {
     for (std::size_t row = 0; row < batch; ++row) {
         // Rows are independent prompts: clear the inner request's variable state
         // (KV-cache) so row i never sees row i-1.  Harmless for stateless inners.
-        for (auto& state : m_inner_request->query_state()) {
+        for (auto& state : inner_query_state()) {
             state->reset();
         }
 
@@ -126,14 +193,14 @@ void ov::npuw::batched::InferRequest::infer() {
         for (std::size_t i = 0; i < wrapper_inputs.size(); ++i) {
             const auto full = get_tensor(wrapper_inputs[i]);
             const bool sliceable = batch > 1 && has_batch_dim(full) && full->get_shape()[0] == batch;
-            m_inner_request->set_tensor(inner_inputs[i], sliceable ? row_slice(full, row) : full);
+            inner_set_tensor(in_ports[i], sliceable ? row_slice(full, row) : full);
         }
 
-        m_inner_request->infer();
+        inner_infer();
 
         // Stack each per-row output into row i of the aggregated [N, ...] tensor.
         for (std::size_t i = 0; i < wrapper_outputs.size(); ++i) {
-            const auto inner_out = m_inner_request->get_tensor(inner_outputs[i]);
+            const auto inner_out = inner_get_tensor(out_ports[i]);
             if (!aggregated_outputs[i]) {
                 ov::Shape out_shape = inner_out->get_shape();
                 if (!out_shape.empty()) {
@@ -165,7 +232,5 @@ std::vector<ov::SoPtr<ov::IVariableState>> ov::npuw::batched::InferRequest::quer
 }
 
 std::vector<ov::ProfilingInfo> ov::npuw::batched::InferRequest::get_profiling_info() const {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    ensure_inner_request_locked();
-    return m_inner_request->get_profiling_info();
+    return {};
 }

@@ -68,7 +68,8 @@ private:
     ov::SoPtr<ov::ICompiledModel> m_inner;
 };
 
-// Sync infer request produced by Batched::CompiledModel.
+// Sync infer request that unrolls a batched inference over a single-sequence
+// inner request.
 //
 // On each infer() call it determines the batch size N from the inputs, then for
 // each row 0..N-1: resets the inner request's variable state, binds the row's
@@ -76,9 +77,26 @@ private:
 // [1, ...] output into row i of the wrapper's [N, ...] output tensors.  The
 // public input/output tensors are held by the ISyncInferRequest base; only the
 // inner request sees [1, ...] shapes.
+//
+// It is constructed from the compiled model whose I/O it exposes plus the inner
+// request to drive.  This lets it be produced both by Batched::CompiledModel
+// (standalone, composable element) and reused directly by a pipeline that
+// already owns a single-sequence request (e.g. NPUW's LLMCompiledModel wrapping
+// its LLMInferRequest for scoring), without that pipeline having to wrap its
+// whole compiled model.
 class InferRequest final : public ov::ISyncInferRequest {
 public:
-    explicit InferRequest(std::shared_ptr<const CompiledModel> compiled_model);
+    // Drive an async inner request (used by the standalone Batched::CompiledModel decorator,
+    // where the inner is a separate compiled model with its own task executor).
+    InferRequest(const std::shared_ptr<const ov::ICompiledModel>& compiled_model,
+                 std::shared_ptr<ov::IAsyncInferRequest> inner_request);
+
+    // Drive a sync inner request directly, on the calling thread, without an executor. Used when a
+    // pipeline wraps its own single-sequence request (e.g. NPUW's LLMCompiledModel wrapping its
+    // LLMInferRequest): this avoids a nested-executor deadlock that would otherwise occur if the
+    // inner ran on the same task executor as the outer (async) request.
+    InferRequest(const std::shared_ptr<const ov::ICompiledModel>& compiled_model,
+                 std::shared_ptr<ov::ISyncInferRequest> inner_request);
 
     void infer() override;
     void check_tensors() const override;
@@ -87,11 +105,20 @@ public:
     std::vector<ov::ProfilingInfo> get_profiling_info() const override;
 
 private:
-    void ensure_inner_request_locked() const;
+    void init_public_tensors();
 
-    std::shared_ptr<const CompiledModel> m_compiled;
+    // The inner single-sequence request, driven row by row. Exactly one of the two handles is set;
+    // the small accessors below hide which interface (sync/async) is in use from infer().
+    const std::vector<ov::Output<const ov::Node>>& inner_inputs() const;
+    const std::vector<ov::Output<const ov::Node>>& inner_outputs() const;
+    void inner_set_tensor(const ov::Output<const ov::Node>& port, const ov::SoPtr<ov::ITensor>& tensor);
+    ov::SoPtr<ov::ITensor> inner_get_tensor(const ov::Output<const ov::Node>& port) const;
+    void inner_infer();
+    std::vector<ov::SoPtr<ov::IVariableState>> inner_query_state() const;
+
+    std::shared_ptr<ov::IAsyncInferRequest> m_inner_async;
+    std::shared_ptr<ov::ISyncInferRequest> m_inner_sync;
     mutable std::mutex m_mutex;
-    mutable std::shared_ptr<ov::IAsyncInferRequest> m_inner_request;
 };
 
 }  // namespace ov::npuw::batched
