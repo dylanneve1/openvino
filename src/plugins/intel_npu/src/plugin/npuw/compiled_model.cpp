@@ -337,6 +337,29 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
       m_loaded_from_cache(false) {
     init_profiling();
 
+    // Derive a per-model dump prefix from the model's on-disk location so dumped artifacts from
+    // different models don't collide on identical "Model0_..." names. The parent directory name
+    // uniquely identifies the model (e.g. "ov262rc1_DeepSeek-R1-Distill-Llama-8B_...group-1").
+    //
+    // Two sources, in priority order:
+    //  1. The model's "__weights_path" rt_info, stamped by read_model() and preserved across
+    //     clone() - this is what reaches us in the GenAI flow, which compiles an in-memory model
+    //     rather than from a path, so Core never stamps the WEIGHTS_PATH property.
+    //  2. The WEIGHTS_PATH property, which Core stamps when compiling directly from a file path.
+    // Empty in both cases (e.g. a model assembled in memory with no path) -> dumps keep the plain
+    // friendly name.
+    {
+        std::string weights_path;
+        if (model->has_rt_info("__weights_path")) {
+            weights_path = model->get_rt_info<std::string>("__weights_path");
+        } else if (const auto wp_it = properties.find(ov::weights_path.name()); wp_it != properties.end()) {
+            weights_path = wp_it->second.as<std::string>();
+        }
+        if (!weights_path.empty()) {
+            m_dump_prefix = ov::util::make_path(weights_path).parent_path().filename().string();
+        }
+    }
+
     // Note: we need to identify original bf16 constants for potential weightless deserialization later
     // And only then do bf16 to f16 transformation
     m_bf16_consts = ov::npuw::s11n::get_bf16_consts(model);
@@ -1924,8 +1947,12 @@ void ov::npuw::CompiledModel::dump_on_fail(std::size_t id, const std::string& de
     }
 }
 
+std::string ov::npuw::CompiledModel::dump_base_name() const {
+    return m_dump_prefix.empty() ? m_name : m_dump_prefix + "_" + m_name;
+}
+
 std::string ov::npuw::CompiledModel::format_subgraph_name(std::size_t id, const std::string& funcall) const {
-    std::string name = m_name + "_" + ov::npuw::util::fmt(id, m_compiled_submodels.size());
+    std::string name = dump_base_name() + "_" + ov::npuw::util::fmt(id, m_compiled_submodels.size());
     if (!funcall.empty()) {
         name += "_" + funcall;
     }
@@ -2036,7 +2063,7 @@ void ov::npuw::CompiledModel::dump_subgraph_composition(const std::vector<ov::np
     LOG_BLOCK();
 
     const std::string dump_dir = m_cfg.get<::intel_npu::NPUW_DUMP_SUBS_DIR>();
-    const std::string sg_file = "npuw_" + m_name + ".xml.sg";
+    const std::string sg_file = dump_base_name() + ".xml.sg";
     const std::string sg_path = ov::util::path_join({dump_dir, sg_file}).string();
 
     // Collect unique subgraphs via replaced_by()

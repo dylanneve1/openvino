@@ -149,6 +149,10 @@ private:
                                                    const std::string& device);
 
     void dump_on_fail(std::size_t id, const std::string& device_to_stry, const char* extra);
+    // Base name used for all dumped artifacts (subgraph XMLs/BINs, IO lists, .sg composition).
+    // Prepends the on-disk model directory name (when known) to the generic friendly name so
+    // dumps from different models don't collide on identical "Model0_..." names.
+    std::string dump_base_name() const;
     std::string format_subgraph_name(std::size_t id, const std::string& funcall) const;
     void dump_subgraph_model(std::size_t id, const std::string& funcall, const std::string& dump_sub_opt);
     void dump_subgraph_composition(const std::vector<ov::npuw::Subgraph>& orderedSubgraphs) const;
@@ -214,6 +218,10 @@ private:
     ov::AnyMap m_non_npuw_props;
 
     std::string m_name;
+    // On-disk model directory name (e.g. "ov262rc1_DeepSeek-R1-Distill-Llama-8B_..."), derived
+    // from the WEIGHTS_PATH property when compiling from a file. Empty when compiled from an
+    // in-memory model (MODEL_PTR), in which case dumps keep their plain friendly names.
+    std::string m_dump_prefix;
     const bool m_loaded_from_cache;
 
     using ToSubmodel = std::pair<size_t /* submodel_idx */

@@ -153,6 +153,12 @@ std::shared_ptr<ov::Model> cut_lm_head(const std::shared_ptr<ov::Model>& model) 
     rewr.run_on_model(model);
     if (lm_head_model) {
         lm_head_model->set_friendly_name(model->get_friendly_name() + "_lm_head");
+        // The lm_head model is built from scratch, so it doesn't inherit the source model's
+        // rt_info. Carry over the on-disk path so its dumped subgraphs get the same per-model
+        // name prefix as the prefill/generate subgraphs (see CompiledModel's m_dump_prefix).
+        if (model->has_rt_info("__weights_path")) {
+            lm_head_model->set_rt_info(model->get_rt_info<ov::Any>("__weights_path"), "__weights_path");
+        }
     }
     model->validate_nodes_and_infer_types();
 
