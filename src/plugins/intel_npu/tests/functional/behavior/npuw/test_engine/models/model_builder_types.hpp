@@ -14,6 +14,7 @@
 #include "openvino/core/node.hpp"
 #include "openvino/core/shape.hpp"
 #include "openvino/core/type/element_type.hpp"
+#include "openvino/op/sink.hpp"
 #include "openvino/op/util/variable.hpp"
 
 namespace ov {
@@ -23,7 +24,7 @@ namespace npuw {
 struct KVCacheResult {
     ov::Output<ov::Node> concatenated;
     ov::Output<ov::Node> beam_gather;
-    std::shared_ptr<ov::Node> assign;
+    std::shared_ptr<ov::op::Sink> assign;
 };
 
 struct KVCacheReadState {

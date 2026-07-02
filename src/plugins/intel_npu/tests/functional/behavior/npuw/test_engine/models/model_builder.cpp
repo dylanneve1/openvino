@@ -5,8 +5,8 @@
 #include "model_builder.hpp"
 
 #include <algorithm>
-#include <limits>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "model_builder_internal.hpp"
 #include "openvino/core/rt_info/weightless_caching_attributes.hpp"
@@ -59,7 +59,6 @@ ov::Output<ov::Node> make_linear(const ov::Output<ov::Node>& input,
     return matmul->output(0);
 }
 
-
 ov::Output<ov::Node> make_embedding(const ov::Output<ov::Node>& input_ids,
                                     size_t vocab_size,
                                     size_t hidden_size,
@@ -82,15 +81,6 @@ ov::Output<ov::Node> make_embedding(const ov::Output<ov::Node>& input_ids,
     gather->set_friendly_name(name);
 
     return gather->output(0);
-}
-
-ov::Output<ov::Node> make_lm_head(const ov::Output<ov::Node>& hidden_states,
-                                  size_t hidden_size,
-                                  size_t vocab_size,
-                                  const std::string& name,
-                                  ov::element::Type precision,
-                                  const WeightFn& weight_fn) {
-    return make_linear(hidden_states, hidden_size, vocab_size, name, precision, weight_fn);
 }
 
 ov::Output<ov::Node> make_conv1d(const ov::Output<ov::Node>& input,
@@ -127,7 +117,6 @@ ov::Output<ov::Node> make_conv1d(const ov::Output<ov::Node>& input,
     return add->output(0);
 }
 
-
 ov::Output<ov::Node> make_transformer_layers(const ov::Output<ov::Node>& initial,
                                              size_t num_layers,
                                              const std::string& prefix_base,
@@ -139,8 +128,6 @@ ov::Output<ov::Node> make_transformer_layers(const ov::Output<ov::Node>& initial
     }
     return current;
 }
-
-
 
 std::shared_ptr<ov::Model> ModelBuilder::get_model_with_one_op() {
     auto param = std::make_shared<ov::opset11::Parameter>(ov::element::i64, ov::PartialShape{1, 3, 2, 2});
@@ -158,13 +145,11 @@ std::shared_ptr<ov::Model> ModelBuilder::get_model_without_repeated_blocks() {
     clear();
     std::shared_ptr<ov::op::v0::Parameter> input =
         std::make_shared<ov::op::v0::Parameter>(ov::element::i32, ov::Shape{1, 1, 40});
-    m_nodes.push_back(input);
     set_name(input);
 
     std::shared_ptr<ov::Node> res = get_block(input);
 
     auto result = std::make_shared<ov::op::v0::Result>(res);
-    m_nodes.push_back(result);
     set_name(result);
 
     return std::make_shared<ov::Model>(ov::OutputVector{result->output(0)});
@@ -195,7 +180,6 @@ std::shared_ptr<ov::Model> ModelBuilder::get_model_with_repeated_blocks_and_resu
     // Generate head
     std::shared_ptr<ov::op::v0::Parameter> input =
         std::make_shared<ov::op::v0::Parameter>(ov::element::i32, ov::Shape{1, 1, 40});
-    m_nodes.push_back(input);
     set_name(input);
 
     std::vector<std::shared_ptr<ov::Node>> head(7, nullptr);
@@ -208,7 +192,6 @@ std::shared_ptr<ov::Model> ModelBuilder::get_model_with_repeated_blocks_and_resu
     head[6] = std::make_shared<ov::op::v1::Reshape>(head[5], head[4], false);
 
     for (const auto& h : head) {
-        m_nodes.push_back(h);
         set_name(h);
     }
 
@@ -234,7 +217,6 @@ std::shared_ptr<ov::Model> ModelBuilder::get_model_with_repeated_blocks_and_resu
     tail[5] = std::make_shared<ov::op::v1::Add>(tail[4], tail[4]);
 
     for (const auto& t : tail) {
-        m_nodes.push_back(t);
         set_name(t);
     }
 
@@ -245,7 +227,6 @@ std::shared_ptr<ov::Model> ModelBuilder::get_model_with_repeated_blocks_and_resu
     for (size_t idx : block_indices) {
         if (idx < block_outputs.size()) {
             auto result = std::make_shared<ov::op::v0::Result>(block_outputs[idx]);
-            m_nodes.push_back(result);
             set_name(result);
             outputs.push_back(result->output(0));
         }
@@ -253,7 +234,6 @@ std::shared_ptr<ov::Model> ModelBuilder::get_model_with_repeated_blocks_and_resu
 
     // Always add final tail Result
     auto final_result = std::make_shared<ov::op::v0::Result>(tail[5]);
-    m_nodes.push_back(final_result);
     set_name(final_result);
     outputs.push_back(final_result->output(0));
 
@@ -269,7 +249,6 @@ std::shared_ptr<ov::Model> ModelBuilder::get_model_with_repeated_blocks_and_para
     }
 
     auto input = std::make_shared<ov::opset11::Parameter>(ov::element::f32, ov::Shape{1, 1, 8});
-    m_nodes.push_back(input);
 
     std::vector<std::size_t> sorted_indices = block_indices;
     std::sort(sorted_indices.begin(), sorted_indices.end());
@@ -282,21 +261,15 @@ std::shared_ptr<ov::Model> ModelBuilder::get_model_with_repeated_blocks_and_para
         }
 
         auto param = std::make_shared<ov::opset11::Parameter>(ov::element::f32, ov::Shape{1, 1, 8});
-        m_nodes.push_back(param);
         block_params.emplace(idx, param);
     }
 
     auto scale_const = ov::opset11::Constant::create(ov::element::f32, ov::Shape{1}, {1.f});
     auto bias_const = ov::opset11::Constant::create(ov::element::f32, ov::Shape{1, 1, 8}, std::vector<float>(8, 0.5f));
     auto head_const = ov::opset11::Constant::create(ov::element::f32, ov::Shape{1, 1, 8}, std::vector<float>(8, 1.f));
-    m_nodes.push_back(scale_const);
-    m_nodes.push_back(bias_const);
-    m_nodes.push_back(head_const);
 
     auto head_add = std::make_shared<ov::opset11::Add>(input, head_const);
     auto head_relu = std::make_shared<ov::opset11::Relu>(head_add);
-    m_nodes.push_back(head_add);
-    m_nodes.push_back(head_relu);
 
     ov::Output<ov::Node> current = head_relu;
 
@@ -305,40 +278,21 @@ std::shared_ptr<ov::Model> ModelBuilder::get_model_with_repeated_blocks_and_para
         ov::Output<ov::Node> rhs = (it != block_params.end()) ? it->second : current;
 
         auto add = std::make_shared<ov::opset11::Add>(current, rhs);
-        m_nodes.push_back(add);
-
         auto mul = std::make_shared<ov::opset11::Multiply>(add, scale_const);
-        m_nodes.push_back(mul);
-
         auto relu = std::make_shared<ov::opset11::Relu>(mul);
-        m_nodes.push_back(relu);
-
         auto add_bias = std::make_shared<ov::opset11::Add>(relu, bias_const);
-        m_nodes.push_back(add_bias);
 
         current = add_bias;
     }
 
     auto tail_const = ov::opset11::Constant::create(ov::element::f32, ov::Shape{1, 1, 8}, std::vector<float>(8, 2.f));
-    m_nodes.push_back(tail_const);
-
     auto tail_mul = std::make_shared<ov::opset11::Multiply>(current, tail_const);
     auto tail_add = std::make_shared<ov::opset11::Add>(tail_mul, tail_const);
-    m_nodes.push_back(tail_mul);
-    m_nodes.push_back(tail_add);
 
     auto result = std::make_shared<ov::opset11::Result>(tail_add);
-    m_nodes.push_back(result);
-
     return std::make_shared<ov::Model>(ov::OutputVector{result->output(0)});
 }
 
-// Builds a model with N identical repeated blocks (using get_block(), same structure as
-// get_model_with_repeated_blocks_and_results) where "head" blocks additionally expose
-// their output via a MatMul to a separate Parameter-weighted projection group, mimicking
-// Gemma4's KV-sharing pattern:
-//   - Non-head blocks: block_output → next_block (only internal consumer)
-//   - Head blocks:     block_output → next_block  (internal)
 // Builds a model with N identical repeated blocks where "head" blocks additionally
 // expose their interior Relu via a cross-group MatMul, reproducing the Gemma4
 // KV-sharing asymmetry pattern.
@@ -366,8 +320,6 @@ std::shared_ptr<ov::Model> ModelBuilder::get_model_with_kv_sharing_repeated_bloc
 
     auto input = std::make_shared<ov::opset11::Parameter>(ov::element::f32, ov::Shape{1, 1, 8});
     auto kv_weight = std::make_shared<ov::opset11::Parameter>(ov::element::f32, ov::Shape{8, 4});
-    m_nodes.push_back(input);
-    m_nodes.push_back(kv_weight);
     set_name(input);
     set_name(kv_weight);
 
@@ -375,8 +327,6 @@ std::shared_ptr<ov::Model> ModelBuilder::get_model_with_kv_sharing_repeated_bloc
     // ensuring identical metadescs for the Add and Multiply ops in every block.
     auto bias_const = ov::opset11::Constant::create(ov::element::f32, ov::Shape{1, 1, 8}, std::vector<float>(8, 0.1f));
     auto scale_const = ov::opset11::Constant::create(ov::element::f32, ov::Shape{1}, std::vector<float>{0.5f});
-    m_nodes.push_back(bias_const);
-    m_nodes.push_back(scale_const);
     set_name(bias_const);
     set_name(scale_const);
 
@@ -384,9 +334,6 @@ std::shared_ptr<ov::Model> ModelBuilder::get_model_with_kv_sharing_repeated_bloc
     auto head_const = ov::opset11::Constant::create(ov::element::f32, ov::Shape{1, 1, 8}, std::vector<float>(8, 1.f));
     auto head_add = std::make_shared<ov::opset11::Add>(input, head_const);
     auto head_relu = std::make_shared<ov::opset11::Relu>(head_add);
-    m_nodes.push_back(head_const);
-    m_nodes.push_back(head_add);
-    m_nodes.push_back(head_relu);
     set_name(head_const);
     set_name(head_add);
     set_name(head_relu);
@@ -399,10 +346,6 @@ std::shared_ptr<ov::Model> ModelBuilder::get_model_with_kv_sharing_repeated_bloc
         auto relu_interior_i = std::make_shared<ov::opset11::Relu>(add_i);  // TAP POINT
         auto mul_i = std::make_shared<ov::opset11::Multiply>(relu_interior_i, scale_const);
         auto relu_boundary_i = std::make_shared<ov::opset11::Relu>(mul_i);  // boundary output
-        m_nodes.push_back(add_i);
-        m_nodes.push_back(relu_interior_i);
-        m_nodes.push_back(mul_i);
-        m_nodes.push_back(relu_boundary_i);
         set_name(add_i);
         set_name(relu_interior_i);
         set_name(mul_i);
@@ -414,7 +357,6 @@ std::shared_ptr<ov::Model> ModelBuilder::get_model_with_kv_sharing_repeated_bloc
             // relu_boundary_i share the same metadesc, adding relu_interior_i
             // as a second output_layer leaves output_ometa = {"Relu…"} unchanged.
             auto kv_mm_i = std::make_shared<ov::opset11::MatMul>(relu_interior_i, kv_weight, false, false);
-            m_nodes.push_back(kv_mm_i);
             set_name(kv_mm_i);
             kv_outputs.push_back(kv_mm_i->output(0));
         }
@@ -426,15 +368,11 @@ std::shared_ptr<ov::Model> ModelBuilder::get_model_with_kv_sharing_repeated_bloc
     auto tail_const = ov::opset11::Constant::create(ov::element::f32, ov::Shape{1, 1, 8}, std::vector<float>(8, 2.f));
     auto tail_mul = std::make_shared<ov::opset11::Multiply>(current, tail_const);
     auto tail_add = std::make_shared<ov::opset11::Add>(tail_mul, tail_const);
-    m_nodes.push_back(tail_const);
-    m_nodes.push_back(tail_mul);
-    m_nodes.push_back(tail_add);
     set_name(tail_const);
     set_name(tail_mul);
     set_name(tail_add);
 
     auto main_result = std::make_shared<ov::opset11::Result>(tail_add);
-    m_nodes.push_back(main_result);
     set_name(main_result);
     ov::OutputVector outputs{main_result->output(0)};
 
@@ -445,7 +383,6 @@ std::shared_ptr<ov::Model> ModelBuilder::get_model_with_kv_sharing_repeated_bloc
     // isRegularResultCase to fail.
     for (auto&& kv_out : kv_outputs) {
         auto kv_result = std::make_shared<ov::opset11::Result>(kv_out);
-        m_nodes.push_back(kv_result);
         set_name(kv_result);
         outputs.push_back(kv_result->output(0));
     }
@@ -462,7 +399,6 @@ std::shared_ptr<ov::Model> ModelBuilder::get_model_with_multi_output_repeating_b
     }
 
     auto input = std::make_shared<ov::opset11::Parameter>(ov::element::f32, ov::Shape{1, 1, 8});
-    m_nodes.push_back(input);
     set_name(input);
 
     auto add_const = ov::opset11::Constant::create(ov::element::f32, ov::Shape{1}, {1.f});
@@ -472,7 +408,6 @@ std::shared_ptr<ov::Model> ModelBuilder::get_model_with_multi_output_repeating_b
     auto tail_bias = ov::opset11::Constant::create(ov::element::f32, ov::Shape{1}, {2.f});
 
     for (const auto& c : {add_const, k_const, seed_indices, tail_scale, tail_bias}) {
-        m_nodes.push_back(c);
         set_name(c);
     }
 
@@ -481,15 +416,12 @@ std::shared_ptr<ov::Model> ModelBuilder::get_model_with_multi_output_repeating_b
 
     for (std::size_t i = 0; i < repetitions; ++i) {
         auto indices_as_float = std::make_shared<ov::opset11::Convert>(current_indices, ov::element::f32);
-        m_nodes.push_back(indices_as_float);
         set_name(indices_as_float);
 
         auto mixed = std::make_shared<ov::opset11::Add>(current_values, indices_as_float);
-        m_nodes.push_back(mixed);
         set_name(mixed);
 
         auto shifted = std::make_shared<ov::opset11::Add>(mixed, add_const);
-        m_nodes.push_back(shifted);
         set_name(shifted);
 
         auto topk = std::make_shared<ov::opset11::TopK>(shifted,
@@ -498,7 +430,6 @@ std::shared_ptr<ov::Model> ModelBuilder::get_model_with_multi_output_repeating_b
                                                         ov::op::TopKMode::MAX,
                                                         ov::op::TopKSortType::SORT_VALUES,
                                                         ov::element::i32);
-        m_nodes.push_back(topk);
         set_name(topk);
 
         current_values = topk->output(0);
@@ -506,30 +437,24 @@ std::shared_ptr<ov::Model> ModelBuilder::get_model_with_multi_output_repeating_b
     }
 
     auto tail_indices_as_float = std::make_shared<ov::opset11::Convert>(current_indices, ov::element::f32);
-    m_nodes.push_back(tail_indices_as_float);
     set_name(tail_indices_as_float);
 
     auto tail_mixed = std::make_shared<ov::opset11::Add>(current_values, tail_indices_as_float);
-    m_nodes.push_back(tail_mixed);
     set_name(tail_mixed);
 
     auto tail_mul = std::make_shared<ov::opset11::Multiply>(tail_mixed, tail_scale);
-    m_nodes.push_back(tail_mul);
     set_name(tail_mul);
 
     auto tail_add = std::make_shared<ov::opset11::Add>(tail_mul, tail_bias);
-    m_nodes.push_back(tail_add);
     set_name(tail_add);
 
     ov::OutputVector outputs;
     auto tail_result = std::make_shared<ov::opset11::Result>(tail_add);
-    m_nodes.push_back(tail_result);
     set_name(tail_result);
     outputs.push_back(tail_result->output(0));
 
     if (last_block_has_direct_result) {
         auto direct_result = std::make_shared<ov::opset11::Result>(current_values);
-        m_nodes.push_back(direct_result);
         set_name(direct_result);
         outputs.push_back(direct_result->output(0));
     }
@@ -559,7 +484,6 @@ std::shared_ptr<ov::Node> ModelBuilder::get_block(const std::shared_ptr<ov::Node
     model_c[17] = std::make_shared<ov::op::v0::Constant>(ov::element::i32, ov::Shape{3}, std::vector<int>{1, 1, 40});
 
     for (const auto& c : model_c) {
-        m_nodes.push_back(c);
         set_name(c);
     }
 
@@ -569,7 +493,6 @@ std::shared_ptr<ov::Node> ModelBuilder::get_block(const std::shared_ptr<ov::Node
     convert[2] = std::make_shared<ov::op::v0::Convert>(model_c[12], ov::element::i32);
 
     for (const auto& c : convert) {
-        m_nodes.push_back(c);
         set_name(c);
     }
 
@@ -602,7 +525,6 @@ std::shared_ptr<ov::Node> ModelBuilder::get_block(const std::shared_ptr<ov::Node
     op[15] = std::make_shared<ov::op::v1::Reshape>(op[14], model_c[17], false);
 
     for (const auto& o : op) {
-        m_nodes.push_back(o);
         set_name(o);
     }
 
@@ -623,12 +545,11 @@ std::shared_ptr<ov::op::v0::Parameter> ModelBuilder::parameter(ov::element::Type
 }
 
 void ModelBuilder::clear() {
-    m_nodes.clear();
     m_sinks.clear();
     m_name_idx = 0;
 }
 
-ov::Output<ov::Node> ModelBuilder::setup_position_ids(LLMConfig& config, const ov::Output<ov::Node>& seq_source) {
+void ModelBuilder::setup_position_ids(LLMConfig& config, const ov::Output<ov::Node>& seq_source) {
     OPENVINO_ASSERT(!(config.internal_position_ids && config.position_ids.get_node()),
                     "internal_position_ids and position_ids are mutually exclusive");
     ov::Output<ov::Node> position_ids_output;
@@ -656,8 +577,6 @@ ov::Output<ov::Node> ModelBuilder::setup_position_ids(LLMConfig& config, const o
     if (position_ids_output.get_node() && !config.rope) {
         config.rope = HalfRotationRoPE(config.head_dim, config.precision, position_ids_output);
     }
-
-    return position_ids_output;
 }
 
 std::shared_ptr<ov::Model> ModelBuilder::make_model(const ov::Output<ov::Node>& output,
@@ -766,8 +685,8 @@ std::shared_ptr<ov::Model> ModelBuilder::build_llm(const LLMConfig& config_in) {
                                                 config.head_dim,
                                                 make_kv_var_id(layer_str, ".", "value"),
                                                 prec);
-            m_sinks.push_back(std::dynamic_pointer_cast<ov::op::Sink>(k_cache.assign));
-            m_sinks.push_back(std::dynamic_pointer_cast<ov::op::Sink>(v_cache.assign));
+            m_sinks.push_back(k_cache.assign);
+            m_sinks.push_back(v_cache.assign);
             return {k_cache.concatenated, v_cache.concatenated};
         };
     }
@@ -804,7 +723,7 @@ std::shared_ptr<ov::Model> ModelBuilder::build_llm(const LLMConfig& config_in) {
 
     if (config.lm_head_weight) {
         auto logits =
-            make_lm_head(final_norm, config.hidden_size, config.vocab_size, "lm_head", prec, config.lm_head_weight);
+            make_linear(final_norm, config.hidden_size, config.vocab_size, "lm_head", prec, config.lm_head_weight);
         return make_model(logits, "logits", model_name);
     }
     return make_model(final_norm, "last_hidden_state", model_name);
@@ -892,7 +811,6 @@ std::shared_ptr<ov::Model> ModelBuilder::build_whisper_encoder(const WhisperConf
     return make_model(encoder_output, "last_hidden_state", "synthetic_whisper_encoder");
 }
 
-
 std::shared_ptr<ov::Model> ModelBuilder::build_whisper_decoder(const WhisperConfig& config_in) {
     clear();
     WhisperConfig config = config_in;
@@ -978,8 +896,8 @@ std::shared_ptr<ov::Model> ModelBuilder::build_whisper_decoder(const WhisperConf
                                             hd,
                                             make_kv_var_id(layer_str, ".decoder.", "value"),
                                             prec);
-        m_sinks.push_back(std::dynamic_pointer_cast<ov::op::Sink>(k_cache.assign));
-        m_sinks.push_back(std::dynamic_pointer_cast<ov::op::Sink>(v_cache.assign));
+        m_sinks.push_back(k_cache.assign);
+        m_sinks.push_back(v_cache.assign);
         return {k_cache.concatenated, v_cache.concatenated};
     };
 
@@ -1001,8 +919,8 @@ std::shared_ptr<ov::Model> ModelBuilder::build_whisper_decoder(const WhisperConf
         auto layer_str = std::to_string(layer);
         auto k_cache = make_encoder_kv_cache(k, heads, hd, make_kv_var_id(layer_str, ".encoder.", "key"), prec);
         auto v_cache = make_encoder_kv_cache(v, heads, hd, make_kv_var_id(layer_str, ".encoder.", "value"), prec);
-        m_sinks.push_back(std::dynamic_pointer_cast<ov::op::Sink>(k_cache.assign));
-        m_sinks.push_back(std::dynamic_pointer_cast<ov::op::Sink>(v_cache.assign));
+        m_sinks.push_back(k_cache.assign);
+        m_sinks.push_back(v_cache.assign);
         return {k_cache.concatenated, v_cache.concatenated};
     };
 
@@ -1022,7 +940,7 @@ std::shared_ptr<ov::Model> ModelBuilder::build_whisper_decoder(const WhisperConf
         });
 
     auto final_norm = config.norm(current, "model.decoder.layer_norm");
-    auto logits = make_lm_head(final_norm, d, config.vocab_size, "proj_out", prec, config.weight);
+    auto logits = make_linear(final_norm, d, config.vocab_size, "proj_out", prec, config.weight);
 
     // Always f32 output — WhisperPipeline reads logits as f32
     ov::Output<ov::Node> logits_out = logits;

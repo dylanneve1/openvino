@@ -47,18 +47,17 @@ ov::Output<ov::Node> make_repeat_kv(const ov::Output<ov::Node>& kv,
                                     const std::string& name,
                                     const ov::Output<ov::Node>& shared_broadcast_shape) {
     const size_t actual_kv_heads = (num_kv_heads == 0) ? num_heads : num_kv_heads;
-    const size_t n_rep = num_heads / actual_kv_heads;
-
-    if (!shared_broadcast_shape.get_node() && n_rep == 1) {
-        return kv;
-    }
-
     OPENVINO_ASSERT(num_heads % actual_kv_heads == 0,
                     "num_heads (",
                     num_heads,
                     ") must be divisible by num_kv_heads (",
                     actual_kv_heads,
                     ")");
+    const size_t n_rep = num_heads / actual_kv_heads;
+
+    if (!shared_broadcast_shape.get_node() && n_rep == 1) {
+        return kv;
+    }
 
     ov::Output<ov::Node> broadcast_shape_output;
     if (shared_broadcast_shape.get_node()) {

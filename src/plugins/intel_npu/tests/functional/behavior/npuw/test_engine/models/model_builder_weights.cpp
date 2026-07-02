@@ -128,72 +128,55 @@ ov::Output<ov::Node> CompressedWeight::operator()(const std::string& name,
     auto weight = ov::opset11::Constant::create(storage_type, weight_shape, w_data);
     weight->set_friendly_name(name);
 
-    ov::Output<ov::Node> decomp_input = weight->output(0);
-
     // --- Convert weight to decomp element type (skip if already matching) ---
     ov::Output<ov::Node> multiply_input;
     if (storage_type != decomp_et) {
-        auto convert = std::make_shared<ov::opset11::Convert>(decomp_input, decomp_et);
+        auto convert = std::make_shared<ov::opset11::Convert>(weight, decomp_et);
         convert->set_friendly_name(name + "_convert");
         multiply_input = convert->output(0);
     } else {
-        multiply_input = decomp_input;
+        multiply_input = weight->output(0);
     }
 
     // --- Zero-point subtraction (SYMM_ZP, GPTQ, ASYMM_ZP) ---
     if (has_zp) {
-        // ZP shape: always 2D (same reasoning as scale — MoE executor doesn't slice ZP)
-        ov::Shape zp_shape;
-        zp_shape = has_groups ? ov::Shape{rows, num_groups, 1} : ov::Shape{rows, 1};
+        // ZP never gets a batch dim (unlike scale) — the MoE executor doesn't slice ZP.
+        const ov::Shape zp_shape = has_groups ? ov::Shape{rows, num_groups, 1} : ov::Shape{rows, 1};
         const size_t zp_count = has_groups ? rows * num_groups : rows;
         const int mid = (static_cast<int>(lo) + static_cast<int>(hi)) / 2;
 
+        ov::Output<ov::Node> zp_output;
         if (pattern == DCOffPattern::GPTQ) {
             // GPTQ: ZP is f32 Constant fed directly to Subtract (no Convert).
             // Uniform value so it stays Constant after partitioning.
             std::vector<float> zp_f32(zp_count, static_cast<float>(mid));
             auto zp_const = ov::opset11::Constant::create(ov::element::f32, zp_shape, zp_f32);
             zp_const->set_friendly_name(name + "_zp");
-
-            auto subtract = std::make_shared<ov::opset11::Subtract>(multiply_input, zp_const);
-            subtract->set_friendly_name(name + "_subtract");
-            multiply_input = subtract->output(0);
-
-        } else if (pattern == DCOffPattern::SYMM_ZP) {
-            // SymmZP: u4 ZP Constant → Convert(f16) → Subtract.
-            // Uniform value across all layers so it stays Constant after partitioning.
-            std::vector<int8_t> zp_data(zp_count, static_cast<int8_t>(mid));
-            auto zp_const = ov::opset11::Constant::create(storage_type, zp_shape, zp_data);
-            zp_const->set_friendly_name(name + "_zp");
-
-            auto zp_convert = std::make_shared<ov::opset11::Convert>(zp_const, ov::element::f16);
-            zp_convert->set_friendly_name(name + "_zp_convert");
-
-            auto subtract = std::make_shared<ov::opset11::Subtract>(multiply_input, zp_convert);
-            subtract->set_friendly_name(name + "_subtract");
-            multiply_input = subtract->output(0);
-
+            zp_output = zp_const->output(0);
         } else {
-            // AsymmZP: u4 ZP Constant → Convert(f16) → Subtract.
-            // Per-layer varying values (seeded from name) so NPUW promotes
-            // it to a Parameter after partitioning.
-            uint32_t zp_state = seed_from_name(name + "_zp");
-            std::vector<int8_t> zp_data(zp_count);
-            for (size_t i = 0; i < zp_data.size(); ++i) {
-                uint32_t r = xorshift32(zp_state);
-                int zp_val = mid + static_cast<int>(r % 3u) - 1;
-                zp_data[i] = static_cast<int8_t>(zp_val);
+            // SymmZP/AsymmZP: u4 ZP Constant → Convert(f16) → Subtract.
+            // SYMM_ZP uses a uniform value across all layers so it stays Constant
+            // after partitioning; ASYMM_ZP varies per layer (seeded from name) so
+            // NPUW promotes it to a Parameter.
+            std::vector<int8_t> zp_data(zp_count, static_cast<int8_t>(mid));
+            if (pattern == DCOffPattern::ASYMM_ZP) {
+                uint32_t zp_state = seed_from_name(name + "_zp");
+                for (auto& zp_val : zp_data) {
+                    uint32_t r = xorshift32(zp_state);
+                    zp_val = static_cast<int8_t>(mid + static_cast<int>(r % 3u) - 1);
+                }
             }
             auto zp_const = ov::opset11::Constant::create(storage_type, zp_shape, zp_data);
             zp_const->set_friendly_name(name + "_zp");
 
             auto zp_convert = std::make_shared<ov::opset11::Convert>(zp_const, ov::element::f16);
             zp_convert->set_friendly_name(name + "_zp_convert");
-
-            auto subtract = std::make_shared<ov::opset11::Subtract>(multiply_input, zp_convert);
-            subtract->set_friendly_name(name + "_subtract");
-            multiply_input = subtract->output(0);
+            zp_output = zp_convert->output(0);
         }
+
+        auto subtract = std::make_shared<ov::opset11::Subtract>(multiply_input, zp_output);
+        subtract->set_friendly_name(name + "_subtract");
+        multiply_input = subtract->output(0);
     }
 
     // --- Scale: per-group or per-channel, with optional batch dim ---

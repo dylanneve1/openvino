@@ -37,13 +37,6 @@ ov::Output<ov::Node> make_embedding(const ov::Output<ov::Node>& input_ids,
                                     const std::string& name,
                                     ov::element::Type precision = ov::element::f32);
 
-ov::Output<ov::Node> make_lm_head(const ov::Output<ov::Node>& hidden_states,
-                                  size_t hidden_size,
-                                  size_t vocab_size,
-                                  const std::string& name,
-                                  ov::element::Type precision = ov::element::f32,
-                                  const WeightFn& weight_fn = FP32Weight{});
-
 ov::Output<ov::Node> make_conv1d(const ov::Output<ov::Node>& input,
                                  size_t in_channels,
                                  size_t out_channels,
@@ -233,7 +226,7 @@ public:
 
 private:
     /// May auto-create HalfRotationRoPE on config.rope (hence non-const ref).
-    ov::Output<ov::Node> setup_position_ids(LLMConfig& config, const ov::Output<ov::Node>& seq_source);
+    void setup_position_ids(LLMConfig& config, const ov::Output<ov::Node>& seq_source);
 
     std::shared_ptr<ov::Model> make_model(const ov::Output<ov::Node>& output,
                                           const std::string& result_name,
@@ -242,7 +235,6 @@ private:
     std::shared_ptr<ov::Node> get_block(const std::shared_ptr<ov::Node>& input);
     void set_name(const std::shared_ptr<ov::Node>& node);
 
-    std::vector<std::shared_ptr<ov::Node>> m_nodes;
     ov::SinkVector m_sinks;
     size_t m_name_idx = 0;
 };
