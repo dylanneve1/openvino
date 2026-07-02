@@ -18,19 +18,7 @@ namespace npuw {
 ov::Output<ov::Node> FloatWeight::operator()(const std::string& name,
                                              const ov::Shape& shape,
                                              ov::element::Type compute_precision) const {
-    // Deterministic pseudo-random fill: each element gets a unique value derived
-    // from the tensor name via xorshift32.  Same name always produces the same
-    // weights, but values look random and span a wide enough range ([-0.5, 0.5))
-    // to survive FP16 quantisation through NPUW.  This prevents CSE from merging
-    // same-shape projections and produces diverse logits in the LM head.
-    uint32_t state = seed_from_name(name);
-    size_t total = ov::shape_size(shape);
-    std::vector<float> data(total);
-    for (size_t i = 0; i < total; ++i) {
-        uint32_t r = xorshift32(state);
-        data[i] = static_cast<float>(r % 10000u) / 10000.0f - 0.5f;  // [-0.5, 0.5)
-    }
-    auto weight = ov::opset11::Constant::create(storage_type, shape, data);
+    auto weight = ov::opset11::Constant::create(storage_type, shape, pseudo_random_data(name, ov::shape_size(shape)));
     weight->set_friendly_name(name);
 
     if (storage_type == compute_precision) {

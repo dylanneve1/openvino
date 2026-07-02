@@ -140,8 +140,6 @@ struct BaseModelConfig {
 
     BaseModelConfig() : lm_head_weight(weight) {}
 
-    virtual ~BaseModelConfig() = default;
-
     size_t get_kv_heads() const {
         return num_kv_heads == 0 ? num_heads : num_kv_heads;
     }

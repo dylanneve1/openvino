@@ -35,6 +35,40 @@ void annotate_constants_with_weightless_cache(const std::shared_ptr<ov::Model>& 
         offset += c->get_byte_size();
     }
 }
+
+/// Fill empty norm/ffn functors with the standard defaults.
+void apply_config_defaults(BaseModelConfig& config) {
+    if (!config.norm) {
+        config.norm = LayerNorm(config.hidden_size, config.precision);
+    }
+    if (!config.ffn) {
+        config.ffn = SwiGLU(config.hidden_size, config.intermediate_size, config.precision, config.weight);
+    }
+}
+
+/// Attention pre-filled with the config's common fields; builders set the rest
+/// (masks, RoPE, KV cache, projection names) themselves.
+Attention make_attention(const BaseModelConfig& config) {
+    Attention attn{};
+    attn.hidden_size = config.hidden_size;
+    attn.num_heads = config.num_heads;
+    attn.num_kv_heads = config.get_kv_heads();
+    attn.head_dim = config.head_dim;
+    attn.precision = config.precision;
+    attn.weight_fn = config.weight;
+    attn.bias_fn = config.attn_bias;
+    return attn;
+}
+
+/// Insert a Convert to `type` unless the output already has that element type.
+ov::Output<ov::Node> convert_to(const ov::Output<ov::Node>& output, ov::element::Type type, const std::string& name) {
+    if (output.get_element_type() == type) {
+        return output;
+    }
+    auto cvt = std::make_shared<ov::op::v0::Convert>(output, type);
+    cvt->set_friendly_name(name);
+    return cvt->output(0);
+}
 }  // namespace
 
 ov::Output<ov::Node> make_linear(const ov::Output<ov::Node>& input,
@@ -65,14 +99,9 @@ ov::Output<ov::Node> make_embedding(const ov::Output<ov::Node>& input_ids,
                                     const std::string& name,
                                     ov::element::Type precision) {
     // Per-element PRNG so each token gets a distinct embedding vector.
-    uint32_t state = seed_from_name(name);
-    size_t total = vocab_size * hidden_size;
-    std::vector<float> data(total);
-    for (size_t i = 0; i < total; ++i) {
-        uint32_t r = xorshift32(state);
-        data[i] = static_cast<float>(r % 10000u) / 10000.0f - 0.5f;
-    }
-    auto weight = ov::opset11::Constant::create(precision, ov::Shape{vocab_size, hidden_size}, data);
+    auto weight = ov::opset11::Constant::create(precision,
+                                                ov::Shape{vocab_size, hidden_size},
+                                                pseudo_random_data(name, vocab_size * hidden_size));
     weight->set_friendly_name(name + ".weight");
 
     auto axis = ov::opset11::Constant::create(ov::element::i64, ov::Shape{}, {0});
@@ -593,25 +622,19 @@ std::shared_ptr<ov::Model> ModelBuilder::build_llm(const LLMConfig& config_in) {
     clear();
 
     LLMConfig config = config_in;
-    if (!config.norm)
-        config.norm = LayerNorm(config.hidden_size, config.precision);
-    if (!config.ffn) {
-        if (config.num_experts > 0) {
-            size_t moe_inter = config.moe_intermediate_size > 0
-                                   ? config.moe_intermediate_size
-                                   : config.intermediate_size;
-            size_t moe_k = config.num_experts_per_tok > 0
-                               ? config.num_experts_per_tok
-                               : std::min<size_t>(2, config.num_experts);
-            OPENVINO_ASSERT(moe_k >= 1 && moe_k <= config.num_experts,
-                            "Invalid MoE config: num_experts_per_tok (",
-                            moe_k, ") must be in [1, num_experts (", config.num_experts, ")]");
-            config.ffn = MoEFFN(config.hidden_size, moe_inter, config.num_experts,
-                                moe_k, config.precision);
-        } else {
-            config.ffn = SwiGLU(config.hidden_size, config.intermediate_size, config.precision, config.weight);
-        }
+    if (!config.ffn && config.num_experts > 0) {
+        size_t moe_inter = config.moe_intermediate_size > 0 ? config.moe_intermediate_size : config.intermediate_size;
+        size_t moe_k =
+            config.num_experts_per_tok > 0 ? config.num_experts_per_tok : std::min<size_t>(2, config.num_experts);
+        OPENVINO_ASSERT(moe_k >= 1 && moe_k <= config.num_experts,
+                        "Invalid MoE config: num_experts_per_tok (",
+                        moe_k,
+                        ") must be in [1, num_experts (",
+                        config.num_experts,
+                        ")]");
+        config.ffn = MoEFFN(config.hidden_size, moe_inter, config.num_experts, moe_k, config.precision);
     }
+    apply_config_defaults(config);
     const auto prec = config.precision;
 
     auto attention_mask = parameter(ov::element::i64, ov::PartialShape{-1, -1}, "attention_mask");
@@ -650,17 +673,9 @@ std::shared_ptr<ov::Model> ModelBuilder::build_llm(const LLMConfig& config_in) {
                                                      config.head_dim);
     }
 
-    const auto hs = config.hidden_size;
     const auto kv_heads = config.get_kv_heads();
 
-    Attention attn{};
-    attn.hidden_size = hs;
-    attn.num_heads = config.num_heads;
-    attn.num_kv_heads = kv_heads;
-    attn.head_dim = config.head_dim;
-    attn.precision = prec;
-    attn.weight_fn = config.weight;
-    attn.bias_fn = config.attn_bias;
+    Attention attn = make_attention(config);
     attn.qk_norm = config.qk_norm;
     attn.rope_fn = config.rope;
     attn.sdpa_mask = sdpa_mask;
@@ -732,10 +747,7 @@ std::shared_ptr<ov::Model> ModelBuilder::build_llm(const LLMConfig& config_in) {
 std::shared_ptr<ov::Model> ModelBuilder::build_whisper_encoder(const WhisperConfig& config_in) {
     clear();
     WhisperConfig config = config_in;
-    if (!config.norm)
-        config.norm = LayerNorm(config.hidden_size, config.precision);
-    if (!config.ffn)
-        config.ffn = SwiGLU(config.hidden_size, config.intermediate_size, config.precision, config.weight);
+    apply_config_defaults(config);
     const auto prec = config.precision;
     const auto d = config.hidden_size;
 
@@ -745,12 +757,7 @@ std::shared_ptr<ov::Model> ModelBuilder::build_whisper_encoder(const WhisperConf
                                                      static_cast<int64_t>(2 * config.max_source_positions)},
                                     "input_features");
 
-    ov::Output<ov::Node> encoder_input = input_features->output(0);
-    if (prec != ov::element::f32) {
-        auto cvt = std::make_shared<ov::op::v0::Convert>(encoder_input, prec);
-        cvt->set_friendly_name("model.encoder.input_convert");
-        encoder_input = cvt->output(0);
-    }
+    auto encoder_input = convert_to(input_features->output(0), prec, "model.encoder.input_convert");
 
     auto conv1 = make_conv1d(encoder_input, config.num_mel_bins, d, 3, 1, 1, "model.encoder.conv1", prec);
     auto gelu1 = std::make_shared<ov::opset11::Gelu>(conv1);
@@ -773,14 +780,7 @@ std::shared_ptr<ov::Model> ModelBuilder::build_whisper_encoder(const WhisperConf
     auto embedded = std::make_shared<ov::opset11::Add>(transposed, pos_embed);
     embedded->set_friendly_name("model.encoder.pos_embed_add");
 
-    Attention enc_attn{};
-    enc_attn.hidden_size = d;
-    enc_attn.num_heads = config.num_heads;
-    enc_attn.num_kv_heads = config.num_heads;
-    enc_attn.head_dim = config.head_dim;
-    enc_attn.precision = prec;
-    enc_attn.weight_fn = config.weight;
-    enc_attn.bias_fn = config.attn_bias;
+    Attention enc_attn = make_attention(config);
     enc_attn.o_proj_name = "self_attn.out_proj";
 
     auto current =
@@ -801,12 +801,7 @@ std::shared_ptr<ov::Model> ModelBuilder::build_whisper_encoder(const WhisperConf
     auto final_norm = config.norm(current, "model.encoder.layer_norm");
 
     // Always f32 output — WhisperPipeline reads encoder output as f32
-    ov::Output<ov::Node> encoder_output = final_norm;
-    if (prec != ov::element::f32) {
-        auto cvt = std::make_shared<ov::op::v0::Convert>(final_norm, ov::element::f32);
-        cvt->set_friendly_name("model.encoder.output_convert");
-        encoder_output = cvt->output(0);
-    }
+    auto encoder_output = convert_to(final_norm, ov::element::f32, "model.encoder.output_convert");
 
     return make_model(encoder_output, "last_hidden_state", "synthetic_whisper_encoder");
 }
@@ -814,10 +809,7 @@ std::shared_ptr<ov::Model> ModelBuilder::build_whisper_encoder(const WhisperConf
 std::shared_ptr<ov::Model> ModelBuilder::build_whisper_decoder(const WhisperConfig& config_in) {
     clear();
     WhisperConfig config = config_in;
-    if (!config.norm)
-        config.norm = LayerNorm(config.hidden_size, config.precision);
-    if (!config.ffn)
-        config.ffn = SwiGLU(config.hidden_size, config.intermediate_size, config.precision, config.weight);
+    apply_config_defaults(config);
     const auto prec = config.precision;
     const auto d = config.hidden_size;
     const auto heads = config.num_heads;
@@ -830,12 +822,7 @@ std::shared_ptr<ov::Model> ModelBuilder::build_whisper_decoder(const WhisperConf
                   "encoder_hidden_states");
     auto beam_idx = parameter(ov::element::i32, ov::PartialShape{-1}, "beam_idx");
 
-    ov::Output<ov::Node> enc_hs = encoder_hidden_states->output(0);
-    if (prec != ov::element::f32) {
-        auto cvt = std::make_shared<ov::op::v0::Convert>(enc_hs, prec);
-        cvt->set_friendly_name("model.decoder.enc_hs_convert");
-        enc_hs = cvt->output(0);
-    }
+    auto enc_hs = convert_to(encoder_hidden_states->output(0), prec, "model.decoder.enc_hs_convert");
 
     auto token_embed = make_embedding(input_ids->output(0), config.vocab_size, d, "model.decoder.embed_tokens", prec);
 
@@ -857,14 +844,7 @@ std::shared_ptr<ov::Model> ModelBuilder::build_whisper_decoder(const WhisperConf
     auto shared_mask = make_whisper_causal_mask(cache_pos, "model.decoder.");
 
     // Self-attention (layer-0 reuses pre-built key Variable)
-    Attention self_attn{};
-    self_attn.hidden_size = d;
-    self_attn.num_heads = heads;
-    self_attn.num_kv_heads = heads;
-    self_attn.head_dim = hd;
-    self_attn.precision = prec;
-    self_attn.weight_fn = config.weight;
-    self_attn.bias_fn = config.attn_bias;
+    Attention self_attn = make_attention(config);
     self_attn.o_proj_name = "self_attn.out_proj";
     self_attn.sdpa_mask = shared_mask;
 
@@ -902,14 +882,7 @@ std::shared_ptr<ov::Model> ModelBuilder::build_whisper_decoder(const WhisperConf
     };
 
     // Cross-attention (store-only encoder KV cache)
-    Attention cross_attn{};
-    cross_attn.hidden_size = d;
-    cross_attn.num_heads = heads;
-    cross_attn.num_kv_heads = heads;
-    cross_attn.head_dim = hd;
-    cross_attn.precision = prec;
-    cross_attn.weight_fn = config.weight;
-    cross_attn.bias_fn = config.attn_bias;
+    Attention cross_attn = make_attention(config);
     cross_attn.o_proj_name = "encoder_attn.out_proj";
     cross_attn.attn_prefix = "encoder_attn.";
 
@@ -943,12 +916,7 @@ std::shared_ptr<ov::Model> ModelBuilder::build_whisper_decoder(const WhisperConf
     auto logits = make_linear(final_norm, d, config.vocab_size, "proj_out", prec, config.weight);
 
     // Always f32 output — WhisperPipeline reads logits as f32
-    ov::Output<ov::Node> logits_out = logits;
-    if (prec != ov::element::f32) {
-        auto cvt = std::make_shared<ov::op::v0::Convert>(logits, ov::element::f32);
-        cvt->set_friendly_name("model.decoder.logits_convert");
-        logits_out = cvt->output(0);
-    }
+    auto logits_out = convert_to(logits, ov::element::f32, "model.decoder.logits_convert");
 
     return make_model(logits_out, "logits", "synthetic_whisper_decoder");
 }
@@ -956,10 +924,7 @@ std::shared_ptr<ov::Model> ModelBuilder::build_whisper_decoder(const WhisperConf
 std::shared_ptr<ov::Model> ModelBuilder::build_embedding_encoder(const BertConfig& config_in) {
     clear();
     BertConfig config = config_in;
-    if (!config.norm)
-        config.norm = LayerNorm(config.hidden_size, config.precision);
-    if (!config.ffn)
-        config.ffn = SwiGLU(config.hidden_size, config.intermediate_size, config.precision, config.weight);
+    apply_config_defaults(config);
 
     const auto prec = config.precision;
     const auto hs = config.hidden_size;
@@ -992,14 +957,7 @@ std::shared_ptr<ov::Model> ModelBuilder::build_embedding_encoder(const BertConfi
 
     auto sdpa_mask = make_padding_mask(attention_mask->output(0), prec);
 
-    Attention bert_attn{};
-    bert_attn.hidden_size = hs;
-    bert_attn.num_heads = config.num_heads;
-    bert_attn.num_kv_heads = config.num_heads;
-    bert_attn.head_dim = config.head_dim;
-    bert_attn.precision = prec;
-    bert_attn.weight_fn = config.weight;
-    bert_attn.bias_fn = config.attn_bias;
+    Attention bert_attn = make_attention(config);
     bert_attn.sdpa_mask = sdpa_mask;
 
     auto current =

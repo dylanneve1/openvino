@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace ov {
 namespace test {
@@ -39,6 +40,20 @@ inline uint32_t seed_from_name(const std::string& name) {
     // Ensure non-zero seed (xorshift requires it)
     uint32_t s = static_cast<uint32_t>(std::hash<std::string>{}(name));
     return s ? s : 1u;
+}
+
+/// Deterministic per-element pseudo-random fill in [-0.5, 0.5), seeded from the
+/// tensor name.  Same name always produces the same values, but they look random
+/// and span a wide enough range to survive FP16 quantisation through NPUW.  This
+/// prevents CSE from merging same-shape constants and produces diverse outputs.
+inline std::vector<float> pseudo_random_data(const std::string& name, size_t total) {
+    uint32_t state = seed_from_name(name);
+    std::vector<float> data(total);
+    for (size_t i = 0; i < total; ++i) {
+        uint32_t r = xorshift32(state);
+        data[i] = static_cast<float>(r % 10000u) / 10000.0f - 0.5f;
+    }
+    return data;
 }
 
 /// KV cache variable id. Missing separator (e.g. "keypresent") is intentional
