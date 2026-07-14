@@ -476,6 +476,61 @@ ov::npuw::PAInferRequest::Dispatch ov::npuw::PAInferRequest::validate_dispatch_l
     return d;
 }
 
+ov::npuw::PAInferRequest::SequenceDispatchKind ov::npuw::PAInferRequest::classify_sequence_dispatch_kind(
+    int64_t past_len,
+    int64_t scheduled_tokens) const {
+    if (scheduled_tokens <= 1) {
+        return SequenceDispatchKind::DECODE;
+    }
+    if (past_len == 0) {
+        return SequenceDispatchKind::PREFILL;
+    }
+    return SequenceDispatchKind::CHUNKED_CONTINUE;
+}
+
+ov::npuw::PAInferRequest::DispatchRoutingPlan ov::npuw::PAInferRequest::build_dispatch_routing_plan_locked(
+    const Dispatch& d) const {
+    DispatchRoutingPlan plan;
+    plan.sequence_kinds.reserve(static_cast<std::size_t>(d.n_seqs));
+
+    std::size_t n_decode = 0;
+    std::size_t n_prefill = 0;
+    std::size_t n_chunked = 0;
+
+    for (int64_t seq = 0; seq < d.n_seqs; ++seq) {
+        const auto scheduled = d.subsequence_begins[seq + 1] - d.subsequence_begins[seq];
+        const auto kind = classify_sequence_dispatch_kind(d.past_lens[seq], scheduled);
+        plan.sequence_kinds.push_back(kind);
+
+        if (kind == SequenceDispatchKind::DECODE) {
+            ++n_decode;
+            plan.decode_sequence_indices.push_back(seq);
+        } else if (kind == SequenceDispatchKind::PREFILL) {
+            ++n_prefill;
+            plan.prefill_sequence_indices.push_back(seq);
+        } else {
+            ++n_chunked;
+            plan.chunked_sequence_indices.push_back(seq);
+        }
+    }
+
+    const std::size_t n_non_zero = static_cast<std::size_t>(n_decode > 0) + static_cast<std::size_t>(n_prefill > 0) +
+                                   static_cast<std::size_t>(n_chunked > 0);
+    plan.needs_split = n_non_zero > 1;
+
+    if (n_decode == static_cast<std::size_t>(d.n_seqs)) {
+        plan.batch_kind = BatchDispatchKind::PURE_DECODE;
+    } else if (n_prefill == static_cast<std::size_t>(d.n_seqs)) {
+        plan.batch_kind = BatchDispatchKind::PURE_PREFILL;
+    } else if (n_chunked == static_cast<std::size_t>(d.n_seqs)) {
+        plan.batch_kind = BatchDispatchKind::PURE_CHUNKED_CONTINUE;
+    } else {
+        plan.batch_kind = BatchDispatchKind::MIXED;
+    }
+
+    return plan;
+}
+
 void ov::npuw::PAInferRequest::validate_output_locked(int64_t expected_logits_rows) {
     if (expected_logits_rows < 0) {
         return;
@@ -621,7 +676,7 @@ void ov::npuw::PAInferRequest::run_chunk_locked(ChunkRequest& chunk,
     }
 }
 
-void ov::npuw::PAInferRequest::infer_chunked_locked(const Dispatch& d) {
+void ov::npuw::PAInferRequest::infer_chunked_locked(const Dispatch& d, const DispatchRoutingPlan& routing_plan) {
     // One logits row per sampled token, in the caller's order.
     const auto& logits_port = m_inner_request->get_compiled_model()->outputs().front();
     const auto& lshape = logits_port.get_partial_shape();
@@ -630,36 +685,82 @@ void ov::npuw::PAInferRequest::infer_chunked_locked(const Dispatch& d) {
                                                                 static_cast<std::size_t>(lshape[1].get_length()),
                                                                 static_cast<std::size_t>(lshape[2].get_length())}));
 
+    enum class ChunkPolicy {
+        GREEDY,
+        FORCE_DECODE_1TOK,
+    };
+
     const bool verbose = ov::npuw::get_log_level() >= ov::npuw::LogLevel::Verbose;
     std::ostringstream plan;
-
-    for (int64_t s = 0; s < d.n_seqs; ++s) {
-        const auto seq_len = d.subsequence_begins[s + 1] - d.subsequence_begins[s];
-        int64_t off = 0;
+    const auto process_sequences = [&](const std::vector<int64_t>& seqs, ChunkPolicy policy, const char* label) {
+        if (seqs.empty()) {
+            return;
+        }
         if (verbose) {
-            plan << (s ? "; " : "") << "seq" << s << "=";
+            plan << (plan.tellp() > 0 ? " | " : "") << label << ":";
         }
-        while (off < seq_len) {
-            const auto remaining = seq_len - off;
-            // Largest variant that fits; the 1-token model is only right when
-            // exactly one token remains (the generation case). Everything
-            // else that no variant fits goes through the dynamic model.
-            std::size_t pick = 0u;
-            for (const auto& [token_dim, _] : m_chunk_requests) {
-                if (static_cast<int64_t>(token_dim) <= remaining && (token_dim > 1u || remaining == 1)) {
-                    pick = token_dim;
-                    break;
-                }
-            }
-            auto& chunk = pick ? m_chunk_requests.at(pick) : m_tail_request;
-            const auto n = pick ? static_cast<int64_t>(pick) : remaining;
+        for (std::size_t i = 0; i < seqs.size(); ++i) {
+            const auto s = seqs[i];
+            const auto seq_len = d.subsequence_begins[s + 1] - d.subsequence_begins[s];
+            int64_t off = 0;
             if (verbose) {
-                plan << (off ? "+" : "") << (pick ? "" : "dyn:") << n;
+                plan << (i ? "; " : "") << "seq" << s << "=";
             }
-            run_chunk_locked(chunk, d, s, off, n);
-            off += n;
+            while (off < seq_len) {
+                const auto remaining = seq_len - off;
+                std::size_t pick = 0u;
+                if (policy == ChunkPolicy::FORCE_DECODE_1TOK) {
+                    OPENVINO_ASSERT(remaining == 1,
+                                    "PA decode routing expected single-token chunk, got remaining=",
+                                    remaining,
+                                    " on seq ",
+                                    s,
+                                    ".");
+                    pick = 1u;
+                } else {
+                    // Largest variant that fits; the 1-token model is only
+                    // used for the generation case. Any residual that no
+                    // static size fits falls back to the dynamic tail.
+                    for (const auto& [token_dim, _] : m_chunk_requests) {
+                        if (static_cast<int64_t>(token_dim) <= remaining && (token_dim > 1u || remaining == 1)) {
+                            pick = token_dim;
+                            break;
+                        }
+                    }
+                }
+                auto& chunk = pick ? m_chunk_requests.at(pick) : m_tail_request;
+                const auto n = pick ? static_cast<int64_t>(pick) : remaining;
+                if (verbose) {
+                    plan << (off ? "+" : "") << (pick ? "" : "dyn:") << n;
+                }
+                run_chunk_locked(chunk, d, s, off, n);
+                off += n;
+            }
         }
+    };
+
+    if (routing_plan.batch_kind == BatchDispatchKind::PURE_DECODE) {
+        process_sequences(routing_plan.decode_sequence_indices, ChunkPolicy::FORCE_DECODE_1TOK, "decode");
+    } else if (routing_plan.batch_kind == BatchDispatchKind::MIXED) {
+        process_sequences(routing_plan.decode_sequence_indices, ChunkPolicy::FORCE_DECODE_1TOK, "decode");
+        std::vector<int64_t> non_decode;
+        non_decode.reserve(routing_plan.prefill_sequence_indices.size() + routing_plan.chunked_sequence_indices.size());
+        non_decode.insert(non_decode.end(),
+                          routing_plan.prefill_sequence_indices.begin(),
+                          routing_plan.prefill_sequence_indices.end());
+        non_decode.insert(non_decode.end(),
+                          routing_plan.chunked_sequence_indices.begin(),
+                          routing_plan.chunked_sequence_indices.end());
+        process_sequences(non_decode, ChunkPolicy::GREEDY, "prefill/chunked");
+    } else {
+        std::vector<int64_t> all;
+        all.reserve(static_cast<std::size_t>(d.n_seqs));
+        for (int64_t s = 0; s < d.n_seqs; ++s) {
+            all.push_back(s);
+        }
+        process_sequences(all, ChunkPolicy::GREEDY, "unified");
     }
+
     if (verbose) {
         LOG_VERB("PA dispatch #" << m_dispatch_idx << ": chunked " << plan.str());
     }
@@ -668,8 +769,51 @@ void ov::npuw::PAInferRequest::infer_chunked_locked(const Dispatch& d) {
 void ov::npuw::PAInferRequest::infer() {
     std::lock_guard<std::mutex> lock(m_mutex);
     const auto dispatch = validate_dispatch_locked();
+    const auto routing_plan = build_dispatch_routing_plan_locked(dispatch);
+    if (ov::npuw::get_log_level() >= ov::npuw::LogLevel::Verbose) {
+        const auto seq_to_cstr = [](SequenceDispatchKind kind) {
+            switch (kind) {
+            case SequenceDispatchKind::PREFILL:
+                return "prefill";
+            case SequenceDispatchKind::DECODE:
+                return "decode";
+            case SequenceDispatchKind::CHUNKED_CONTINUE:
+                return "chunked-continue";
+            }
+            return "unknown";
+        };
+        const auto batch_to_cstr = [](BatchDispatchKind kind) {
+            switch (kind) {
+            case BatchDispatchKind::PURE_PREFILL:
+                return "pure-prefill";
+            case BatchDispatchKind::PURE_DECODE:
+                return "pure-decode";
+            case BatchDispatchKind::PURE_CHUNKED_CONTINUE:
+                return "pure-chunked-continue";
+            case BatchDispatchKind::MIXED:
+                return "mixed";
+            }
+            return "unknown";
+        };
+        std::ostringstream seq_kinds;
+        for (std::size_t i = 0; i < routing_plan.sequence_kinds.size(); ++i) {
+            seq_kinds << (i ? ", " : "") << seq_to_cstr(routing_plan.sequence_kinds[i]);
+        }
+        LOG_VERB("PA dispatch #"
+                 << m_dispatch_idx << ": routing=" << batch_to_cstr(routing_plan.batch_kind)
+                 << ", split=" << (routing_plan.needs_split ? "yes" : "no")
+                 << ", decode=" << routing_plan.decode_sequence_indices.size()
+                 << ", prefill=" << routing_plan.prefill_sequence_indices.size()
+                 << ", chunked-continue=" << routing_plan.chunked_sequence_indices.size()
+                 << ", seq-kinds=[" << seq_kinds.str() << "]");
+    }
     if (can_chunk_locked(dispatch)) {
-        infer_chunked_locked(dispatch);
+        if (routing_plan.batch_kind == BatchDispatchKind::MIXED && ov::npuw::get_log_level() >= ov::npuw::LogLevel::Info) {
+            LOG_INFO("PA dispatch #"
+                     << m_dispatch_idx
+                     << ": mixed batch detected; using current unified chunked path (split routing not enabled yet)");
+        }
+        infer_chunked_locked(dispatch, routing_plan);
         m_serve_chunked_logits = true;
     } else {
         m_serve_chunked_logits = false;

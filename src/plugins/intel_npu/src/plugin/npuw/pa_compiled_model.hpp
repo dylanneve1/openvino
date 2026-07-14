@@ -44,6 +44,19 @@ public:
     std::vector<ov::ProfilingInfo> get_profiling_info() const override;
 
 private:
+    enum class SequenceDispatchKind {
+        PREFILL,
+        DECODE,
+        CHUNKED_CONTINUE,
+    };
+
+    enum class BatchDispatchKind {
+        PURE_PREFILL,
+        PURE_DECODE,
+        PURE_CHUNKED_CONTINUE,
+        MIXED,
+    };
+
     // One dispatch's control tensors, parsed and validated.
     struct Dispatch {
         std::vector<int64_t> past_lens;
@@ -57,6 +70,15 @@ private:
         bool has_sti = false;
     };
 
+    struct DispatchRoutingPlan {
+        BatchDispatchKind batch_kind = BatchDispatchKind::MIXED;
+        std::vector<SequenceDispatchKind> sequence_kinds;
+        std::vector<int64_t> decode_sequence_indices;
+        std::vector<int64_t> prefill_sequence_indices;
+        std::vector<int64_t> chunked_sequence_indices;
+        bool needs_split = false;
+    };
+
     // A chunk-capable request (semi-static variant or the dynamic tail
     // request) with its ports resolved by name once.
     struct ChunkRequest {
@@ -68,11 +90,13 @@ private:
     const ov::Output<const ov::Node>& map_port_locked(const ov::Output<const ov::Node>& port) const;
     // Validates the control tensors of one dispatch and parses them out.
     Dispatch validate_dispatch_locked();
+    SequenceDispatchKind classify_sequence_dispatch_kind(int64_t past_len, int64_t scheduled_tokens) const;
+    DispatchRoutingPlan build_dispatch_routing_plan_locked(const Dispatch& d) const;
     void validate_output_locked(int64_t expected_logits_rows);
 
     // True when this dispatch fits the chunked-execution input contract.
     bool can_chunk_locked(const Dispatch& d) const;
-    void infer_chunked_locked(const Dispatch& d);
+    void infer_chunked_locked(const Dispatch& d, const DispatchRoutingPlan& routing_plan);
     // Executes `n_chunk_tokens` of subsequence `seq` starting at token
     // `seq_offset` on `chunk`, scattering any sampled logits rows into
     // m_chunked_logits.
