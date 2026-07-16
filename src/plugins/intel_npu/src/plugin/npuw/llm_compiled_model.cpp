@@ -812,13 +812,23 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     LOG_DEBUG("Creating kvcache model as clone of passed one.");
     auto kvcache_model = model->clone();
 
+    // NPUW_TEXT_EMBED / NPUW_TEXT_RERANK select the single-shot scoring pipelines and
+    // gate the runtime batched wrapper the entry points put around this model. Pop them
+    // from other_props so they don't leak into the submodel configs, but record them in
+    // m_cfg: both are CACHED options, so this carries the decision through the blob (via
+    // the serialized config string, without touching the binary stream layout) and lets
+    // the entry points re-apply the wrapper on import by querying the imported model
+    // rather than depending on the ambient import properties being re-supplied.
     auto use_text_embed_key = pop_option(other_props, std::string("NPUW_TEXT_EMBED"));
     m_is_embedding = use_text_embed_key.value_or(false).as<bool>() == true;
+    if (use_text_embed_key.has_value()) {
+        m_cfg.update({{"NPUW_TEXT_EMBED", m_is_embedding ? "YES" : "NO"}});
+    }
 
-    // NPUW_TEXT_RERANK is consumed at the entry point (npuw::ICompiledModel::create
-    // wraps this model with the batched element); pop it here so it doesn't leak
-    // into the submodel configs.
-    pop_option(other_props, std::string("NPUW_TEXT_RERANK"));
+    auto use_text_rerank_key = pop_option(other_props, std::string("NPUW_TEXT_RERANK"));
+    if (use_text_rerank_key.has_value()) {
+        m_cfg.update({{"NPUW_TEXT_RERANK", use_text_rerank_key.value().as<bool>() ? "YES" : "NO"}});
+    }
 
     if (m_is_embedding) {
         LOG_DEBUG("Text-embedding model rebuild");

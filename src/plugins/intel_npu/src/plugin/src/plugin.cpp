@@ -176,9 +176,10 @@ std::shared_ptr<ov::ICompiledModel> import_model_npuw(std::istream& stream,
                 // Properties are required for ov::weights_path
                 auto llm_compiled_model = ov::npuw::LLMCompiledModel::import_model(stream, pluginSO, properties);
                 // The batched-scoring element is a runtime-only decorator and is not
-                // part of the blob - re-apply it from the import properties, mirroring
-                // ov::npuw::ICompiledModel::create().
-                if (ov::npuw::batched::requested(properties)) {
+                // part of the blob - re-apply it by querying the imported model, whose
+                // NPUW_TEXT_RERANK / NPUW_TEXT_EMBED flags are CACHED and thus restored
+                // from the blob, mirroring ov::npuw::ICompiledModel::create().
+                if (ov::npuw::batched::requested(llm_compiled_model)) {
                     return std::make_shared<ov::npuw::batched::CompiledModel>(llm_compiled_model, pluginSO);
                 }
                 return llm_compiled_model;

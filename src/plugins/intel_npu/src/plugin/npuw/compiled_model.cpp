@@ -318,7 +318,7 @@ std::shared_ptr<ov::npuw::ICompiledModel> ov::npuw::ICompiledModel::create(
         // [N, ...] inputs, while the LLM pipeline pins everything to a static batch
         // of 1. Wrap the compiled model with the batched element, which unrolls such
         // an infer row by row over the unchanged batch-1 inner request.
-        if (ov::npuw::batched::requested(properties)) {
+        if (ov::npuw::batched::requested(llm_compiled_model)) {
             LOG_INFO("Wrapping with ov::npuw::batched::CompiledModel.");
             compiled_model = std::make_shared<ov::npuw::batched::CompiledModel>(llm_compiled_model, plugin);
         }
