@@ -47,12 +47,6 @@ bool requested(const ov::AnyMap& properties);
 // guarantees the inner is the matching batch-1 compilation.
 class CompiledModel final : public ov::npuw::ICompiledModel {
 public:
-    // Factory method. Returns inner unwrapped when enabled == false, keeping the
-    // default path zero-overhead.
-    static std::shared_ptr<ov::npuw::ICompiledModel> create(const std::shared_ptr<ov::npuw::ICompiledModel>& inner,
-                                                            const std::shared_ptr<const ov::IPlugin>& plugin,
-                                                            bool enabled);
-
     CompiledModel(const std::shared_ptr<ov::npuw::ICompiledModel>& inner,
                   const std::shared_ptr<const ov::IPlugin>& plugin);
 

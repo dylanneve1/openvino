@@ -178,9 +178,10 @@ std::shared_ptr<ov::ICompiledModel> import_model_npuw(std::istream& stream,
                 // The batched-scoring element is a runtime-only decorator and is not
                 // part of the blob - re-apply it from the import properties, mirroring
                 // ov::npuw::ICompiledModel::create().
-                return ov::npuw::batched::CompiledModel::create(llm_compiled_model,
-                                                                pluginSO,
-                                                                ov::npuw::batched::requested(properties));
+                if (ov::npuw::batched::requested(properties)) {
+                    return std::make_shared<ov::npuw::batched::CompiledModel>(llm_compiled_model, pluginSO);
+                }
+                return llm_compiled_model;
             } else if (compiled_model_indicator == NPUW_COMPILED_MODEL_INDICATOR) {
                 OPENVINO_THROW("Legacy flat NPUW CompiledModel blobs are no longer supported. Re-export the model with "
                                "the current ORC serializer.");
