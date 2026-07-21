@@ -17,9 +17,9 @@ namespace ov::npuw {
 
 class PACompiledModel;
 
-// PA front-end Stage 0 (CVS-190137): a dispatcher over the dynamic, stateless
-// PagedAttention model the GenAI continuous-batching pipeline deploys. Each
-// dispatch is validated against the PA control-tensor contract (past_lens /
+// Dispatches the dynamic, stateless PagedAttention model deployed by the
+// GenAI continuous-batching pipeline. Each dispatch is validated against the
+// PA control-tensor contract (past_lens /
 // subsequence_begins / block_indices(_begins) / max_context_len /
 // sampled_tokens_indices), then executed per subsequence by greedily routing
 // token chunks through the pre-compiled semi-static variants (largest first;
@@ -29,7 +29,10 @@ class PACompiledModel;
 //
 // Chunks only fix the activation size -- the context stays dynamic, so the
 // KV cache is always addressed through the caller's block tables and no
-// padding is ever written. NPU enters later by flipping NPUW_PA_DEVICE.
+// padding is ever written. Semi-static dispatch models are partitioned by
+// NPUW: static repeating compute/FFN blocks run on NPU and share their weights,
+// while every PagedAttention op remains an individual dynamic subgraph on
+// NPUW_PA_DEVICE (CPU or GPU).
 class PAInferRequest final : public ov::ISyncInferRequest {
 public:
     explicit PAInferRequest(std::shared_ptr<const PACompiledModel> compiled_model);
