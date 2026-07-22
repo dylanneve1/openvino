@@ -873,6 +873,20 @@ TEST_F(LLMCompiledModelFactoryOptionsTest, GetMaxPositionEmbeddingsReadsBertTabl
     EXPECT_EQ(*max_pos, 512u);
 }
 
+// The position-table lookup must not depend on exporter-specific friendly names: with all names
+// stripped, the structural match (a 2D constant table gathered with internally computed indices,
+// vs. the word/token-type tables gathered directly from model inputs) must still find it.
+TEST_F(LLMCompiledModelFactoryOptionsTest, GetMaxPositionEmbeddingsWorksWithoutFriendlyNames) {
+    auto model = build_embedding_model();
+    size_t idx = 0;
+    for (const auto& op : model->get_ops()) {
+        op->set_friendly_name("op_" + std::to_string(idx++));
+    }
+    const auto max_pos = ov::npuw::util::get_max_position_embeddings(model);
+    ASSERT_TRUE(max_pos.has_value());
+    EXPECT_EQ(*max_pos, 512u);
+}
+
 // A bidirectional encoder embedding model has no autoregressive generate step. It must compile
 // the prefill (whole-sequence) model only and skip the generate/KV-cache variants entirely.
 TEST_F(LLMCompiledModelFactoryOptionsTest, TextEmbedEncoderCompilesPrefillOnly) {

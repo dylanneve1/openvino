@@ -24,13 +24,9 @@ public:
     ov::SoPtr<ov::ITensor> get_tensor(const ov::Output<const ov::Node>& port) const override;
 
 private:
-    ov::SoPtr<ov::ITensor> create_prefill_output_tensor();
-
     std::unordered_map<std::string, ov::Output<const ov::Node>> m_prefill_in_ports;
 
     std::shared_ptr<ov::IAsyncInferRequest> m_prefill_request;
-
-    ov::SoPtr<ov::ITensor> m_prefill_output;
 };
 
 }  // namespace npuw

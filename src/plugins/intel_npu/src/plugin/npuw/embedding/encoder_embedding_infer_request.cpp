@@ -8,16 +8,6 @@
 #include "../logging.hpp"
 #include "../util.hpp"
 
-ov::SoPtr<ov::ITensor> ov::npuw::EncoderEmbeddingInferRequest::create_prefill_output_tensor() {
-    const auto& out_port = m_prefill_request->get_outputs()[0];
-    auto out_shape = out_port.get_shape();
-    auto& kvcache_desc = m_npuw_llm_compiled_model->m_kvcache_desc;
-
-    auto prefill_shape = ov::Shape(out_shape);
-    prefill_shape[layer_ids::INPUT_IDS_SEQ_LEN_DIM] = kvcache_desc.max_prompt_size;
-    return ov::get_tensor_impl(ov::Tensor(out_port.get_element_type(), prefill_shape));
-}
-
 ov::npuw::EncoderEmbeddingInferRequest::EncoderEmbeddingInferRequest(
     const std::shared_ptr<LLMCompiledModel>& compiled_model)
     : ov::npuw::LLMInferBaseRequest(compiled_model) {
@@ -27,8 +17,6 @@ ov::npuw::EncoderEmbeddingInferRequest::EncoderEmbeddingInferRequest(
     for (const auto& input_port : m_prefill_request->get_compiled_model()->inputs()) {
         m_prefill_in_ports.emplace(input_port.get_any_name(), input_port);
     }
-
-    m_prefill_output = create_prefill_output_tensor();
 }
 
 void ov::npuw::EncoderEmbeddingInferRequest::infer() {
@@ -98,21 +86,17 @@ void ov::npuw::EncoderEmbeddingInferRequest::infer() {
 
     m_prefill_request->infer();
 
-    // Copy the valid (front) rows of the hidden state into the right-sized output tensor; the
-    // remaining padded rows stay zeroed. Downstream pooling uses attention_mask to ignore them.
-    uu::fill_tensor_bytes(m_prefill_output, 0u);
-    auto output_tensor = m_prefill_request->get_tensor(m_prefill_request->get_outputs()[0]);
-    auto src = uu::make_tensor_slice(output_tensor, layer_ids::INPUT_IDS_SEQ_LEN_DIM, 0, prompt_len);
-    auto dst = uu::make_tensor_slice(m_prefill_output, layer_ids::INPUT_IDS_SEQ_LEN_DIM, 0, prompt_len);
-    uu::copy_tensor_by_dim(src, dst, layer_ids::INPUT_IDS_SEQ_LEN_DIM, layer_ids::INPUT_IDS_SEQ_LEN_DIM);
-
     LOG_DEBUG("Done");
 }
 
 ov::SoPtr<ov::ITensor> ov::npuw::EncoderEmbeddingInferRequest::get_tensor(
     const ov::Output<const ov::Node>& port) const {
+    // Expose the prefill request's own output tensor directly: it already has the full static
+    // [1, max_prompt_size, hidden] shape, so no intermediate copy is needed. Rows past the real
+    // prompt length correspond to padding tokens; downstream pooling uses attention_mask to
+    // ignore them.
     if (port == get_outputs()[0]) {
-        return m_prefill_output;
+        return m_prefill_request->get_tensor(m_prefill_request->get_outputs()[0]);
     }
     return ov::ISyncInferRequest::get_tensor(port);
 }

@@ -42,6 +42,13 @@ bool is_encoder_embedding_model(const std::shared_ptr<ov::Model>& model);
 // position embedding (clamped to the table) won't broadcast against the token embedding.
 std::optional<uint32_t> get_max_position_embeddings(const std::shared_ptr<ov::Model>& model);
 
-// clang-format off
-}  // namespace ov
-// clang-format on
+// Sanity-checks a non-autoregressive bidirectional encoder (e.g. BERT) text-embedding model for
+// the NPUW embedding path. Unlike PrepareTextEmbeddingModel (autoregressive / Qwen3-Embedding
+// style), the encoder path does NOT rebuild the graph — no KV-cache parameters, RoPE position
+// ids, or causal mask are injected: an encoder is self-contained (builds its own bidirectional
+// mask from `attention_mask`, uses learned absolute positions, has no KV cache) and processes
+// the whole sequence in one forward. So all that's left is validation: assert there are no
+// autoregressive KV-cache inputs and re-validate shapes.
+void validate_encoder_embedding_model(const std::shared_ptr<ov::Model>& model);
+
+}  // namespace ov::npuw::util
