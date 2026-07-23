@@ -158,9 +158,9 @@ public:
         if (it != m_props.end()) {
             return it->second;
         }
-        // The batched element queries these scoring flags; default them to disabled so
-        // get_property(...).as<bool>() is always well-formed.
-        if (name == "NPUW_TEXT_RERANK" || name == "NPUW_TEXT_EMBED") {
+        // The batched element queries the rerank scoring flag; default it to disabled
+        // so get_property(...).as<bool>() is always well-formed.
+        if (name == "NPUW_TEXT_RERANK") {
             return false;
         }
         return {};
@@ -241,7 +241,9 @@ TEST_F(NPUWBatchedElementTest, RequestedFromModel) {
     EXPECT_FALSE(ov::npuw::batched::requested(model_with({})));
     EXPECT_FALSE(ov::npuw::batched::requested(model_with({{"NPUW_TEXT_RERANK", false}})));
     EXPECT_TRUE(ov::npuw::batched::requested(model_with({{"NPUW_TEXT_RERANK", true}})));
-    EXPECT_TRUE(ov::npuw::batched::requested(model_with({{"NPUW_TEXT_EMBED", true}})));
+    // Only the rerank tag gates the element -- the embedding pipeline keeps its
+    // pre-existing batch-1 behaviour untouched.
+    EXPECT_FALSE(ov::npuw::batched::requested(model_with({{"NPUW_TEXT_EMBED", true}, {"NPUW_TEXT_RERANK", false}})));
     EXPECT_TRUE(ov::npuw::batched::requested(model_with({{"NPUW_LLM", true}, {"NPUW_TEXT_RERANK", true}})));
 }
 

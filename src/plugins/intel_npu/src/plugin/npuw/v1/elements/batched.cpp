@@ -16,11 +16,7 @@
 
 bool ov::npuw::batched::requested(const std::shared_ptr<ov::npuw::ICompiledModel>& model) {
     OPENVINO_ASSERT(model != nullptr, "Batched element: null compiled model");
-    const auto is_enabled = [&model](const std::string& key) {
-        return model->get_property(key).as<bool>();
-    };
-    return is_enabled(ov::intel_npu::npuw::text_rerank::enabled.name()) ||
-           is_enabled(ov::intel_npu::npuw::text_embed::enabled.name());
+    return model->get_property(ov::intel_npu::npuw::text_rerank::enabled.name()).as<bool>();
 }
 
 std::shared_ptr<ov::npuw::ICompiledModel> ov::npuw::batched::CompiledModel::create(

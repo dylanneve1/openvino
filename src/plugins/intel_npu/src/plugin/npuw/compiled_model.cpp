@@ -312,9 +312,9 @@ std::shared_ptr<ov::npuw::ICompiledModel> ov::npuw::ICompiledModel::create(
         compiled_model = std::make_shared<ov::npuw::GQACompiledModel>(model, plugin, config);
     } else if (properties.count(use_llm_key) && properties.at(use_llm_key).as<bool>() == true) {
         LOG_INFO("ov::npuw::LLMCompiledModel will be created.");
-        // Single-shot scoring pipelines (text rerank / embedding) may submit batched
-        // [N, ...] inputs, while the LLM pipeline pins everything to a static batch
-        // of 1. batched::CompiledModel::create() wraps models tagged for such scoring
+        // A single-shot scoring pipeline (text rerank) may submit batched [N, ...]
+        // inputs, while the LLM pipeline pins everything to a static batch of 1.
+        // batched::CompiledModel::create() wraps models tagged for such scoring
         // with the batched element, which unrolls an infer row by row over the
         // unchanged batch-1 inner request; untagged models are returned unwrapped.
         compiled_model = ov::npuw::batched::CompiledModel::create(

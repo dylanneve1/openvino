@@ -17,10 +17,10 @@
 namespace ov::npuw::batched {
 
 // True when the given compiled model is tagged for batched single-shot scoring --
-// currently the text rerank and text embedding pipelines. The tag is read from the
-// model's own properties (NPUW_TEXT_RERANK / NPUW_TEXT_EMBED, recorded in its config
-// and serialized with it into the blob), which is what lets CompiledModel::create()
-// decide identically at both NPUW entry points.
+// currently only the text rerank pipeline. The tag is read from the model's own
+// properties (NPUW_TEXT_RERANK, recorded in its config and serialized with it into
+// the blob), which is what lets CompiledModel::create() decide identically at both
+// NPUW entry points.
 bool requested(const std::shared_ptr<ov::npuw::ICompiledModel>& model);
 
 // A compiled-model decorator that adds batched (batch > 1) execution on top of an
@@ -37,9 +37,11 @@ bool requested(const std::shared_ptr<ov::npuw::ICompiledModel>& model);
 // public output tensors.
 //
 // This is correct for single-shot scoring workloads whose rows are independent
-// -- text reranking and text embedding -- where batched and per-row results are
-// identical and batching is purely a throughput/ergonomics choice. It is NOT
-// valid for autoregressive generation, where state must persist across calls.
+// (text reranking today; the same would hold for e.g. text embedding), where
+// batched and per-row results are identical and batching is purely a
+// throughput/ergonomics choice. A batch-1 infer passes through transparently.
+// It is NOT valid for autoregressive generation, where state must persist
+// across calls.
 //
 // It is applied via create() at the NPUW entry points only:
 // npuw::ICompiledModel::create() on compilation and the plugin's NPUW import path
