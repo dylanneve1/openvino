@@ -815,11 +815,9 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     auto use_text_embed_key = pop_option(other_props, std::string("NPUW_TEXT_EMBED"));
     m_is_embedding = use_text_embed_key.value_or(false).as<bool>() == true;
 
-    // NPUW_TEXT_RERANK tags the single-shot rerank scoring pipeline and gates the
-    // batched wrapper the entry points put around this model. Pop it from
-    // other_props so it doesn't leak into the submodel configs, and record it in
-    // m_cfg, which is serialized into the blob wholesale - so the tag survives
-    // export/import and both entry points can decide by querying the model itself.
+    // NPUW_TEXT_RERANK gates the batched wrapper the entry points put around this
+    // model. Pop it so it doesn't leak into the submodel configs, and record it
+    // in m_cfg so it survives blob export/import.
     auto use_text_rerank_key = pop_option(other_props, std::string("NPUW_TEXT_RERANK"));
     if (use_text_rerank_key.has_value()) {
         m_cfg.update({{"NPUW_TEXT_RERANK", use_text_rerank_key.value().as<bool>() ? "YES" : "NO"}});
@@ -1600,9 +1598,7 @@ std::shared_ptr<ov::npuw::LLMCompiledModel> ov::npuw::LLMCompiledModel::deserial
 
     NPUW_ASSERT(compiled && "Couldn't create NPUW compiled model!");
 
-    // The rerank tag may also be supplied with the import properties (e.g. by a caller
-    // re-passing its compile config). Mirror the compile-side handling: an explicit
-    // caller value overrides the blob-recorded one.
+    // An explicit rerank tag in the import properties overrides the blob-recorded one.
     const auto rerank_iter = properties.find(std::string("NPUW_TEXT_RERANK"));
     if (rerank_iter != properties.end()) {
         compiled->m_cfg.update({{"NPUW_TEXT_RERANK", rerank_iter->second.as<bool>() ? "YES" : "NO"}});

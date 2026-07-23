@@ -16,44 +16,26 @@
 
 namespace ov::npuw::batched {
 
-// True when the given compiled model is tagged for batched single-shot scoring --
-// currently only the text rerank pipeline. The tag is read from the model's own
-// properties (NPUW_TEXT_RERANK, recorded in its config and serialized with it into
-// the blob), which is what lets CompiledModel::create() decide identically at both
-// NPUW entry points.
+// True when the compiled model is tagged for batched single-shot scoring
+// (NPUW_TEXT_RERANK). The tag lives in the model's own config and survives blob
+// serialization, so compile and import decide identically.
 bool requested(const std::shared_ptr<ov::npuw::ICompiledModel>& model);
 
-// A compiled-model decorator that adds batched (batch > 1) execution on top of an
-// inner compiled model that only supports a batch size of 1 (as NPUW's LLM
-// pipeline does, since it reshapes every sub-model to a static batch of 1).
+// A transparent decorator that adds batched (batch > 1) execution on top of an
+// inner compiled model that only supports batch 1 (as NPUW's LLM pipeline does).
+// It exposes the inner model's ports and forwards everything but inference: a
+// batched [N, ...] infer is unrolled into N independent batch-1 inferences on
+// the inner request, with the variable state (KV-cache) reset between rows and
+// the per-row outputs stacked into [N, ...] output tensors.
 //
-// Like the other v1/elements wrappers (failsafe, accuracy_checked) it is a
-// transparent decorator that exposes the inner model's I/O (inputs()/outputs()
-// forward to the inner, so the ports are literally the same objects) and forwards
-// everything but inference to the inner model. Unlike them it is a *fan-out*
-// element: a single [N, ...] inference is unrolled into N independent [1, ...]
-// inferences on the inner request, the inner variable state (KV-cache) is reset
-// between rows, and the per-row outputs are written into rows of the [N, ...]
-// public output tensors.
-//
-// This is correct for single-shot scoring workloads whose rows are independent
-// (text reranking today; the same would hold for e.g. text embedding), where
-// batched and per-row results are identical and batching is purely a
-// throughput/ergonomics choice. A batch-1 infer passes through transparently.
-// It is NOT valid for autoregressive generation, where state must persist
-// across calls.
-//
-// It is applied via create() at the NPUW entry points only:
-// npuw::ICompiledModel::create() on compilation and the plugin's NPUW import path
-// on blob import (the element is runtime-only and is not part of the serialized
-// blob). Both wrap the LLMCompiledModel produced there from the very same model,
-// which is what guarantees the inner is the matching batch-1 compilation.
+// Valid only for single-shot scoring whose rows are independent (text rerank);
+// NOT valid for autoregressive generation, where state must persist across
+// calls. Applied via create() at the NPUW entry points - compile and blob
+// import - as the element is runtime-only and not part of the blob.
 class CompiledModel final : public ov::npuw::ICompiledModel {
 public:
-    // Factory used by the NPUW entry points. Returns the inner model unwrapped
-    // when it is not tagged for batched scoring (see requested()), keeping the
-    // untagged path zero-overhead -- the same convention as the other elements'
-    // create() no-op paths.
+    // Returns the inner model wrapped when it is tagged for batched scoring
+    // (see requested()), or as-is otherwise.
     static std::shared_ptr<ov::npuw::ICompiledModel> create(const std::shared_ptr<ov::npuw::ICompiledModel>& inner,
                                                             const std::shared_ptr<const ov::IPlugin>& plugin);
 
@@ -78,17 +60,11 @@ private:
     std::shared_ptr<ov::npuw::ICompiledModel> m_inner;
 };
 
-// Sync infer request that unrolls a batched inference over the single-sequence
-// inner request.
-//
-// The public input tensors default to the inner request's own tensors (surfaced in
-// the constructor), so a plain batch-1 infer works exactly as on the inner. When
-// the caller binds [N, ...] inputs, infer() takes N as the largest leading
-// dimension across the inputs (an input with a leading dim of 1 is shared across
-// rows), and for each row: resets the inner variable state, binds the row's
-// [1, ...] view of every batched input, runs the inner request, and copies the
-// inner outputs into row i of the [N, ...] public output tensors. Caller-bound
-// output tensors are reused when they already have the right shape and type.
+// Sync infer request that unrolls a batched inference over the batch-1 inner
+// request. The batch size is the largest leading dimension across the inputs;
+// an input with a leading dim of 1 is shared across rows. Per row it resets the
+// inner state, binds the row's [1, ...] input views, infers, and copies the
+// outputs into row i of the [N, ...] output tensors.
 class InferRequest final : public ov::ISyncInferRequest {
 public:
     InferRequest(const std::shared_ptr<const ov::ICompiledModel>& compiled_model,
@@ -101,23 +77,21 @@ public:
     std::vector<ov::ProfilingInfo> get_profiling_info() const override;
 
 private:
-    // The public input tensors snapshotted for one infer() call, together with the
-    // batch size derived from them.
+    // The input tensors snapshotted for one infer() call and the batch size
+    // derived from them.
     struct BatchedInputs {
         std::vector<ov::SoPtr<ov::ITensor>> tensors;  // parallel to get_inputs()
         std::size_t batch = 1;
     };
 
-    // Snapshot the public inputs and derive the batch size: the largest leading
-    // dimension across them. Every input must either carry the batch ([N, ...],
-    // sliced per row by infer()) or be shared across rows ([1, ...], bound whole);
-    // anything else throws.
+    // Snapshot the inputs and derive the batch size. Every input must either
+    // carry the batch ([N, ...]) or be shared across rows ([1, ...]); anything
+    // else throws.
     BatchedInputs extract_batch() const;
 
-    // Make the public output tensors [batch, ...] copies of the inner's [1, ...]
-    // outputs, reusing caller-bound tensors that already fit. The wrapped model's
-    // ports are dynamic, so this can only run once the first row has been scored
-    // and the inner output shapes are known.
+    // Make the public output tensors [batch, ...], reusing caller-bound tensors
+    // that already fit. The ports are dynamic, so this can only run once the
+    // first row has been scored and the inner output shapes are known.
     void ensure_batched_outputs(std::size_t batch);
 
     std::shared_ptr<ov::IAsyncInferRequest> m_inner;

@@ -99,10 +99,8 @@ inline std::shared_ptr<ov::Model> build_llm_gqa_test_model() {
     return mb.build_llm(make_test_model_config_gqa());
 }
 
-/// Minimal Qwen3-style reranker: a GQA causal decoder with RMSNorm and per-head
-/// Q/K normalization, stateful KV cache and an LM head (logits output). Matches the
-/// I/O signature of Qwen3-Reranker (input_ids/attention_mask/position_ids + beam_idx),
-/// which is what the batched scoring element fans out over.
+// Minimal Qwen3-style reranker: GQA causal decoder with RMSNorm and per-head Q/K
+// norm, stateful KV cache and an LM head. Matches Qwen3-Reranker's I/O signature.
 inline LLMConfig make_test_model_config_reranker() {
     auto cfg = make_test_model_config_gqa();
     cfg.norm = RMSNorm(cfg.hidden_size, cfg.precision);

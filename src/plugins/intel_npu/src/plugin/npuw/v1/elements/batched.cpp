@@ -45,8 +45,7 @@ const std::vector<ov::Output<const ov::Node>>& ov::npuw::batched::CompiledModel:
 }
 
 void ov::npuw::batched::CompiledModel::export_model(std::ostream& model) const {
-    // The element is a runtime-only decorator: the blob is the inner's blob, and the
-    // entry points re-apply the wrapper on import based on the properties.
+    // Runtime-only decorator: the blob is the inner's, import re-applies the wrapper.
     m_inner->export_model(model);
 }
 
@@ -82,10 +81,8 @@ ov::npuw::batched::InferRequest::InferRequest(const std::shared_ptr<const ov::IC
     m_profile.report_on_die = ov::npuw::profiling_enabled();
     m_profile.area = "batched/execution";
 
-    // Surface the inner request's own tensors as the public defaults (the ports are
-    // the same objects, see CompiledModel::inputs()). Nothing is allocated here: a
-    // batch-1 caller works directly on the inner's tensors, and a batched caller
-    // replaces them with its [N, ...] tensors via set_tensor().
+    // Surface the inner request's tensors as the public defaults (the ports are
+    // the same objects); a batched caller replaces them via set_tensor().
     for (const auto& port : get_inputs()) {
         if (auto tensor = m_inner->get_tensor(port)) {
             set_tensor(port, tensor);
@@ -140,10 +137,7 @@ void ov::npuw::batched::InferRequest::infer() {
     });
     const std::size_t batch = inputs.batch;
 
-    // Unroll row by row: reset the inner variable state so each row is scored as an
-    // independent prompt, bind the row's [1, ...] view of every batched input, run
-    // the batch-1 inner request, and write the row's outputs into row `row` of the
-    // [N, ...] public output tensors.
+    // Unroll row by row: reset state, bind the row's input views, infer, stack outputs.
     const auto inner_states = m_inner->query_state();
     for (std::size_t row = 0; row < batch; ++row) {
         m_profile["2.bind_row"].record([&]() {
@@ -190,14 +184,12 @@ void ov::npuw::batched::InferRequest::ensure_batched_outputs(std::size_t batch) 
 }
 
 void ov::npuw::batched::InferRequest::check_tensors() const {
-    // No-op: the public outputs are late-bound (allocated on infer once the batch is
-    // known), and the batched inputs are validated and then unrolled by infer() -- the
-    // per-row [1, ...] tensors are checked by the inner request.
+    // No-op: outputs are late-bound and inputs are validated by infer(); the
+    // per-row tensors are checked by the inner request.
 }
 
 std::vector<ov::SoPtr<ov::IVariableState>> ov::npuw::batched::InferRequest::query_state() const {
-    // The batched element resets inner state between rows and exposes no
-    // cross-call state of its own, so it presents an empty state list.
+    // No cross-call state: the element resets the inner state between rows.
     return {};
 }
 

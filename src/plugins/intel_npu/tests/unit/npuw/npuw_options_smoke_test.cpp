@@ -213,8 +213,7 @@ TEST(NPUWConfigOptionsSmokeTest, AttentionHintDefaultsCanDifferPerOption) {
     EXPECT_EQ(cfg.getString<::intel_npu::NPUW_LLM_GENERATE_ATTENTION_HINT>(), "STATIC");
 }
 
-// LLMCompiledModel persists its config in the blob via toString()/fromString() - the
-// rerank tag must survive that round trip for import to re-apply the batched element.
+// The rerank tag must survive the config string round trip the blob uses.
 TEST(NPUWConfigOptionsSmokeTest, RerankTagSurvivesConfigStringRoundTrip) {
     const auto cfg = make_config({{"NPUW_TEXT_RERANK", "YES"}});
 

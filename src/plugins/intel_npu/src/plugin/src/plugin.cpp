@@ -173,13 +173,9 @@ std::shared_ptr<ov::ICompiledModel> import_model_npuw(std::istream& stream,
             if (compiled_model_indicator == NPUW_GQA_COMPILED_MODEL_INDICATOR) {
                 return ov::npuw::GQACompiledModel::import_model(stream, pluginSO, properties);
             } else if (compiled_model_indicator == NPUW_LLM_COMPILED_MODEL_INDICATOR) {
-                // Properties are required for ov::weights_path
-                //
-                // The batched-scoring element is a runtime-only decorator and is not
-                // part of the blob - batched::CompiledModel::create() re-applies it to
-                // the imported model, whose scoring tag is restored from the blob (or
-                // re-supplied with the import properties), mirroring the compile-side
-                // entry point in ov::npuw::ICompiledModel::create().
+                // Properties are required for ov::weights_path.
+                // The batched element is runtime-only and not part of the blob -
+                // create() re-applies it from the rerank tag restored on import.
                 return ov::npuw::batched::CompiledModel::create(
                     ov::npuw::LLMCompiledModel::import_model(stream, pluginSO, properties),
                     pluginSO);

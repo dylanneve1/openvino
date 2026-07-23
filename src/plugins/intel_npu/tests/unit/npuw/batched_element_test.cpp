@@ -2,14 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-// Unit tests for the batched v1 element (ov::npuw::batched), a model-agnostic fan-out
-// decorator that unrolls a batched [N, ...] request into N batch-1 inner inferences,
-// resets inner variable state between rows, and writes the per-row outputs into rows
-// of the [N, ...] public output tensors. The element itself is the unit under test;
-// only the inner compiled model is mocked, which keeps the tests deviceless and lets
-// them observe the per-row infer/reset. It is driven through a synthetic Qwen-style
-// reranker (realistic multi-input, stateful signature), and the mock echoes each
-// row's first token so a test can assert output row r reflects input row r.
+// Unit tests for the batched v1 element (ov::npuw::batched). Only the inner
+// compiled model is mocked, keeping the tests deviceless and letting them observe
+// the per-row infer/reset. The mock echoes each row's first input_ids token, so a
+// test can assert that output row r reflects input row r.
 
 #include <gtest/gtest.h>
 
@@ -41,8 +37,8 @@ using ov::test::npuw::NullPlugin;
 // Per-output value offset the mock applies so multi-output tests can tell stacked outputs apart.
 constexpr float kOutputChannelOffset = 1000.0f;
 
-// Ordered log of the lifecycle the element drives on the inner: "reset" before each row,
-// "infer" for each row. Mirrors the events-vector pattern in failsafe.cpp / accuracy_checked.cpp.
+// Ordered log of the lifecycle the element drives on the inner: "reset" before
+// each row, "infer" for each row.
 struct Recorder {
     std::vector<std::string> events;
 };
@@ -89,9 +85,7 @@ std::shared_ptr<ov::Model> build_two_output_model() {
     return std::make_shared<ov::Model>(ov::OutputVector{as_f32, scaled}, ov::ParameterVector{ids}, "two_output");
 }
 
-// Batch-1 inner stand-in: echoes the row's first input_ids token across its (generically
-// shaped) output. Pure in its input, so the same row always yields the same value -- which
-// is what lets callers check that batched scoring equals per-row scoring.
+// Batch-1 inner stand-in: echoes the row's first input_ids token across every output.
 class MockInnerSync : public ov::ISyncInferRequest {
 public:
     MockInnerSync(std::shared_ptr<const ov::ICompiledModel> compiled_model, std::shared_ptr<Recorder> rec)
@@ -158,8 +152,7 @@ public:
         if (it != m_props.end()) {
             return it->second;
         }
-        // The batched element queries the rerank scoring flag; default it to disabled
-        // so get_property(...).as<bool>() is always well-formed.
+        // Default the rerank flag to disabled so as<bool>() is well-formed.
         if (name == "NPUW_TEXT_RERANK") {
             return false;
         }
@@ -241,14 +234,12 @@ TEST_F(NPUWBatchedElementTest, RequestedFromModel) {
     EXPECT_FALSE(ov::npuw::batched::requested(model_with({})));
     EXPECT_FALSE(ov::npuw::batched::requested(model_with({{"NPUW_TEXT_RERANK", false}})));
     EXPECT_TRUE(ov::npuw::batched::requested(model_with({{"NPUW_TEXT_RERANK", true}})));
-    // Only the rerank tag gates the element -- the embedding pipeline keeps its
-    // pre-existing batch-1 behaviour untouched.
+    // Only the rerank tag gates the element.
     EXPECT_FALSE(ov::npuw::batched::requested(model_with({{"NPUW_TEXT_EMBED", true}, {"NPUW_TEXT_RERANK", false}})));
     EXPECT_TRUE(ov::npuw::batched::requested(model_with({{"NPUW_LLM", true}, {"NPUW_TEXT_RERANK", true}})));
 }
 
-// create() is the single gating point used by both NPUW entry points (compile and
-// blob import): tagged models come back wrapped, untagged ones pass through as-is.
+// create() wraps tagged models and passes untagged ones through as-is.
 TEST_F(NPUWBatchedElementTest, CreateWrapsOnlyWhenRequested) {
     const auto model_with = [&](ov::AnyMap props) -> std::shared_ptr<ov::npuw::ICompiledModel> {
         return std::make_shared<MockInnerCompiled>(m_model, m_plugin, m_recorder, std::move(props));
@@ -325,8 +316,7 @@ TEST_F(NPUWBatchedElementTest, ZeroBatchIsRejected) {
     EXPECT_TRUE(m_recorder->events.empty());
 }
 
-// input_ids fixes N=3; an attention_mask with batch 2 (neither N nor 1) cannot be sliced
-// per row and must be rejected rather than fed whole into the batch-1 inner.
+// An input whose batch is neither N nor 1 cannot be sliced per row and is rejected.
 TEST_F(NPUWBatchedElementTest, MismatchedBatchRejected) {
     auto wrapped = wrap();
     auto req = wrapped->create_infer_request();
@@ -343,8 +333,7 @@ TEST_F(NPUWBatchedElementTest, MismatchedBatchRejected) {
     EXPECT_TRUE(m_recorder->events.empty());
 }
 
-// A shared input (batch 1) is fed to every row whole -- only inputs carrying the full
-// batch are sliced, so a [1, L] input is never sliced out of range.
+// A [1, ...] input is shared: bound whole to every row, never sliced.
 TEST_F(NPUWBatchedElementTest, SharedInputBoundToEveryRow) {
     auto wrapped = wrap();
     auto req = wrapped->create_infer_request();
@@ -363,8 +352,7 @@ TEST_F(NPUWBatchedElementTest, SharedInputBoundToEveryRow) {
     EXPECT_EQ(m_recorder->events, (std::vector<std::string>{"reset", "infer", "reset", "infer", "reset", "infer"}));
 }
 
-// Regression: a leading batch-1 input (here input_ids, shared) must not pin the batch to 1
-// when a later input carries the real batch -- the batch is the largest leading dim.
+// The batch is the largest leading dim - a batch-1 first input must not pin N to 1.
 TEST_F(NPUWBatchedElementTest, BatchSizeFromNonLeadingInput) {
     auto wrapped = wrap();
     auto req = wrapped->create_infer_request();
