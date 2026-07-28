@@ -291,13 +291,16 @@ ov::npuw::LLMInferRequest::LLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
 
     for (const auto& input_port : m_kvcache_request->get_compiled_model()->inputs()) {
         const auto& all_names = input_port.get_names();
+        // NB: A port may expose several aliases, but the per-variant port maps are keyed by
+        // get_any_name(). Detect the port by any of its aliases, yet store the key those maps
+        // use, otherwise lookups like m_generate_variant_in_ports.at(name) miss and throw.
         for (const auto& name : all_names) {
             if (ov::npuw::util::starts_with(name, layer_names::past_key_values)) {
-                m_kvcache_past_names.push_back(name);
+                m_kvcache_past_names.push_back(input_port.get_any_name());
                 break;
             }
             if (ov::npuw::util::starts_with_past_lincache(name)) {
-                m_lincache_past_names.push_back(name);
+                m_lincache_past_names.push_back(input_port.get_any_name());
                 break;
             }
         }
