@@ -155,6 +155,18 @@ bool PrefixCacheManager::put_block(const std::shared_ptr<KVBlock>& block, uint64
 
         LOG_VERB("[Cache store] Successfully added block. Token start: " << block->get_token_start()
                                                                          << " block hash: " << block->get_block_hash());
+
+        // Footprint of the cache itself. Each cached block owns freshly allocated host
+        // tensors holding a copy of the computed KV, so this is the duplicate KV the
+        // prefix cache keeps beyond the model's own cache.
+        std::size_t store_bytes = 0u;
+        for (const auto& entry : m_cache_map) {
+            for (const auto& kv : entry.second->get_block_kv_data()) {
+                store_bytes += kv.second->get_byte_size();
+            }
+        }
+        LOG_INFO("[Cache store] block store now " << (store_bytes / 1024u) << " KiB across " << m_cache_map.size()
+                                                  << " block(s), cap " << m_max_cache_size << " blocks");
     }
 
     return true;

@@ -255,6 +255,15 @@ std::unique_ptr<ContinuedPrefillPlan> LLMContinuousKVCacheStrategy::plan_continu
                             name);
         }
     }
+    // Staging buffers are the only extra memory a continuation needs. They live for the
+    // duration of the plan and are released with it, so this is a transient peak rather
+    // than a persistent store.
+    std::size_t staging_bytes = 0u;
+    for (const auto& t : plan->temps) {
+        staging_bytes += t.second->get_byte_size();
+    }
+    LOG_INFO("Continued prefill staging: " << (staging_bytes / 1024u) << " KiB across " << plan->temps.size()
+                                           << " temp tensor(s) for keep=" << keep << " (transient, freed with the plan)");
     return plan;
 }
 
