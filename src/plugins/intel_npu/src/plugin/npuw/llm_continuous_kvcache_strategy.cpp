@@ -263,7 +263,8 @@ std::unique_ptr<ContinuedPrefillPlan> LLMContinuousKVCacheStrategy::plan_continu
         staging_bytes += t.second->get_byte_size();
     }
     LOG_INFO("Continued prefill staging: " << (staging_bytes / 1024u) << " KiB across " << plan->temps.size()
-                                           << " temp tensor(s) for keep=" << keep << " (transient, freed with the plan)");
+                                           << " temp tensor(s) for keep=" << keep
+                                           << " (transient, freed with the plan)");
     return plan;
 }
 

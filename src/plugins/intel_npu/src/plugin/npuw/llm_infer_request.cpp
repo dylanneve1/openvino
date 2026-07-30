@@ -5,6 +5,7 @@
 #include "llm_infer_request.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <regex>
@@ -628,6 +629,7 @@ void ov::npuw::LLMInferRequest::copy_kvcache() {
     // Timed as the mirror operation of the continued prefill repack, so the two copy
     // directions can be compared in the log.
     const auto t_start = std::chrono::steady_clock::now();
+    std::atomic<uint64_t> staging_bytes{0u};
     auto& kvcache_desc = m_npuw_llm_compiled_model->m_kvcache_desc;
     // FIXME: Find only matching by names outputs and copy them, having previously checked that such inputs exist
     ov::parallel_for(m_kvcache_past_names.size(), [&](size_t out_idx) {
@@ -671,6 +673,7 @@ void ov::npuw::LLMInferRequest::copy_kvcache() {
                                                                    prefill_past_kv->get_shape(),
                                                                    m_pre_alloc_device,
                                                                    m_npuw_llm_compiled_model->get_plugin());
+                    staging_bytes.fetch_add(tmp_dense_kv_tensor->get_byte_size(), std::memory_order_relaxed);
                     prefill_past_kv->copy_to(tmp_dense_kv_tensor._ptr);
                     prefill_past_kv_chunks = make_tensor_slice(tmp_dense_kv_tensor,
                                                                pre_kv_dim,
@@ -720,7 +723,8 @@ void ov::npuw::LLMInferRequest::copy_kvcache() {
     const auto t_ms =
         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_start).count() /
         1000.0;
-    LOG_INFO("copy_kvcache: " << kvcache_desc.num_stored_tokens << " tokens, prefill to generate, " << t_ms << " ms");
+    LOG_INFO("copy_kvcache: " << kvcache_desc.num_stored_tokens << " tokens, prefill to generate, " << t_ms
+                              << " ms, staging " << (staging_bytes.load() / 1024u) << " KiB (transient)");
     LOG_DEBUG("Done.");
 }
 
