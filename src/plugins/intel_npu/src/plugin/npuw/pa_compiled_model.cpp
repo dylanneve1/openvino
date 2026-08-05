@@ -12,9 +12,12 @@
 #include <vector>
 
 #include "intel_npu/config/npuw.hpp"
+#include "openvino/core/graph_util.hpp"
 #include "logging.hpp"
+#include "openvino/op/add.hpp"
 #include "openvino/op/constant.hpp"
 #include "openvino/op/matmul.hpp"
+#include "openvino/op/multiply.hpp"
 #include "openvino/op/reshape.hpp"
 #include "openvino/runtime/iplugin.hpp"
 #include "openvino/runtime/make_tensor.hpp"
@@ -160,44 +163,83 @@ ov::SoPtr<ov::ITensor> slice_1d(const ov::SoPtr<ov::ITensor>& src, int64_t start
     return out;
 }
 
-// The PA model keeps the flat token count in dimension 0, so every linear
-// layer sees a [tokens, 1, hidden] activation: a batch of single-row GEMVs.
-// The NPU compiler lowers a batched MatMul like that into a batched
-// Convolution it cannot legalize (ConvertBatchedLayerTo1N), so no variant
-// with token_dim > 1 ever compiles for NPU. Both layouts are contiguous and
-// bit-identical, so moving the token count into the row dimension around
-// every weight MatMul ([tokens, 1, h] -> [1, tokens, h]) turns the batch
-// into a single batch-1 GEMM at zero data cost.
-void relayout_token_major_matmuls(const std::shared_ptr<ov::Model>& model) {
-    bool changed = false;
-    for (const auto& node : model->get_ordered_ops()) {
-        auto matmul = ov::as_type_ptr<ov::op::v0::MatMul>(node);
-        if (!matmul || matmul->get_transpose_a()) {
-            continue;
-        }
-        const auto& act_shape = matmul->get_input_partial_shape(0);
-        const auto& out_shape = matmul->get_output_partial_shape(0);
-        if (act_shape.is_dynamic() || out_shape.is_dynamic() || act_shape.rank().get_length() != 3 ||
-            matmul->get_input_partial_shape(1).rank().get_length() != 2) {
-            continue;
-        }
-        const auto tokens = act_shape[0].get_length();
-        if (tokens <= 1 || act_shape[1].get_length() != 1) {
-            continue;
-        }
+// A static [tokens, 1, x] activation with tokens > 1; the layouts the NPU
+// compiler reads as batched.
+bool is_token_major(const ov::PartialShape& shape) {
+    return shape.is_static() && shape.rank().get_length() == 3 && shape[0].get_length() > 1 &&
+           shape[1].get_length() == 1;
+}
 
-        const auto row_major = [](const ov::Output<ov::Node>& out, int64_t d0, int64_t d1, int64_t d2) {
-            auto target = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{3}, {d0, d1, d2});
-            return std::make_shared<ov::op::v1::Reshape>(out, target, false);
-        };
-        const auto consumers = matmul->output(0).get_target_inputs();
-        matmul->input(0).replace_source_output(
-            row_major(matmul->input_value(0), 1, tokens, act_shape[2].get_length()));
-        auto restored = row_major(matmul, tokens, 1, out_shape[2].get_length());
+// The PA model keeps the flat token count in dimension 0, so activations run
+// through the trunk as [tokens, 1, hidden]. The NPU compiler reads dimension
+// 0 as a batch and lowers two op families into batched Convolutions it then
+// cannot legalize (ConvertBatchedLayerTo1N): weight MatMuls (a batch of
+// single-row GEMVs) and per-channel scale or bias eltwise ops (RMSNorm
+// weights and eps, taken to depthwise convolution). [tokens, 1, x] and [1, tokens, x] are the same
+// bytes, so wrapping just those ops in two metadata-only Reshapes makes them
+// batch-1 at zero data cost while the rest of the graph stays token-major.
+// The RoPE position outer product ([tokens, d, 1] x [tokens, 1, 1] MatMul)
+// is the same problem with no weights involved; a K=1 MatMul is exactly a
+// broadcast Multiply, so it is rewritten as one and stops being a batched
+// GEMM altogether.
+void relayout_token_major_ops(const std::shared_ptr<ov::Model>& model) {
+    const auto row_major = [](const ov::Output<ov::Node>& out, const ov::Shape& dims) {
+        auto target = ov::op::v0::Constant::create(ov::element::i64,
+                                                   ov::Shape{dims.size()},
+                                                   std::vector<int64_t>(dims.begin(), dims.end()));
+        return std::make_shared<ov::op::v1::Reshape>(out, target, false);
+    };
+    // Route `op`'s [tokens, 1, x] input through [1, tokens, x], and restore
+    // the original output shape for the consumers.
+    const auto wrap = [&](const std::shared_ptr<ov::Node>& op, std::size_t act_idx) {
+        const auto& act = op->get_input_shape(act_idx);
+        const auto consumers = op->output(0).get_target_inputs();
+        op->input(act_idx).replace_source_output(row_major(op->input_value(act_idx), {1, act[0], act[2]}));
+        auto restored = row_major(op, op->get_output_shape(0));
         for (auto consumer : consumers) {
             consumer.replace_source_output(restored);
         }
-        changed = true;
+    };
+
+    bool changed = false;
+    for (const auto& node : model->get_ordered_ops()) {
+        if (node->get_output_size() != 1 || node->get_output_partial_shape(0).is_dynamic()) {
+            continue;
+        }
+        if (auto matmul = ov::as_type_ptr<ov::op::v0::MatMul>(node)) {
+            if (matmul->get_transpose_a()) {
+                continue;
+            }
+            const auto& act = matmul->get_input_partial_shape(0);
+            const auto& rhs = matmul->get_input_partial_shape(1);
+            if (is_token_major(act) && rhs.rank().get_length() == 2) {
+                wrap(matmul, 0);
+                changed = true;
+            } else if (!matmul->get_transpose_b() && act.is_static() && rhs.is_static() &&
+                       act.rank().get_length() == 3 && rhs.rank().get_length() == 3 && act[0].get_length() > 1 &&
+                       act[2].get_length() == 1 && rhs[1].get_length() == 1) {
+                // K = 1: the batched outer product ([tokens, d, 1] x
+                // [tokens, 1, n]) is a broadcast Multiply.
+                auto product = std::make_shared<ov::op::v1::Multiply>(matmul->input_value(0), matmul->input_value(1));
+                ov::replace_node(matmul, product);
+                changed = true;
+            }
+        } else if (ov::is_type<ov::op::v1::Multiply>(node) || ov::is_type<ov::op::v1::Add>(node)) {
+            // Per-channel scale or bias: one side [tokens, 1, x], the other
+            // [1, 1, x] (or lower rank), in either operand order.
+            for (std::size_t act_idx = 0; act_idx < 2; ++act_idx) {
+                const auto& act = node->get_input_partial_shape(act_idx);
+                const auto& scale = node->get_input_partial_shape(1 - act_idx);
+                const bool scale_has_no_token_dims =
+                    scale.is_static() && (scale.rank().get_length() < 3 ||
+                                          (scale[0].get_length() == 1 && scale[1].get_length() == 1));
+                if (is_token_major(act) && scale_has_no_token_dims) {
+                    wrap(node, act_idx);
+                    changed = true;
+                    break;
+                }
+            }
+        }
     }
     if (changed) {
         model->validate_nodes_and_infer_types();
@@ -211,7 +253,7 @@ std::shared_ptr<ov::Model> derive_pa_semi_static_model(const std::shared_ptr<ov:
     auto derived = base_model->clone();
     derived->reshape({{"input_ids", ov::PartialShape{static_cast<int64_t>(token_dim)}},
                       {"position_ids", ov::PartialShape{static_cast<int64_t>(token_dim)}}});
-    relayout_token_major_matmuls(derived);
+    relayout_token_major_ops(derived);
     derived->set_friendly_name(base_model->get_friendly_name() + "_pa_token_" + std::to_string(token_dim));
     return derived;
 }
