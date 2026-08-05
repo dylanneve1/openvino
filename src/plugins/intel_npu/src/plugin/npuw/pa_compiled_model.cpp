@@ -185,23 +185,26 @@ void append_unique_csv_property(ov::AnyMap& config, const std::string& key, cons
     config[key] = current.empty() ? value : current + "," + value;
 }
 
-ov::AnyMap make_partitioned_variant_config(const ov::AnyMap& properties,
-                                           const std::string& pa_device,
-                                           const std::string& weights_bank) {
+}  // anonymous namespace
+
+ov::AnyMap ov::npuw::PACompiledModel::make_variant_config(const ov::AnyMap& properties,
+                                                          const std::string& pa_device,
+                                                          const std::string& weights_bank) {
     auto config = properties;
 
     // This is an inner, ordinary NPUW model. Do not let the PA front-end
-    // select itself recursively when it is compiled.
+    // select itself recursively, and do not let the caller's partitioning
+    // decisions leak into it.
     config.erase(std::string(::intel_npu::NPUW_PA::key()));
     config.erase(std::string(::intel_npu::NPUW_PA_DEVICE::key()));
+    config.erase(std::string(::intel_npu::NPUW_PLAN::key()));
+    config.erase(std::string(::intel_npu::NPUW_SUBMODEL_DEVICE::key()));
 
     // REP honours the explicit single-op isolation below. Fixing only the
     // token-driven inputs makes the rest of the transformer static, while
     // the PA control/cache inputs (and therefore its context) remain dynamic.
     config[std::string(::intel_npu::NPUW_DEVICES::key())] = std::string("NPU,") + pa_device;
     config[std::string(::intel_npu::NPUW_ONLINE_PIPELINE::key())] = std::string("REP");
-    config[std::string(::intel_npu::NPUW_PLAN::key())] = std::string{};
-    config[std::string(::intel_npu::NPUW_SUBMODEL_DEVICE::key())] = std::string{};
     append_unique_csv_property(config,
                                std::string(::intel_npu::NPUW_ONLINE_ISOLATE::key()),
                                "Op:PagedAttentionExtension/pa");
@@ -218,6 +221,8 @@ ov::AnyMap make_partitioned_variant_config(const ov::AnyMap& properties,
     return config;
 }
 
+namespace {
+
 std::map<std::size_t, ov::SoPtr<ov::ICompiledModel>> compile_pa_semi_static_variants(
     const std::shared_ptr<ov::Model>& base_model,
     const std::shared_ptr<const ov::IPlugin>& plugin,
@@ -226,7 +231,7 @@ std::map<std::size_t, ov::SoPtr<ov::ICompiledModel>> compile_pa_semi_static_vari
     const std::string& weights_bank) {
     std::map<std::size_t, ov::SoPtr<ov::ICompiledModel>> variants;
     constexpr std::array<std::size_t, 3> kVariantTokenDims = {1024u, 128u, 1u};
-    const auto variant_config = make_partitioned_variant_config(properties, pa_device, weights_bank);
+    const auto variant_config = ov::npuw::PACompiledModel::make_variant_config(properties, pa_device, weights_bank);
 
     for (const auto token_dim : kVariantTokenDims) {
         auto derived = derive_pa_semi_static_model(base_model, token_dim);
@@ -250,6 +255,11 @@ ov::npuw::PACompiledModel::PreparedState ov::npuw::PACompiledModel::prepare(
     auto device_it = properties.find(device_key);
     std::string device = device_it != properties.end() ? device_it->second.as<std::string>()
                                                        : std::string(::intel_npu::NPUW_PA_DEVICE::defaultValue());
+    // NPU cannot take the PA op itself (dynamic shapes, no PA kernel), and the
+    // partitioned variants avoid it there by construction.
+    OPENVINO_ASSERT(!ov::npuw::util::starts_with(device, "NPU"),
+                    "NPUW_PA_DEVICE must be the PagedAttention fallback device (CPU or GPU), got ",
+                    device);
 
     LOG_INFO("PA: compiling the dynamic PA model 1:1 on " << device);
 
@@ -580,18 +590,20 @@ void ov::npuw::PAInferRequest::run_chunk_locked(ChunkRequest& chunk,
     }
     set("sampled_tokens_indices", make_ctrl_tensor(chunk.inputs.at("sampled_tokens_indices"), local_sti));
 
+    // The logits row count is the number of sampled tokens, so the output port
+    // stays dynamic and the executing request cannot allocate it on its own
+    // (NPUW in particular sizes unset outputs from the port's static shape).
+    // The row count is known right here, so pre-set an exact-sized tensor.
+    const auto& oshape = m_chunked_logits->get_shape();
+    const auto out = ov::get_tensor_impl(
+        ov::Tensor(m_chunked_logits->get_element_type(), ov::Shape{local_sti.size(), oshape.at(1), oshape.at(2)}));
+    chunk.request->set_tensor(chunk.logits, out);
+
     chunk.request->infer();
 
     if (out_rows.empty()) {
         return;
     }
-    const auto out = chunk.request->get_tensor(chunk.logits);
-    OPENVINO_ASSERT(out->get_shape().at(0) == out_rows.size(),
-                    "PA chunk produced ",
-                    out->get_shape().at(0),
-                    " logits row(s), expected ",
-                    out_rows.size());
-    const auto& oshape = m_chunked_logits->get_shape();
     const auto row_bytes = oshape.at(1) * oshape.at(2) * m_chunked_logits->get_element_type().size();
     const auto* src = static_cast<const uint8_t*>(out->data());
     auto* dst = static_cast<uint8_t*>(m_chunked_logits->data());
@@ -620,9 +632,10 @@ void ov::npuw::PAInferRequest::infer_chunked_locked(const Dispatch& d) {
         }
         while (off < seq_len) {
             const auto remaining = seq_len - off;
-            // Largest variant that fits; the 1-token model is only right when
-            // exactly one token remains (the generation case). Everything
-            // else that no variant fits goes through the dynamic model.
+            // Largest variant that fits (m_chunk_requests is ordered largest
+            // first); the 1-token model is only right when exactly one token
+            // remains (the generation case). Everything else that no variant
+            // fits goes through the dynamic model.
             std::size_t pick = 0u;
             for (const auto& [token_dim, _] : m_chunk_requests) {
                 if (static_cast<int64_t>(token_dim) <= remaining && (token_dim > 1u || remaining == 1)) {

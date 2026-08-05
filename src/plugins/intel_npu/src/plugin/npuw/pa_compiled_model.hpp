@@ -113,6 +113,14 @@ public:
                     const std::shared_ptr<const ov::IPlugin>& plugin,
                     const ov::AnyMap& properties);
 
+    // The NPUW configuration the semi-static dispatch variants are compiled
+    // with: caller properties plus the partitioning recipe (static repeated
+    // blocks folded on NPU, every PagedAttention op isolated on pa_device).
+    // Static so the recipe is unit-testable as a pure function.
+    static ov::AnyMap make_variant_config(const ov::AnyMap& properties,
+                                          const std::string& pa_device,
+                                          const std::string& weights_bank);
+
     void export_model(std::ostream& stream) const override;
     std::shared_ptr<const ov::Model> get_runtime_model() const override;
 
