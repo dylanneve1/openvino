@@ -13,6 +13,9 @@
 
 #include "intel_npu/config/npuw.hpp"
 #include "logging.hpp"
+#include "openvino/op/constant.hpp"
+#include "openvino/op/matmul.hpp"
+#include "openvino/op/reshape.hpp"
 #include "openvino/runtime/iplugin.hpp"
 #include "openvino/runtime/make_tensor.hpp"
 #include "openvino/runtime/properties.hpp"
@@ -157,6 +160,50 @@ ov::SoPtr<ov::ITensor> slice_1d(const ov::SoPtr<ov::ITensor>& src, int64_t start
     return out;
 }
 
+// The PA model keeps the flat token count in dimension 0, so every linear
+// layer sees a [tokens, 1, hidden] activation: a batch of single-row GEMVs.
+// The NPU compiler lowers a batched MatMul like that into a batched
+// Convolution it cannot legalize (ConvertBatchedLayerTo1N), so no variant
+// with token_dim > 1 ever compiles for NPU. Both layouts are contiguous and
+// bit-identical, so moving the token count into the row dimension around
+// every weight MatMul ([tokens, 1, h] -> [1, tokens, h]) turns the batch
+// into a single batch-1 GEMM at zero data cost.
+void relayout_token_major_matmuls(const std::shared_ptr<ov::Model>& model) {
+    bool changed = false;
+    for (const auto& node : model->get_ordered_ops()) {
+        auto matmul = ov::as_type_ptr<ov::op::v0::MatMul>(node);
+        if (!matmul || matmul->get_transpose_a()) {
+            continue;
+        }
+        const auto& act_shape = matmul->get_input_partial_shape(0);
+        const auto& out_shape = matmul->get_output_partial_shape(0);
+        if (act_shape.is_dynamic() || out_shape.is_dynamic() || act_shape.rank().get_length() != 3 ||
+            matmul->get_input_partial_shape(1).rank().get_length() != 2) {
+            continue;
+        }
+        const auto tokens = act_shape[0].get_length();
+        if (tokens <= 1 || act_shape[1].get_length() != 1) {
+            continue;
+        }
+
+        const auto row_major = [](const ov::Output<ov::Node>& out, int64_t d0, int64_t d1, int64_t d2) {
+            auto target = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{3}, {d0, d1, d2});
+            return std::make_shared<ov::op::v1::Reshape>(out, target, false);
+        };
+        const auto consumers = matmul->output(0).get_target_inputs();
+        matmul->input(0).replace_source_output(
+            row_major(matmul->input_value(0), 1, tokens, act_shape[2].get_length()));
+        auto restored = row_major(matmul, tokens, 1, out_shape[2].get_length());
+        for (auto consumer : consumers) {
+            consumer.replace_source_output(restored);
+        }
+        changed = true;
+    }
+    if (changed) {
+        model->validate_nodes_and_infer_types();
+    }
+}
+
 std::shared_ptr<ov::Model> derive_pa_semi_static_model(const std::shared_ptr<ov::Model>& base_model,
                                                        std::size_t token_dim) {
     // Only the token-driven inputs get a fixed size (both are 1-D, checked by
@@ -164,6 +211,7 @@ std::shared_ptr<ov::Model> derive_pa_semi_static_model(const std::shared_ptr<ov:
     auto derived = base_model->clone();
     derived->reshape({{"input_ids", ov::PartialShape{static_cast<int64_t>(token_dim)}},
                       {"position_ids", ov::PartialShape{static_cast<int64_t>(token_dim)}}});
+    relayout_token_major_matmuls(derived);
     derived->set_friendly_name(base_model->get_friendly_name() + "_pa_token_" + std::to_string(token_dim));
     return derived;
 }
