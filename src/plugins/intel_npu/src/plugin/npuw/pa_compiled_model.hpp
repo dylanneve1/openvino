@@ -31,6 +31,14 @@ public:
                     const std::shared_ptr<const ov::IPlugin>& plugin,
                     const ov::AnyMap& properties);
 
+    // The NPUW configuration the semi-static dispatch variants are compiled
+    // with: caller properties plus the partitioning recipe (static repeated
+    // blocks folded on NPU, every PagedAttention op isolated on pa_device).
+    // Static so the recipe is unit-testable as a pure function.
+    static ov::AnyMap make_variant_config(const ov::AnyMap& properties,
+                                          const std::string& pa_device,
+                                          const std::string& weights_bank);
+
     // The wrapper adds no I/O of its own -- it exposes the inner model's ports.
     const std::vector<ov::Output<const ov::Node>>& inputs() const override;
     const std::vector<ov::Output<const ov::Node>>& outputs() const override;
@@ -68,7 +76,10 @@ private:
 //
 // Chunks only fix the activation size -- the context stays dynamic, so the
 // KV cache is always addressed through the caller's block tables and no
-// padding is ever written.
+// padding is ever written. Semi-static dispatch models are partitioned by
+// NPUW: static repeating compute/FFN blocks run on NPU and share their weights,
+// while every PagedAttention op remains an individual dynamic subgraph on
+// the PA fallback device.
 class PAInferRequest final : public ov::ISyncInferRequest {
 public:
     PAInferRequest(const std::shared_ptr<const ov::ICompiledModel>& compiled_model,

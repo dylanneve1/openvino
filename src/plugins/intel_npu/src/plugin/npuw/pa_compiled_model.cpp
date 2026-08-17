@@ -169,23 +169,76 @@ std::shared_ptr<ov::Model> derive_pa_semi_static_model(const std::shared_ptr<ov:
     return derived;
 }
 
+void append_unique_csv_property(ov::AnyMap& config, const std::string& key, const std::string& value) {
+    auto it = config.find(key);
+    if (it == config.end()) {
+        config[key] = value;
+        return;
+    }
+
+    const auto current = it->second.as<std::string>();
+    std::istringstream values(current);
+    for (std::string entry; std::getline(values, entry, ',');) {
+        if (entry == value) {
+            return;
+        }
+    }
+    config[key] = current.empty() ? value : current + "," + value;
+}
+
+}  // anonymous namespace
+
+ov::AnyMap ov::npuw::PACompiledModel::make_variant_config(const ov::AnyMap& properties,
+                                                          const std::string& pa_device,
+                                                          const std::string& weights_bank) {
+    auto config = properties;
+
+    // This is an inner, ordinary NPUW model. Do not let the PA front-end
+    // select itself recursively, and do not let the caller's partitioning
+    // decisions leak into it.
+    config.erase(std::string(::intel_npu::NPUW_PA::key()));
+    config.erase(std::string(::intel_npu::NPUW_PLAN::key()));
+    config.erase(std::string(::intel_npu::NPUW_SUBMODEL_DEVICE::key()));
+
+    // REP honours the explicit single-op isolation below. Fixing only the
+    // token-driven inputs makes the rest of the transformer static, while
+    // the PA control/cache inputs (and therefore its context) remain dynamic.
+    config[std::string(::intel_npu::NPUW_DEVICES::key())] = std::string("NPU,") + pa_device;
+    config[std::string(::intel_npu::NPUW_ONLINE_PIPELINE::key())] = std::string("REP");
+    append_unique_csv_property(config,
+                               std::string(::intel_npu::NPUW_ONLINE_ISOLATE::key()),
+                               "Op:PagedAttentionExtension/pa");
+    append_unique_csv_property(config,
+                               std::string(::intel_npu::NPUW_ONLINE_AVOID::key()),
+                               "Op:PagedAttentionExtension/NPU");
+    append_unique_csv_property(config, std::string(::intel_npu::NPUW_ONLINE_KEEP_BLOCKS_TAGGED::key()), "pa");
+
+    // Folding turns the static repeated FFN blocks into calls over one
+    // function body. A common bank name lets all token-size variants reuse
+    // the same immutable weights.
+    config[std::string(::intel_npu::NPUW_FOLD::key())] = std::string("YES");
+    config[std::string(::intel_npu::NPUW_WEIGHTS_BANK::key())] = weights_bank;
+    return config;
+}
+
+namespace {
+
 std::map<std::size_t, ov::SoPtr<ov::ICompiledModel>> compile_pa_semi_static_variants(
     const std::shared_ptr<ov::Model>& base_model,
     const std::shared_ptr<const ov::IPlugin>& plugin,
-    const std::string& device,
-    const ov::AnyMap& inner_config) {
+    const std::string& pa_device,
+    const ov::AnyMap& properties,
+    const std::string& weights_bank) {
     std::map<std::size_t, ov::SoPtr<ov::ICompiledModel>> variants;
     constexpr std::array<std::size_t, 3> kVariantTokenDims = {1024u, 128u, 1u};
+    const auto variant_config = ov::npuw::PACompiledModel::make_variant_config(properties, pa_device, weights_bank);
 
     for (const auto token_dim : kVariantTokenDims) {
         auto derived = derive_pa_semi_static_model(base_model, token_dim);
-        auto compiled = plugin->get_core()->compile_model(derived, device, inner_config);
-        OPENVINO_ASSERT(compiled != nullptr,
-                        "PA semi-static derivation failed to compile token_dim=",
-                        token_dim,
-                        " on ",
-                        device);
-        LOG_INFO("PA: compiled semi-static variant token_dim=" << token_dim << " on " << device);
+        ov::SoPtr<ov::ICompiledModel> compiled{
+            std::make_shared<ov::npuw::CompiledModel>(derived, plugin, variant_config)};
+        LOG_INFO("PA: compiled partitioned semi-static variant token_dim="
+                 << token_dim << " through NPUW; PagedAttention target=" << pa_device);
         variants.emplace(token_dim, std::move(compiled));
     }
 
@@ -255,7 +308,13 @@ ov::npuw::PACompiledModel::PACompiledModel(const std::shared_ptr<ov::Model>& mod
     // contract; anything else (VLM, M-RoPE, per-layer block tables, ...) runs
     // 1:1 on the dynamic model, so don't spend compile time on variants.
     if (is_chunkable_pa_model(model)) {
-        m_semi_static_models = compile_pa_semi_static_variants(model, plugin, device, inner_config);
+        // One bank shared by all token-size variants; a caller-supplied
+        // NPUW_WEIGHTS_BANK is honoured instead.
+        const auto bank_key = std::string(::intel_npu::NPUW_WEIGHTS_BANK::key());
+        const auto bank_it = properties.find(bank_key);
+        const auto configured_bank = bank_it == properties.end() ? std::string{} : bank_it->second.as<std::string>();
+        const auto weights_bank = configured_bank.empty() ? ov::npuw::util::generate_random_string() : configured_bank;
+        m_semi_static_models = compile_pa_semi_static_variants(model, plugin, device, properties, weights_bank);
     } else {
         LOG_INFO("PA: model is outside the chunkable flat-token contract; every dispatch runs 1:1");
     }
