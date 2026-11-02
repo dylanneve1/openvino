@@ -295,6 +295,9 @@ bool is_pa_kv_cache_name(const std::string& input_name);
 
 // One-line tensor digest for log traces: LOG_VERB("x: " << TensorBrief{t}).
 // Tensors past kMaxStats elements, such as KV cache pools, print their shape only.
+// A device tensor (GPU memory, for one) has no host pointer: data() throws.
+bool is_remote(const ov::SoPtr<ov::ITensor>& tensor);
+
 struct TensorBrief {
     static constexpr std::size_t kMaxInline = 16u;
     static constexpr std::size_t kMaxStats = 1u << 20;
