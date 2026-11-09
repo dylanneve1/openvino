@@ -7,6 +7,7 @@
 #include <limits>
 #include <memory>
 #include <set>
+#include <unordered_set>
 
 #include "../logging.hpp"
 #include "../npuw_transformations/detect_causal_mask.hpp"
@@ -21,6 +22,7 @@
 #include "openvino/op/slice.hpp"
 #include "openvino/op/util/op_types.hpp"
 #include "openvino/pass/validate.hpp"
+#include "openvino/runtime/device_id_parser.hpp"
 #include "openvino/runtime/make_tensor.hpp"
 #include "openvino/util/common_util.hpp"
 #include "openvino/util/xml_parse_utils.hpp"
@@ -429,6 +431,7 @@ public:
 
     // Partitioning to subgraph mapping
     void identifySubgraphs();
+    void keepGpuLinksF32(const std::unordered_map<std::string, std::shared_ptr<ov::Node>>& node_id_cache);
 
     // Function folding subroutines
     enum class FunctionPipelineType { FOLD, CWAI };
@@ -493,6 +496,103 @@ struct Precalculated_Bound_Const {
     static constexpr const char* name = "NPUW::Precalculated_Bound_Const";
 };
 
+// F16IC lowers the links between subgraphs to f16 for NPU. The links of a
+// subgraph that lands on GPU stay f32: at f16 inference precision the GPU
+// drops the Convert F16IC puts on such an input and works on the input
+// buffer itself, which it does not handle in every case (a fully connected
+// layer that adds a residual in place into a subgraph input crashes). The
+// links are kept f32 through the high-precision tag, the same way in every
+// instance of a repeated block, so the blocks still fold.
+void Partitioner::keepGpuLinksF32(const std::unordered_map<std::string, std::shared_ptr<ov::Node>>& node_id_cache) {
+    const auto devices = ov::DeviceIDParser::get_hetero_devices(cfg.get<::intel_npu::NPUW_DEVICES>());
+    const auto forced =
+        ov::npuw::util::parse_submodel_devices(cfg.get<::intel_npu::NPUW_SUBMODEL_DEVICE>(), ens.groups.size());
+    // The device a subgraph lands on, as the compiled model picks it.
+    const auto lands_on_gpu = [&](std::size_t idx, const Group& group) {
+        std::string device;
+        const auto forced_it = forced.find(idx);
+        if (forced_it != forced.end() &&
+            std::find(devices.begin(), devices.end(), forced_it->second) != devices.end()) {
+            device = forced_it->second;
+        } else {
+            const auto avoid = ov::util::split(group.avoid_list, ',');
+            for (const auto& candidate : devices) {
+                if (std::find(avoid.begin(), avoid.end(), candidate) == avoid.end()) {
+                    device = candidate;
+                    break;
+                }
+            }
+        }
+        return ov::npuw::util::starts_with(device, "GPU");
+    };
+
+    // A layer and the same layer in the other instances of its repeated block.
+    std::unordered_map<std::string, const RepeatedBlock::MatchedLayers*> bank_of;
+    for (const auto& [id, block] : ens.repeated) {
+        for (const auto& bank : block.matches) {
+            for (const auto& name : bank) {
+                bank_of[name] = &bank;
+            }
+        }
+    }
+    const auto instances = [&](const std::shared_ptr<ov::Node>& node) -> std::vector<std::shared_ptr<ov::Node>> {
+        const auto it = bank_of.find(node->get_friendly_name());
+        if (it == bank_of.end()) {
+            return {node};
+        }
+        std::vector<std::shared_ptr<ov::Node>> nodes;
+        for (const auto& name : *it->second) {
+            nodes.push_back(node_id_cache.at(name));
+        }
+        return nodes;
+    };
+
+    std::unordered_set<ov::Output<ov::Node>> pinned;
+    std::vector<ov::Output<ov::Node>> queue;
+    const auto pin = [&](const ov::Output<ov::Node>& output) {
+        for (const auto& node : instances(output.get_node_shared_ptr())) {
+            const auto same_output = node->output(output.get_index());
+            if (pinned.insert(same_output).second) {
+                queue.push_back(same_output);
+            }
+        }
+    };
+    for (std::size_t idx = 0; idx < ens.groups.size(); ++idx) {
+        const auto& group = ens.groups[idx];
+        if (!lands_on_gpu(idx, group)) {
+            continue;
+        }
+        for (const auto& layer : group.all_layers) {
+            const auto& node = node_id_cache.at(layer);
+            for (const auto& output : node->outputs()) {
+                pin(output);
+            }
+            for (const auto& input : node->input_values()) {
+                pin(input);
+            }
+        }
+    }
+    // An instance that takes a pinned link makes its siblings take theirs in f32 too.
+    while (!queue.empty()) {
+        const auto output = queue.back();
+        queue.pop_back();
+        for (const auto& reader : output.get_target_inputs()) {
+            for (const auto& sibling : instances(reader.get_node()->shared_from_this())) {
+                pin(sibling->input_value(reader.get_index()));
+            }
+        }
+    }
+
+    for (auto output : pinned) {
+        ov::npuw::util::HighPrecisionAttr attr;
+        attr.compute_precision_type = ov::element::f32;
+        output.get_rt_info()[ov::npuw::util::HighPrecisionAttr::get_type_info_static()] = attr;
+    }
+    if (!pinned.empty()) {
+        LOG_INFO("F16IC: kept " << pinned.size() << " tensors in f32 around the subgraphs that run on GPU");
+    }
+}
+
 void Partitioner::identifySubgraphs() {
     LOG_INFO("Identifying subgraphs for model " << model->get_friendly_name() << "...");
     LOG_BLOCK();
@@ -511,6 +611,9 @@ void Partitioner::identifySubgraphs() {
         node_id_cache[node_ptr->get_friendly_name()] = node_ptr;
     }
     LOG_INFO("Caching done: " << node_id_cache.size() << " layers.");
+    if (connect_in_f16) {
+        keepGpuLinksF32(node_id_cache);
+    }
 
     // Accumulate knowledge about known OV layers when walking
     // over a topologically-sorted list.

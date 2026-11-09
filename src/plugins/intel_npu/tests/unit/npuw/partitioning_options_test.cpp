@@ -450,6 +450,61 @@ TEST(PartitioningOptionsTest, FoldCreatesFunctionCallsForRepeatedBlocks) {
         }));
 }
 
+// An f32 residual chain: repeated blocks of a weight MatMul, Relu, Multiply,
+// Sigmoid and a residual Add, then a MatMul tail.
+std::shared_ptr<ov::Model> build_f32_residual_model(std::size_t repetitions) {
+    auto input = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 1, 40});
+    ov::Output<ov::Node> x = input;
+    for (std::size_t i = 0; i < repetitions; ++i) {
+        auto weight = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{40, 40}, {0.01f * (i + 1)});
+        auto scale = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{1, 1, 40}, {0.5f});
+        auto matmul = std::make_shared<ov::op::v0::MatMul>(x, weight, false, true);
+        auto relu = std::make_shared<ov::op::v0::Relu>(matmul);
+        auto multiply = std::make_shared<ov::op::v1::Multiply>(relu, scale);
+        auto sigmoid = std::make_shared<ov::op::v0::Sigmoid>(multiply);
+        x = std::make_shared<ov::op::v1::Add>(sigmoid, x);
+    }
+    auto head = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{16, 40}, {0.1f});
+    auto logits = std::make_shared<ov::op::v0::MatMul>(x, head, false, true);
+    auto result = std::make_shared<ov::op::v0::Result>(logits);
+    return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{input});
+}
+
+// The parameters a subgraph takes: its own, or its function body's.
+ov::ParameterVector subgraph_params(const ov::npuw::Partitioning& partitioning, const ov::npuw::Subgraph& sg) {
+    if (sg._funcall.empty()) {
+        return sg._parameters;
+    }
+    return partitioning.functions.at(sg._funcall)._model->get_parameters();
+}
+
+bool takes_f16(const ov::ParameterVector& params) {
+    return std::any_of(params.begin(), params.end(), [](const auto& p) {
+        return p->get_element_type() == ov::element::f16;
+    });
+}
+
+TEST(PartitioningOptionsTest, F16ICKeepsTheLinksOfAGpuSubgraphInF32) {
+    const auto base = ::intel_npu::Config::ConfigMap{{"NPUW_FOLD", "YES"},
+                                                     {"NPUW_ONLINE_KEEP_BLOCK_SIZE", "4"},
+                                                     {"NPUW_ONLINE_KEEP_BLOCKS", "2"},
+                                                     {"NPUW_F16IC", "YES"},
+                                                     {"NPUW_DEVICES", "NPU,GPU"}};
+    const auto on_npu = ov::npuw::getPartitioning(build_f32_residual_model(12), make_cfg(base));
+    ASSERT_FALSE(on_npu.functions.empty());
+    ASSERT_GT(on_npu.subgraphs.size(), 1u);
+    const bool any_f16 = std::any_of(on_npu.subgraphs.begin(), on_npu.subgraphs.end(), [&](const auto& sg) {
+        return takes_f16(subgraph_params(on_npu, sg));
+    });
+    ASSERT_TRUE(any_f16) << "F16IC lowers the links between NPU subgraphs";
+
+    auto with_gpu_tail = base;
+    with_gpu_tail["NPUW_SUBMODEL_DEVICE"] = "last:GPU";
+    const auto on_gpu = ov::npuw::getPartitioning(build_f32_residual_model(12), make_cfg(with_gpu_tail));
+    ASSERT_FALSE(on_gpu.functions.empty()) << "the repeated blocks still fold";
+    EXPECT_FALSE(takes_f16(subgraph_params(on_gpu, on_gpu.subgraphs.back())));
+}
+
 TEST(PartitioningOptionsTest, CwaiCreatesFunctionCallsForRepeatedBlocks) {
     auto cfg = make_cfg({{"NPUW_CWAI", "YES"}, {"NPUW_ONLINE_KEEP_BLOCK_SIZE", "4"}});
     auto partitioning = ov::npuw::getPartitioning(build_repeated_model(10), cfg);
