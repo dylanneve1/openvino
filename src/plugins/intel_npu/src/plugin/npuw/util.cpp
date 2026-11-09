@@ -1213,8 +1213,13 @@ std::shared_ptr<ov::Model> ov::npuw::util::with_dynamic_pa_tokens(const std::sha
             continue;
         }
         // Inputs 0, 1 and 2 are the queries, keys and values, [tokens, heads * head_size].
+        // With F16IC they come from the block's f16 parameters through a Convert.
         for (std::size_t i = 0; i < 3; ++i) {
-            auto param = ov::as_type_ptr<ov::op::v0::Parameter>(node->get_input_node_shared_ptr(i));
+            auto source = node->get_input_node_shared_ptr(i);
+            while (ov::is_type<ov::op::v0::Convert>(source)) {
+                source = source->get_input_node_shared_ptr(0);
+            }
+            auto param = ov::as_type_ptr<ov::op::v0::Parameter>(source);
             if (!param) {
                 continue;
             }

@@ -306,7 +306,8 @@ TEST(PACompiledModelEndToEnd, RejectsAPADeviceOtherThanCPUOrGPU) {
 
 // The PA block of a variant as NPUW partitions it: the PA op alone, its
 // queries, keys and values coming in as static [tokens, heads * head_size].
-std::shared_ptr<ov::Model> make_pa_block(std::size_t tokens) {
+// With f16ic they come in as f16 and are converted, as F16IC does.
+std::shared_ptr<ov::Model> make_pa_block(std::size_t tokens, bool f16ic = false) {
     auto model = make_pipeline_pa_model();
     std::shared_ptr<ov::Node> pa;
     for (const auto& op : model->get_ordered_ops()) {
@@ -325,11 +326,21 @@ std::shared_ptr<ov::Model> make_pa_block(std::size_t tokens) {
         if (i < 3) {
             shape[0] = static_cast<int64_t>(tokens);
         }
-        auto param = std::make_shared<ov::op::v0::Parameter>(source.get_element_type(), shape);
-        pa->input(i).replace_source_output(param);
+        const bool convert = f16ic && i < 3;
+        auto param =
+            std::make_shared<ov::op::v0::Parameter>(convert ? ov::element::f16 : source.get_element_type(), shape);
+        if (convert) {
+            pa->input(i).replace_source_output(std::make_shared<ov::op::v0::Convert>(param, source.get_element_type()));
+        } else {
+            pa->input(i).replace_source_output(param);
+        }
         params.push_back(param);
     }
-    auto block = std::make_shared<ov::Model>(ov::OutputVector{pa->output(0)}, params);
+    ov::Output<ov::Node> out = pa->output(0);
+    if (f16ic) {
+        out = std::make_shared<ov::op::v0::Convert>(out, ov::element::f16);
+    }
+    auto block = std::make_shared<ov::Model>(ov::OutputVector{out}, params);
     block->validate_nodes_and_infer_types();
     return block;
 }
@@ -350,6 +361,20 @@ TEST(PADynamicTokens, RelaxesTheTokenCountAndKeepsTheOutputStatic) {
     EXPECT_TRUE(ov::is_type<ov::op::v1::Reshape>(relaxed->get_results()[0]->get_input_node_ptr(0)));
     // The original block is left as it was.
     EXPECT_TRUE(block->get_parameters()[0]->get_partial_shape().is_static());
+}
+
+TEST(PADynamicTokens, RelaxesTheTokenCountThroughTheF16ICConverts) {
+    const auto block = make_pa_block(16, /*f16ic=*/true);
+    const auto out_shape = block->output(0).get_partial_shape();
+    ASSERT_TRUE(out_shape.is_static());
+
+    const auto relaxed = ov::npuw::util::with_dynamic_pa_tokens(block);
+    for (std::size_t i = 0; i < 3; ++i) {
+        const auto& param = relaxed->get_parameters()[i];
+        EXPECT_EQ(param->get_element_type(), ov::element::f16) << "input " << i;
+        EXPECT_TRUE(param->get_partial_shape()[0].is_dynamic()) << "input " << i;
+    }
+    EXPECT_EQ(relaxed->output(0).get_partial_shape(), out_shape);
 }
 
 TEST(PADynamicTokens, LeavesAModelWithoutPAAlone) {
