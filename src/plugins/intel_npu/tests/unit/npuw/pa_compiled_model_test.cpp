@@ -26,6 +26,7 @@
 #include "openvino/op/multiply.hpp"
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/reshape.hpp"
+#include "openvino/op/unsqueeze.hpp"
 #include "openvino/op/util/op_types.hpp"
 #include "openvino/pass/graph_rewrite.hpp"
 #include "openvino/pass/manager.hpp"
@@ -472,8 +473,9 @@ TEST(PARelayoutTokenMajor, LeavesTheOneTokenVariantAlone) {
     EXPECT_EQ(model->get_ops().size(), ops);
 }
 
-// Tied embeddings: one decompressed table feeds the embedding Gather and the
-// LM head MatMul.
+// Tied embeddings as the PA model has them: one decompressed table feeds the
+// embedding Gather and the LM head MatMul, and the 1-D token ids reach the
+// Gather through an Unsqueeze.
 std::shared_ptr<ov::Model> make_tied_embedding_model() {
     std::vector<uint8_t> table(32 * 16);
     std::vector<float> scales(32);
@@ -490,8 +492,9 @@ std::shared_ptr<ov::Model> make_tied_embedding_model() {
 
     auto ids = std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::PartialShape{4});
     auto hidden = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{2, 16});
+    auto ids_2d = std::make_shared<ov::op::v0::Unsqueeze>(ids, ov::op::v0::Constant::create(ov::element::i64, {}, {1}));
     auto embed = std::make_shared<ov::op::v8::Gather>(decompressed,
-                                                      ids,
+                                                      ids_2d,
                                                       ov::op::v0::Constant::create(ov::element::i64, {}, {0}));
     auto lm_head = std::make_shared<ov::op::v0::MatMul>(hidden, decompressed, false, true);
     return std::make_shared<ov::Model>(ov::OutputVector{embed, lm_head}, ov::ParameterVector{ids, hidden});

@@ -1165,7 +1165,9 @@ DQLiftGatherAsymCW::DQLiftGatherAsymCW() {
     auto qcvtm = opp::wrap_type<ov::op::v0::Convert>({qmuls});
 
     auto pids = opp::wrap_type<ov::op::v0::Parameter>();
-    auto cvtids = opp::optional<ov::op::v0::Convert>({pids->output(0)});
+    // The PA model has 1-D token ids, which reach the Gather through an Unsqueeze
+    auto unsqids = opp::optional<ov::op::v0::Unsqueeze>({pids->output(0), opp::any_input()});
+    auto cvtids = opp::optional<ov::op::v0::Convert>({unsqids->output(0)});
     auto gather = opp::wrap_type<ov::op::v8::Gather>({qcvtm, cvtids, opp::any_input()});
 
     // Note: Use [=] to make sure the above objects stay alive in the callback
@@ -1176,7 +1178,7 @@ DQLiftGatherAsymCW::DQLiftGatherAsymCW() {
         auto matched_out_w = node_to_output.at(qweight);
         auto matched_out_z = node_to_output.at(qzerop);
         auto matched_out_s = node_to_output.at(qcoeff);
-        auto matched_out_ids = uat::_(node_to_output).at_or_at(cvtids, pids);
+        auto matched_out_ids = uat::_(node_to_output).at_or_at_or_at(cvtids, unsqids, pids);
         const auto& matched_out_gather = node_to_output.at(gather);
 
         const bool has_weight_shift = node_to_output.count(qshiftw) != 0;
@@ -1228,7 +1230,9 @@ DQLiftGatherSymCW::DQLiftGatherSymCW() {
     auto qcvtm = opp::optional<ov::op::v0::Convert>({qmuls->output(0)});
 
     auto pids = opp::wrap_type<ov::op::v0::Parameter>();
-    auto cvtids = opp::optional<ov::op::v0::Convert>({pids->output(0)});
+    // The PA model has 1-D token ids, which reach the Gather through an Unsqueeze
+    auto unsqids = opp::optional<ov::op::v0::Unsqueeze>({pids->output(0), opp::any_input()});
+    auto cvtids = opp::optional<ov::op::v0::Convert>({unsqids->output(0)});
     auto gather = opp::wrap_type<ov::op::v8::Gather>({qcvtm, cvtids, opp::any_input()});
 
     // Note: Use [=] to make sure the above objects stay alive in the callback
@@ -1237,7 +1241,7 @@ DQLiftGatherSymCW::DQLiftGatherSymCW() {
 
         auto matched_out_w = node_to_output.at(qweight);
         auto matched_out_s = node_to_output.at(qcoeff);
-        auto matched_out_ids = uat::_(node_to_output).at_or_at(cvtids, pids);
+        auto matched_out_ids = uat::_(node_to_output).at_or_at_or_at(cvtids, unsqids, pids);
         const auto& matched_out_gather = node_to_output.at(gather);
 
         // Create new gathers on W and S, connect respectively
@@ -1284,7 +1288,9 @@ DQLiftGatherCW::DQLiftGatherCW() {
     auto qcvtw = opp::wrap_type<ov::op::v0::Convert>({qweight});
 
     auto pids = opp::wrap_type<ov::op::v0::Parameter>();
-    auto cvtids = opp::optional<ov::op::v0::Convert>({pids->output(0)});
+    // The PA model has 1-D token ids, which reach the Gather through an Unsqueeze
+    auto unsqids = opp::optional<ov::op::v0::Unsqueeze>({pids->output(0), opp::any_input()});
+    auto cvtids = opp::optional<ov::op::v0::Convert>({unsqids->output(0)});
     auto gather = opp::wrap_type<ov::op::v8::Gather>({qcvtw, cvtids, opp::any_input()});
 
     // Note: Use [=] to make sure the above objects stay alive in the callback
@@ -1292,7 +1298,7 @@ DQLiftGatherCW::DQLiftGatherCW() {
         auto& node_to_output = m.get_pattern_value_map();
 
         auto matched_out_w = node_to_output.at(qweight);
-        auto matched_out_ids = uat::_(node_to_output).at_or_at(cvtids, pids);
+        auto matched_out_ids = uat::_(node_to_output).at_or_at_or_at(cvtids, unsqids, pids);
         const auto& matched_out_gather = node_to_output.at(gather);
 
         // Create new gathers on W, connect respectively
@@ -1323,7 +1329,9 @@ DQLiftGatherSymGQ::DQLiftGatherSymGQ() {
     auto qcvtm = opp::wrap_type<ov::op::v0::Convert>({qreshp});
 
     auto pids = opp::wrap_type<ov::op::v0::Parameter>();
-    auto cvtids = opp::optional<ov::op::v0::Convert>({pids->output(0)});
+    // The PA model has 1-D token ids, which reach the Gather through an Unsqueeze
+    auto unsqids = opp::optional<ov::op::v0::Unsqueeze>({pids->output(0), opp::any_input()});
+    auto cvtids = opp::optional<ov::op::v0::Convert>({unsqids->output(0)});
     auto gather = opp::wrap_type<ov::op::v8::Gather>({qcvtm, cvtids, opp::any_input()});
 
     // Note: Use [=] to make sure the above objects stay alive in the callback
@@ -1333,7 +1341,7 @@ DQLiftGatherSymGQ::DQLiftGatherSymGQ() {
         // Create new gathers on W and S respectively
         auto matched_out_w = node_to_output.at(qweight);
         auto matched_out_s = node_to_output.at(qcoeff);
-        auto matched_out_ids = uat::_(node_to_output).at_or_at(cvtids, pids);
+        auto matched_out_ids = uat::_(node_to_output).at_or_at_or_at(cvtids, unsqids, pids);
         const auto& matched_out_gather = node_to_output.at(gather);
 
         auto matched_gather_shape = matched_out_gather.get_shape();
