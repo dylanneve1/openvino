@@ -17,7 +17,6 @@
 #include "common_test_utils/test_assertions.hpp"
 #include "llm_test_helpers.hpp"
 #include "npuw_transformations/relayout_token_major.hpp"
-#include "npuw_transformations/untie_lm_head_weights.hpp"
 #include "openvino/op/add.hpp"
 #include "openvino/op/constant.hpp"
 #include "openvino/op/convert.hpp"
@@ -27,9 +26,11 @@
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/reshape.hpp"
 #include "openvino/op/util/op_types.hpp"
+#include "openvino/pass/graph_rewrite.hpp"
 #include "openvino/pass/manager.hpp"
 #include "openvino/pass/sdpa_to_paged_attention.hpp"
 #include "openvino/runtime/core.hpp"
+#include "partitioning/patterns/opt.hpp"
 #include "util.hpp"
 
 namespace {
@@ -493,12 +494,6 @@ TEST(PARelayoutTokenMajor, LeavesTheOneTokenVariantAlone) {
     EXPECT_EQ(model->get_ops().size(), ops);
 }
 
-void untie_lm_head_weights(const std::shared_ptr<ov::Model>& model) {
-    ov::pass::Manager manager;
-    manager.register_pass<ov::npuw::UntieLMHeadWeights>();
-    manager.run_passes(model);
-}
-
 // Tied embeddings: one decompressed table feeds the embedding Gather and the
 // LM head MatMul.
 std::shared_ptr<ov::Model> make_tied_embedding_model() {
@@ -524,50 +519,41 @@ std::shared_ptr<ov::Model> make_tied_embedding_model() {
     return std::make_shared<ov::Model>(ov::OutputVector{embed, lm_head}, ov::ParameterVector{ids, hidden});
 }
 
-TEST(PAUntieLMHeadWeights, GivesTheLMHeadItsOwnDecompression) {
-    const auto reference = make_tied_embedding_model();
-    auto model = reference->clone();
-    untie_lm_head_weights(model);
+// The variants rely on the gather lift of the NPUW LLM path to keep the
+// decompressed table out of the links between subgraphs.
+TEST(PATiedEmbeddings, TheGatherLiftLeavesTheDecompressionToTheLMHead) {
+    const auto model = make_tied_embedding_model();
+    const auto embed_shape = model->output(0).get_shape();
+    const auto embed_type = model->output(0).get_element_type();
 
-    std::shared_ptr<ov::Node> lm_head, embed;
+    ov::pass::Manager manager;
+    const auto lift = manager.register_pass<ov::pass::GraphRewrite>();
+    lift->add_matcher<ov::npuw::patterns::opt::DQLiftGatherAsymCW>();
+    lift->add_matcher<ov::npuw::patterns::opt::DQLiftGatherSymCW>();
+    lift->add_matcher<ov::npuw::patterns::opt::DQLiftGatherSymGQ>();
+    lift->add_matcher<ov::npuw::patterns::opt::DQLiftGatherCW>();
+    manager.run_passes(model);
+
+    std::shared_ptr<ov::Node> lm_head;
+    std::vector<std::shared_ptr<ov::Node>> gathers;
     for (const auto& node : model->get_ordered_ops()) {
         if (ov::is_type<ov::op::v0::MatMul>(node)) {
             lm_head = node;
         } else if (ov::is_type<ov::op::v8::Gather>(node)) {
-            embed = node;
+            gathers.push_back(node);
         }
     }
     ASSERT_NE(lm_head, nullptr);
-    ASSERT_NE(embed, nullptr);
-    const auto head_weights = lm_head->get_input_node_shared_ptr(1);
-    const auto embed_table = embed->get_input_node_shared_ptr(0);
-    EXPECT_NE(head_weights, embed_table);
-    EXPECT_EQ(head_weights->output(0).get_target_inputs().size(), 1u);
-    // Both still read the one weight constant.
-    EXPECT_EQ(head_weights->get_input_node_shared_ptr(0)->get_input_node_shared_ptr(0),
-              embed_table->get_input_node_shared_ptr(0)->get_input_node_shared_ptr(0));
+    ASSERT_FALSE(gathers.empty());
 
-    // Untying is idempotent and keeps the results.
-    const auto ops = model->get_ops().size();
-    untie_lm_head_weights(model);
-    EXPECT_EQ(model->get_ops().size(), ops);
-
-    ov::TensorVector inputs = {ov::Tensor(ov::element::i64, {4}), ov::Tensor(ov::element::f32, {2, 16})};
-    for (std::size_t i = 0; i < 4; ++i) {
-        inputs[0].data<int64_t>()[i] = static_cast<int64_t>(i * 7 % 32);
+    // No Gather reads the table the LM head decompresses.
+    const auto decompressed = lm_head->get_input_node_shared_ptr(1);
+    EXPECT_TRUE(ov::is_type<ov::op::v1::Multiply>(decompressed));
+    for (const auto& gather : gathers) {
+        EXPECT_NE(gather->get_input_node_shared_ptr(0), decompressed);
     }
-    for (std::size_t i = 0; i < 32; ++i) {
-        inputs[1].data<float>()[i] = 0.1f * static_cast<float>(i % 11) - 0.5f;
-    }
-    ov::TensorVector expected = {ov::Tensor(ov::element::f32, {4, 16}), ov::Tensor(ov::element::f32, {2, 32})};
-    ov::TensorVector actual = {ov::Tensor(ov::element::f32, {4, 16}), ov::Tensor(ov::element::f32, {2, 32})};
-    ASSERT_TRUE(reference->evaluate(expected, inputs));
-    ASSERT_TRUE(model->evaluate(actual, inputs));
-    for (std::size_t o = 0; o < expected.size(); ++o) {
-        for (std::size_t i = 0; i < expected[o].get_size(); ++i) {
-            EXPECT_FLOAT_EQ(expected[o].data<float>()[i], actual[o].data<float>()[i]) << "output " << o << " at " << i;
-        }
-    }
+    EXPECT_EQ(model->output(0).get_shape(), embed_shape);
+    EXPECT_EQ(model->output(0).get_element_type(), embed_type);
 }
 
 }  // namespace

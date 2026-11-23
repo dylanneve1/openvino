@@ -20,11 +20,12 @@
 #include "intel_npu/config/npuw.hpp"
 #include "logging.hpp"
 #include "npuw_transformations/relayout_token_major.hpp"
-#include "npuw_transformations/untie_lm_head_weights.hpp"
+#include "openvino/pass/graph_rewrite.hpp"
 #include "openvino/pass/manager.hpp"
 #include "openvino/runtime/iplugin.hpp"
 #include "openvino/runtime/make_tensor.hpp"
 #include "openvino/runtime/properties.hpp"
+#include "partitioning/patterns/opt.hpp"
 #include "util.hpp"
 
 namespace {
@@ -124,7 +125,18 @@ std::shared_ptr<ov::Model> derive_pa_semi_static_model(const std::shared_ptr<ov:
     derived->reshape({{"input_ids", ov::PartialShape{static_cast<int64_t>(chunk_size)}},
                       {"position_ids", ov::PartialShape{static_cast<int64_t>(chunk_size)}}});
     ov::pass::Manager manager("PA variant");
-    manager.register_pass<ov::npuw::UntieLMHeadWeights>();
+    // A model with tied embeddings decompresses one weight table for both the
+    // embedding Gather and the LM head. Partitioned as is, the decompression
+    // lands with the Gather, and the tail takes the whole decompressed table as
+    // an input every inference. The gather lift of the NPUW LLM path makes the
+    // Gather read the weights itself, which leaves the decompression to the LM
+    // head alone. NPUW runs it only when every subgraph is a function, which
+    // the variants cannot ask for.
+    const auto lift = manager.register_pass<ov::pass::GraphRewrite>();
+    lift->add_matcher<ov::npuw::patterns::opt::DQLiftGatherAsymCW>();
+    lift->add_matcher<ov::npuw::patterns::opt::DQLiftGatherSymCW>();
+    lift->add_matcher<ov::npuw::patterns::opt::DQLiftGatherSymGQ>();
+    lift->add_matcher<ov::npuw::patterns::opt::DQLiftGatherCW>();
     manager.register_pass<ov::npuw::RelayoutTokenMajor>(chunk_size);
     manager.run_passes(derived);
     derived->set_friendly_name(base_model->get_friendly_name() + "_pa_token_" + std::to_string(chunk_size));
