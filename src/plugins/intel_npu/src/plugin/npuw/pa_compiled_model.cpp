@@ -132,12 +132,17 @@ std::shared_ptr<ov::Model> derive_pa_semi_static_model(const std::shared_ptr<ov:
     // Gather read the weights itself, which leaves the decompression to the LM
     // head alone. NPUW runs it only when every subgraph is a function, which
     // the variants cannot ask for.
-    const auto lift = manager.register_pass<ov::pass::GraphRewrite>();
-    lift->add_matcher<ov::npuw::patterns::opt::DQLiftGatherAsymCW>();
-    lift->add_matcher<ov::npuw::patterns::opt::DQLiftGatherSymCW>();
-    lift->add_matcher<ov::npuw::patterns::opt::DQLiftGatherSymGQ>();
-    lift->add_matcher<ov::npuw::patterns::opt::DQLiftGatherCW>();
-    manager.register_pass<ov::npuw::RelayoutTokenMajor>(chunk_size);
+    // EXPERIMENT ONLY, not for the PR: switches to compare with and without each step.
+    if (std::getenv("OPENVINO_NPUW_PA_NO_LIFT") == nullptr) {
+        const auto lift = manager.register_pass<ov::pass::GraphRewrite>();
+        lift->add_matcher<ov::npuw::patterns::opt::DQLiftGatherAsymCW>();
+        lift->add_matcher<ov::npuw::patterns::opt::DQLiftGatherSymCW>();
+        lift->add_matcher<ov::npuw::patterns::opt::DQLiftGatherSymGQ>();
+        lift->add_matcher<ov::npuw::patterns::opt::DQLiftGatherCW>();
+    }
+    if (std::getenv("OPENVINO_NPUW_PA_NO_RELAYOUT") == nullptr) {
+        manager.register_pass<ov::npuw::RelayoutTokenMajor>(chunk_size);
+    }
     manager.run_passes(derived);
     derived->set_friendly_name(base_model->get_friendly_name() + "_pa_token_" + std::to_string(chunk_size));
     return derived;
