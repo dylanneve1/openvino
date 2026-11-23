@@ -5,7 +5,9 @@
 #include "pa_dispatch.hpp"
 
 #include <algorithm>
+#include <functional>
 
+#include "intel_npu/config/config.hpp"
 #include "openvino/core/except.hpp"
 
 void ov::npuw::pa::validate_dispatch(const Dispatch& d, std::size_t block_size, std::size_t dispatch_idx) {
@@ -82,4 +84,15 @@ bool ov::npuw::pa::variants_serve(const Dispatch& dispatch, const std::vector<st
         }
     }
     return false;
+}
+
+std::vector<std::size_t> ov::npuw::pa::parse_chunk_sizes(const std::string& option) {
+    auto sizes = ::intel_npu::OptionParser<std::vector<std::size_t>>::parse(option);
+    OPENVINO_ASSERT(!sizes.empty() && std::find(sizes.begin(), sizes.end(), 0u) == sizes.end(),
+                    "NPUW_PA_CHUNK_SIZES is a list of token counts above zero, got \"",
+                    option,
+                    "\"");
+    std::sort(sizes.begin(), sizes.end(), std::greater<>());
+    sizes.erase(std::unique(sizes.begin(), sizes.end()), sizes.end());
+    return sizes;
 }

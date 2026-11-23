@@ -5,7 +5,6 @@
 #include "pa_compiled_model.hpp"
 
 #include <algorithm>
-#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -47,8 +46,6 @@ std::size_t pa_block_size(const std::string& device, const ov::SoPtr<ov::ICompil
     }
     OPENVINO_THROW("PA: the model has no value cache input");
 }
-
-constexpr std::array<std::size_t, 3> kChunkSizes = {1024u, 128u, 1u};
 
 // The PA op takes its controls as i32; the lm_head gather index is i64.
 template <typename T>
@@ -136,9 +133,10 @@ std::shared_ptr<ov::Model> derive_pa_semi_static_model(const std::shared_ptr<ov:
 std::map<std::size_t, ov::SoPtr<ov::ICompiledModel>> compile_pa_semi_static_variants(
     const std::shared_ptr<ov::Model>& base_model,
     const std::shared_ptr<const ov::IPlugin>& plugin,
+    const std::vector<std::size_t>& chunk_sizes,
     const ov::AnyMap& variant_config) {
     std::map<std::size_t, ov::SoPtr<ov::ICompiledModel>> variants;
-    for (const auto chunk_size : kChunkSizes) {
+    for (const auto chunk_size : chunk_sizes) {
         auto derived = derive_pa_semi_static_model(base_model, chunk_size);
         auto compiled = plugin->get_core()->compile_model(derived, plugin->get_device_name(), variant_config);
         OPENVINO_ASSERT(compiled != nullptr, "PA semi-static derivation failed to compile chunk_size=", chunk_size);
@@ -192,6 +190,7 @@ ov::AnyMap ov::npuw::PACompiledModel::make_variant_config(const ov::AnyMap& prop
     // A variant is an ordinary NPUW model: it must not select the PA front-end
     // again, and a partitioning chosen for the whole model does not apply to it.
     config.erase(std::string(::intel_npu::NPUW_PA::key()));
+    config.erase(std::string(::intel_npu::NPUW_PA_CHUNK_SIZES::key()));
     config.erase(std::string(::intel_npu::NPUW_PLAN::key()));
     config[std::string(::intel_npu::NPUW_SUBMODEL_DEVICE::key())] = "last:" + pa_device;
     config[ov::intel_npu::use_npuw.name()] = std::string("YES");
@@ -274,7 +273,13 @@ ov::npuw::PACompiledModel::PACompiledModel(const std::shared_ptr<ov::Model>& mod
         for (const auto& key : cache_keys) {
             variant_config[key] = m_compiled_model->get_property(key);
         }
-        m_semi_static_models = compile_pa_semi_static_variants(model, plugin, variant_config);
+        // One variant per token count the caller expects to dispatch, such as
+        // the CB scheduler's token budget.
+        const auto sizes_it = properties.find(std::string(::intel_npu::NPUW_PA_CHUNK_SIZES::key()));
+        const auto chunk_sizes =
+            pa::parse_chunk_sizes(sizes_it == properties.end() ? ::intel_npu::NPUW_PA_CHUNK_SIZES::defaultValue()
+                                                               : sizes_it->second.as<std::string>());
+        m_semi_static_models = compile_pa_semi_static_variants(model, plugin, chunk_sizes, variant_config);
     } else {
         LOG_INFO("PA: model is outside the chunkable flat-token contract; every dispatch runs 1:1");
     }

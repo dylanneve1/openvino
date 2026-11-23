@@ -18,6 +18,7 @@
 namespace {
 
 using ov::npuw::pa::Dispatch;
+using ov::npuw::pa::parse_chunk_sizes;
 using ov::npuw::pa::validate_dispatch;
 using ov::npuw::pa::variants_serve;
 
@@ -208,6 +209,17 @@ TEST(PADispatchRouting, MixedDispatchWithOneLongSubsequenceIsChunked) {
 TEST(PADispatchRouting, NoVariantsOrNoTokensRunOneToOne) {
     EXPECT_FALSE(variants_serve(make_dispatch_of({7638}), {}));
     EXPECT_FALSE(variants_serve(make_dispatch_of({}), kChunkSizes));
+}
+
+TEST(PAChunkSizes, ListsTheTokenCountsLargestFirst) {
+    EXPECT_EQ(parse_chunk_sizes("1024,128,1"), kChunkSizes);
+    EXPECT_EQ(parse_chunk_sizes("1,256,128,256"), (std::vector<std::size_t>{256u, 128u, 1u}));
+    EXPECT_EQ(parse_chunk_sizes("256"), (std::vector<std::size_t>{256u}));
+}
+
+TEST(PAChunkSizes, RejectsAnEmptyListAndAZero) {
+    EXPECT_THROW(parse_chunk_sizes(""), ov::Exception);
+    EXPECT_THROW(parse_chunk_sizes("256,0"), ov::Exception);
 }
 
 }  // namespace

@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace ov::npuw::pa {
@@ -40,5 +41,9 @@ void validate_dispatch(const Dispatch& dispatch, std::size_t block_size, std::si
 // a multi-token variant, or it is a single-sequence decode. A decode batch or a
 // short prefill stays one 1:1 infer, which chunking would only serialize.
 bool variants_serve(const Dispatch& dispatch, const std::vector<std::size_t>& chunk_sizes);
+
+// The token counts of NPUW_PA_CHUNK_SIZES ("1024,128,1"), one variant each,
+// largest first. Throws when the list is empty or holds a zero.
+std::vector<std::size_t> parse_chunk_sizes(const std::string& option);
 
 }  // namespace ov::npuw::pa
