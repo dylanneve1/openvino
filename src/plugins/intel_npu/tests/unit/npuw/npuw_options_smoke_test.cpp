@@ -132,6 +132,7 @@ std::vector<Case> make_cases() {
         string_case<::intel_npu::NPUW_ACC_DEVICE>("NPUW_ACC_DEVICE", "CPU", "CPU"),
         bool_case<::intel_npu::NPUW_GQA>("NPUW_GQA", "YES", true),
         bool_case<::intel_npu::NPUW_PA>("NPUW_PA", "YES", true),
+        string_case<::intel_npu::NPUW_PA_CHUNK_SIZES>("NPUW_PA_CHUNK_SIZES", "256,1", "256,1"),
         bool_case<::intel_npu::NPUW_UNQDQ>("NPUW_UNQDQ", "YES", true),
         bool_case<::intel_npu::NPUW_LLM>("NPUW_LLM", "YES", true),
         numeric_case<::intel_npu::NPUW_LLM_BATCH_DIM>("NPUW_LLM_BATCH_DIM", "1", uint32_t{1}),

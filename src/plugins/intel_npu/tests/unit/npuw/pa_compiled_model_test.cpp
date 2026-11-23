@@ -100,6 +100,7 @@ TEST(PAVariantConfig, StartsFromTheLLMPathNPUDefaults) {
 
 TEST(PAVariantConfig, ForwardsTheCallerPropertiesButNotTheWholeModelChoices) {
     const ov::AnyMap properties = {{"NPUW_PA", "YES"},
+                                   {"NPUW_PA_CHUNK_SIZES", "256,1"},
                                    {"NPUW_PLAN", "plan.xml"},
                                    {"NPUW_SUBMODEL_DEVICE", "0:CPU"},
                                    {"NPUW_DUMP_SUBS", "YES"},
@@ -107,6 +108,7 @@ TEST(PAVariantConfig, ForwardsTheCallerPropertiesButNotTheWholeModelChoices) {
     const auto config = PACompiledModel::make_variant_config(properties, "CPU", "bank1", std::nullopt);
 
     EXPECT_EQ(config.count("NPUW_PA"), 0u);
+    EXPECT_EQ(config.count("NPUW_PA_CHUNK_SIZES"), 0u);
     EXPECT_EQ(config.count("NPUW_PLAN"), 0u);
     EXPECT_EQ(str(config, "NPUW_SUBMODEL_DEVICE"), "last:CPU");
     EXPECT_EQ(str(config, "NPUW_DUMP_SUBS"), "YES");
